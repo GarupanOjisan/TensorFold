@@ -8,6 +8,7 @@ const bench = @import("bench.zig");
 const oracle_tests = @import("oracle_tests.zig");
 const libs_tests = @import("libs_tests.zig");
 const sample_tests = @import("sample_tests.zig");
+const pair_tests = @import("pair_tests.zig");
 
 const usage =
     \\usage: tf-cuda-test <command>
@@ -21,6 +22,7 @@ const usage =
     \\  symbols                   every gdn fatbin instantiation resolves by its listed symbol
     \\  cublaslt                  bf16 GEMM through cuBLASLt against an fp64 reference
     \\  nccl                      one-rank NCCL all-reduce and all-gather
+    \\  nccl-pair <rank> <host> <port> [reps]  two ranks: NCCL id over TCP, an all-gather in a CUDA graph
     \\  gdn-replay <dir>          replay_kernel bits against the Python oracle's fixture
     \\  gdn-tree <dir>            tree_kernel bits against the Python oracle's fixture
     \\  triton <dir>              a Triton cubin's bits against the Python oracle's fixture
@@ -71,6 +73,7 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "symbols")) return runtime_tests.symbols(gpu);
     if (std.mem.eql(u8, cmd, "cublaslt")) return libs_tests.cublaslt(gpu);
     if (std.mem.eql(u8, cmd, "nccl")) return libs_tests.nccl(gpu);
+    if (std.mem.eql(u8, cmd, "nccl-pair")) return pair_tests.ncclPair(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10), try arg(rest, 1), try std.fmt.parseInt(u16, try arg(rest, 2), 10), if (rest.len > 3) try std.fmt.parseInt(usize, rest[3], 10) else 1000);
     if (std.mem.eql(u8, cmd, "gdn-replay")) return oracle_tests.gdnReplay(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "gdn-tree")) return oracle_tests.gdnTree(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "triton")) return oracle_tests.tritonKernel(gpu, try arg(rest, 0));
