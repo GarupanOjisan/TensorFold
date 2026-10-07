@@ -20,6 +20,8 @@ const kernels = [_]Kernel{
     .{ .name = "scan_rows", .flags = &.{ "-O3", "--fmad=false" } }, // nemotron_h/cuda/mamba.py
     .{ .name = "nemotron_ops", .flags = &.{"-O3"} }, // ours: Nemotron's layouts and the serial feed
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
+    .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
+    .{ .name = "glm_exl3", .flags = &.{ "-O3", "-lineinfo" } }, // cuda/exl3/experts.py, tensorfold_exl3_experts_v1
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
