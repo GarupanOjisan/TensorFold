@@ -1,4 +1,4 @@
-//! GLM's raw CUDA kernels (the glm_kda and glm_exl3 fatbins) launched with the Python host code's geometry
+//! GLM's raw CUDA kernels (the glm_kda, glm_exl3 and glm_glue fatbins) launched with the Python host code's geometry
 //! (glm_symbols.zig has the spec, with file:line references into v0.6.6).
 const std = @import("std");
 const cuda = @import("cuda");
@@ -13,7 +13,7 @@ fn int(x: usize) i32 {
 }
 
 pub const Kernels = struct {
-    mods: [2]cuda.Module,
+    mods: [3]cuda.Module,
     chain: cuda.Function,
     prep: cuda.Function,
     step: cuda.Function,
@@ -24,6 +24,9 @@ pub const Kernels = struct {
     grouped: cuda.Function,
     gateup_epilogue: cuda.Function,
     down_epilogue: cuda.Function,
+    copy_rows: cuda.Function,
+    tokens: cuda.Function,
+    greedy: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -32,6 +35,8 @@ pub const Kernels = struct {
         errdefer k.mods[0].unload();
         k.mods[1] = try cuda.Module.load(d, cuda.kernels.glm_exl3);
         errdefer k.mods[1].unload();
+        k.mods[2] = try cuda.Module.load(d, cuda.kernels.glm_glue);
+        errdefer k.mods[2].unload();
         k.chain = try k.mods[0].function(sym.kda_chain);
         k.prep = try k.mods[0].function(sym.kda_prep);
         k.step = try k.mods[0].function(sym.kda_step);
@@ -42,6 +47,9 @@ pub const Kernels = struct {
         k.grouped = try k.mods[1].function(sym.exl3_grouped);
         k.gateup_epilogue = try k.mods[1].function(sym.exl3_gateup_epilogue);
         k.down_epilogue = try k.mods[1].function(sym.exl3_down_epilogue);
+        k.copy_rows = try k.mods[2].function("tf_glm_copy_rows");
+        k.tokens = try k.mods[2].function("tf_glm_tokens");
+        k.greedy = try k.mods[2].function("tf_glm_greedy");
         // group_kernel's members list grows with the rows (a prompt chunk's 2048 rows * 9 slots * 4 B): experts.cu:292-305
         try k.group.allowDynamicShared(96 << 10);
         return k;

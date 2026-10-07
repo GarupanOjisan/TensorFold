@@ -13,8 +13,6 @@ const prefix = "model.language_model.";
 
 /// A BF16 matrix [n, k], row-major (qmm.B16).
 pub const B16 = struct { ptr: u64, n: usize, k: usize };
-/// The draft head's tiled affine 4-bit groups of 64 (qmm.Q4 from quantize4): words [n, k/8], scales and biases [n, k/64].
-pub const Q4 = struct { words: u64, scales: u64, biases: u64, n: usize, k: usize };
 
 pub const Hc = struct { fn_: u64, base: u64, scale: u64 }; // [24, S*D] bf16, [24] f32, [3] f32
 
@@ -98,7 +96,6 @@ pub const Weights = struct {
     layers: []Layer,
     norm: u64,
     head: B16, // this rank's half of the vocabulary
-    draft_head: Q4,
     mtp: ?Mtp,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     bytes: usize = 0,
@@ -222,7 +219,7 @@ const Loader = struct {
         return .{ .ptr = ptr, .rows = rows, .cols = cols };
     }
 
-    fn one(l: *Loader, full: []const u8, dtype: core.safetensors.DType) !u64 {
+    fn upOne(l: *Loader, full: []const u8, dtype: core.safetensors.DType) !u64 {
         return (try l.stack(&.{full}, dtype)).ptr;
     }
 
@@ -238,10 +235,10 @@ const Loader = struct {
         defer l.gpa.free(b);
         const s = try l.name(prefix ++ "layers.{d}.hc_{s}_scale", .{ i, site });
         defer l.gpa.free(s);
-        return .{ .fn_ = try l.one(f, .bf16), .base = try l.one(b, .f32), .scale = try l.one(s, .f32) };
+        return .{ .fn_ = try l.upOne(f, .bf16), .base = try l.upOne(b, .f32), .scale = try l.upOne(s, .f32) };
     }
 
-    fn names(l: *Loader, i: usize, comptime parts: []const []const u8) ![parts.len][]const u8 {
+    fn layerNames(l: *Loader, i: usize, comptime parts: []const []const u8) ![parts.len][]const u8 {
         var out: [parts.len][]const u8 = undefined;
         inline for (parts, 0..) |p, j| out[j] = try l.name(prefix ++ "layers.{d}." ++ p, .{i});
         return out;
@@ -254,13 +251,13 @@ const Loader = struct {
     fn kda(l: *Loader, i: usize) !Kda {
         const c = &l.w.cfg;
         const ll = c.kda_heads / world;
-        const p = try l.names(i, &.{ "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.f_a_proj.weight", "self_attn.g_a_proj.weight", "self_attn.b_proj.weight" });
+        const p = try l.layerNames(i, &.{ "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.f_a_proj.weight", "self_attn.g_a_proj.weight", "self_attn.b_proj.weight" });
         defer l.free(&p);
         const proj = try l.b16(&p);
-        const cv = try l.names(i, &.{ "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight", "self_attn.v_conv1d.weight" });
+        const cv = try l.layerNames(i, &.{ "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight", "self_attn.v_conv1d.weight" });
         defer l.free(&cv);
         const conv = try l.stack(&cv, .bf16);
-        const r = try l.names(i, &.{ "self_attn.f_b_proj.weight", "self_attn.g_b_proj.weight", "self_attn.A_log", "self_attn.dt_bias", "self_attn.o_norm.weight", "self_attn.o_proj.weight" });
+        const r = try l.layerNames(i, &.{ "self_attn.f_b_proj.weight", "self_attn.g_b_proj.weight", "self_attn.A_log", "self_attn.dt_bias", "self_attn.o_norm.weight", "self_attn.o_proj.weight" });
         defer l.free(&r);
         const width = 3 * ll * c.kda_dim;
         if (conv.rows != width or proj.n != width + 2 * 128 + ll) return error.KdaShape;
@@ -272,9 +269,9 @@ const Loader = struct {
             .fb = try l.b16(r[0..1]),
             .gb = try l.b16(r[1..2]),
             .conv = conv.ptr,
-            .a_log = try l.one(r[2], .f32),
-            .dt_bias = try l.one(r[3], .f32),
-            .norm = try l.one(r[4], .bf16),
+            .a_log = try l.upOne(r[2], .f32),
+            .dt_bias = try l.upOne(r[3], .f32),
+            .norm = try l.upOne(r[4], .bf16),
             .o = try l.b16(r[5..6]),
         };
     }
@@ -282,9 +279,9 @@ const Loader = struct {
     fn dsa(l: *Loader, i: usize) !Dsa {
         const c = &l.w.cfg;
         const hl = c.mla_heads / world;
-        const p = try l.names(i, &.{ "self_attn.q_a_proj.weight", "self_attn.kv_a_proj_with_mqa.weight", "self_attn.q_a_layernorm.weight", "self_attn.kv_a_layernorm.weight", "self_attn.q_b_proj.weight", "self_attn.o_proj.weight", "self_attn.kv_b_proj.weight" });
+        const p = try l.layerNames(i, &.{ "self_attn.q_a_proj.weight", "self_attn.kv_a_proj_with_mqa.weight", "self_attn.q_a_layernorm.weight", "self_attn.kv_a_layernorm.weight", "self_attn.q_b_proj.weight", "self_attn.o_proj.weight", "self_attn.kv_b_proj.weight" });
         defer l.free(&p);
-        const x = try l.names(i, &.{ "self_attn.indexer.wk.weight", "self_attn.indexer.weights_proj.weight", "self_attn.indexer.wq_b.weight", "self_attn.indexer.k_norm.weight", "self_attn.indexer.k_norm.bias", "self_attn.indexer.index_kpool_compress_gate", "self_attn.indexer.index_kpool_compress_ape" });
+        const x = try l.layerNames(i, &.{ "self_attn.indexer.wk.weight", "self_attn.indexer.weights_proj.weight", "self_attn.indexer.wq_b.weight", "self_attn.indexer.k_norm.weight", "self_attn.indexer.k_norm.bias", "self_attn.indexer.index_kpool_compress_gate", "self_attn.indexer.index_kpool_compress_ape" });
         defer l.free(&x);
         // kv_b's rank rows, head by head [qk_dim key rows | v_dim value rows]: the key and value blocks apart
         var kvb: std.ArrayList(u8) = .empty;
@@ -308,17 +305,17 @@ const Loader = struct {
         try l.src.ops.upload(wv_ptr, wv);
         return .{
             .proj = try l.b16(p[0..2]),
-            .q_norm = try l.one(p[2], .bf16),
-            .kv_norm = try l.one(p[3], .bf16),
+            .q_norm = try l.upOne(p[2], .bf16),
+            .kv_norm = try l.upOne(p[3], .bf16),
             .q_b = try l.b16(p[4..5]),
             .o = try l.b16(p[5..6]),
             .index = .{
                 .kw = try l.b16(x[0..2]),
                 .qb = try l.b16(x[2..3]),
-                .ln_w = try l.one(x[3], .bf16),
-                .ln_b = try l.one(x[4], .bf16),
-                .gate = try l.one(x[5], .bf16),
-                .ape = try l.one(x[6], .bf16),
+                .ln_w = try l.upOne(x[3], .bf16),
+                .ln_b = try l.upOne(x[4], .bf16),
+                .gate = try l.upOne(x[5], .bf16),
+                .ape = try l.upOne(x[6], .bf16),
             },
             .wk = wk_ptr,
             .wv = wv_ptr,
@@ -326,7 +323,7 @@ const Loader = struct {
     }
 
     fn mlp(l: *Loader, i: usize, comptime sub: []const u8) !Mlp {
-        const p = try l.names(i, &.{ sub ++ "gate_proj.weight", sub ++ "up_proj.weight", sub ++ "down_proj.weight" });
+        const p = try l.layerNames(i, &.{ sub ++ "gate_proj.weight", sub ++ "up_proj.weight", sub ++ "down_proj.weight" });
         defer l.free(&p);
         const gu = try l.b16(p[0..2]);
         return .{ .gu = gu, .down = try l.b16(p[2..3]), .width = gu.n / 2 };
@@ -423,15 +420,15 @@ const Loader = struct {
     }
 
     fn moe(l: *Loader, i: usize) !Moe {
-        const p = try l.names(i, &.{ "mlp.gate.weight", "mlp.gate.e_score_correction_bias" });
+        const p = try l.layerNames(i, &.{ "mlp.gate.weight", "mlp.gate.e_score_correction_bias" });
         defer l.free(&p);
-        return .{ .router = try l.one(p[0], .bf16), .bias = try l.one(p[1], .f32), .ex = try l.exl3(i), .shared = try l.mlp(i, "mlp.shared_experts.") };
+        return .{ .router = try l.upOne(p[0], .bf16), .bias = try l.upOne(p[1], .f32), .ex = try l.exl3(i), .shared = try l.mlp(i, "mlp.shared_experts.") };
     }
 
     /// weights.load's `layer`; `plain`: the MTP layer (DSA and MoE, no hyper-connections).
     fn layer(l: *Loader, i: usize, plain: bool) !Layer {
         const c = &l.w.cfg;
-        const n = try l.names(i, &.{ "input_layernorm.weight", "post_attention_layernorm.weight" });
+        const n = try l.layerNames(i, &.{ "input_layernorm.weight", "post_attention_layernorm.weight" });
         defer l.free(&n);
         const kind: glm_config.Kind = if (plain) .mla else c.kind(@intCast(i));
         var lw: Layer = .{
@@ -439,8 +436,8 @@ const Loader = struct {
             .kind = kind,
             .attn_hc = if (plain) null else try l.hc(i, "attn"),
             .ffn_hc = if (plain) null else try l.hc(i, "ffn"),
-            .in_norm = try l.one(n[0], .bf16),
-            .post_norm = try l.one(n[1], .bf16),
+            .in_norm = try l.upOne(n[0], .bf16),
+            .post_norm = try l.upOne(n[1], .bf16),
         };
         if (kind == .kda) lw.kda = try l.kda(i) else lw.dsa = try l.dsa(i);
         if (plain or c.isMoe(@intCast(i))) lw.moe = try l.moe(i) else lw.mlp = try l.mlp(i, "mlp.");
@@ -448,95 +445,35 @@ const Loader = struct {
     }
 };
 
-/// qmm.quantize4 on the host: per 64-group min and max, scale ((hi - lo) / 15, at least 1e-8) and bias (lo) in bf16,
-/// q = round((x - bias) / scale) clamped to 0..15, 8 nibbles a word low first. fp32 division and round-half-even as
-/// torch does them on the GPU; the draft head only proposes tokens, so a difference would cost speed, not replies.
-pub fn quantize4(gpa: std.mem.Allocator, w: []const u16, n: usize, k: usize) !struct { words: []u32, scales: []u16, biases: []u16 } {
-    const words = try gpa.alloc(u32, n * k / 8);
-    errdefer gpa.free(words);
-    const scales = try gpa.alloc(u16, n * k / 64);
-    errdefer gpa.free(scales);
-    const biases = try gpa.alloc(u16, n * k / 64);
-    for (0..n * k / 64) |g| {
-        const x = w[g * 64 ..][0..64];
-        var lo: f32 = std.math.inf(f32);
-        var hi: f32 = -std.math.inf(f32);
-        for (x) |v| {
-            lo = @min(lo, widen(v));
-            hi = @max(hi, widen(v));
-        }
-        const s16 = bf16(@max((hi - lo) / 15.0, 1e-8));
-        const b16v = bf16(lo);
-        scales[g] = s16;
-        biases[g] = b16v;
-        const sf = widen(s16);
-        const bf = widen(b16v);
-        for (0..8) |wi| {
-            var word: u32 = 0;
-            for (0..8) |j| {
-                const v: u32 = @intFromFloat(std.math.clamp(roundEven((widen(x[wi * 8 + j]) - bf) / sf), 0, 15));
-                word |= v << @intCast(4 * j);
-            }
-            words[g * 8 + wi] = word;
-        }
-    }
-    return .{ .words = words, .scales = scales, .biases = biases };
-}
-
-/// torch.round: to the nearest integer, ties to even.
-fn roundEven(r: f32) f32 {
-    const fl = @floor(r);
-    const diff = r - fl;
-    if (diff > 0.5) return fl + 1;
-    if (diff < 0.5) return fl;
-    return if (@mod(fl, 2) == 0) fl else fl + 1;
-}
-
-fn widen(h: u16) f32 {
-    return @bitCast(@as(u32, h) << 16);
-}
-
-fn bf16(x: f32) u16 {
-    const u: u32 = @bitCast(x);
-    return @truncate((u + 0x7fff + ((u >> 16) & 1)) >> 16);
-}
-
 /// Every weight of rank `rank` of the checkpoint in `dir`, uploaded on `ops`'s stream.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @import("glm_source.zig").Ops, dir: []const u8, cfg: Config, rank: u32, mtp: bool) !Weights {
-    var ck = try core.Checkpoint.openModel(gpa, io, dir);
+    // by prefix, so the vision tower's tensors (5-D convolutions past safetensors.max_rank) are never parsed
+    var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
     defer ck.close();
+    var ck_head = try core.Checkpoint.openModelPrefix(gpa, io, dir, "lm_head.");
+    defer ck_head.close();
     var src = try Source.init(gpa, ops);
     defer src.deinit();
     try src.add(&ck);
-    var w: Weights = .{ .cfg = cfg, .rank = rank, .embed = 0, .layers = try gpa.alloc(Layer, cfg.layers), .norm = 0, .head = undefined, .draft_head = undefined, .mtp = null };
+    try src.add(&ck_head);
+    var w: Weights = .{ .cfg = cfg, .rank = rank, .embed = 0, .layers = try gpa.alloc(Layer, cfg.layers), .norm = 0, .head = undefined, .mtp = null };
     errdefer w.deinit(gpa);
     var l: Loader = .{ .gpa = gpa, .ck = &ck, .src = &src, .d = d, .rank = rank, .w = &w };
     defer l.host.deinit(gpa);
-    w.embed = try l.one(prefix ++ "embed_tokens.weight", .bf16);
+    w.embed = try l.upOne(prefix ++ "embed_tokens.weight", .bf16);
     for (w.layers, 0..) |*lw, i| lw.* = try l.layer(i, false);
-    w.norm = try l.one(prefix ++ "norm.weight", .bf16);
-    // the head: this rank's half of the vocabulary rows, and its 4-bit draft copy
-    const head = try ck.expect("lm_head.weight", .bf16, &.{ cfg.vocab, cfg.hidden });
+    w.norm = try l.upOne(prefix ++ "norm.weight", .bf16);
+    // the head: this rank's half of the vocabulary rows
+    const head = try ck_head.expect("lm_head.weight", .bf16, &.{ cfg.vocab, cfg.hidden });
     const vl = cfg.vocab / world;
     const half = head.bytes[rank * vl * cfg.hidden * 2 ..][0 .. vl * cfg.hidden * 2];
-    const host = try gpa.alloc(u16, vl * cfg.hidden);
-    defer gpa.free(host);
-    try src.read(std.mem.sliceAsBytes(host), half);
     w.head = .{ .ptr = try l.alloc(half.len), .n = vl, .k = cfg.hidden };
-    try ops.upload(w.head.ptr, std.mem.sliceAsBytes(host));
-    const q = try quantize4(gpa, host, vl, cfg.hidden);
-    defer gpa.free(q.words);
-    defer gpa.free(q.scales);
-    defer gpa.free(q.biases);
-    w.draft_head = .{ .words = try l.alloc(q.words.len * 4), .scales = try l.alloc(q.scales.len * 2), .biases = try l.alloc(q.biases.len * 2), .n = vl, .k = cfg.hidden };
-    try ops.upload(w.draft_head.words, std.mem.sliceAsBytes(q.words));
-    try ops.upload(w.draft_head.scales, std.mem.sliceAsBytes(q.scales));
-    try ops.upload(w.draft_head.biases, std.mem.sliceAsBytes(q.biases));
+    try src.upload(w.head.ptr, half);
     if (cfg.mtp > 0 and mtp) {
         const i = cfg.layers;
-        const n = try l.names(i, &.{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" });
+        const n = try l.layerNames(i, &.{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" });
         defer l.free(&n);
-        w.mtp = .{ .enorm = try l.one(n[0], .bf16), .hnorm = try l.one(n[1], .bf16), .eh = try l.b16(n[2..3]), .head_norm = try l.one(n[3], .bf16), .layer = try l.layer(i, true) };
+        w.mtp = .{ .enorm = try l.upOne(n[0], .bf16), .hnorm = try l.upOne(n[1], .bf16), .eh = try l.b16(n[2..3]), .head_norm = try l.upOne(n[3], .bf16), .layer = try l.layer(i, true) };
     }
     try src.flush();
     try ops.s.synchronize();
@@ -569,16 +506,4 @@ test "split rules match split.py on the tensors GLM reads" {
     try t.expectEqual(Split.rep, rule("model.language_model.layers.45.eh_proj.weight"));
     try t.expectEqual(Split.rep, rule("model.language_model.layers.3.hc_attn_fn"));
     try t.expectEqual(Split.rep, rule("model.language_model.layers.3.mlp.gate.weight"));
-}
-
-test "quantize4 rounds half to even and packs nibbles low first" {
-    var row: [64]u16 = undefined;
-    for (&row, 0..) |*v, i| v.* = bf16(@floatFromInt(i % 16));
-    const q = try quantize4(std.testing.allocator, &row, 1, 64);
-    defer std.testing.allocator.free(q.words);
-    defer std.testing.allocator.free(q.scales);
-    defer std.testing.allocator.free(q.biases);
-    try std.testing.expectEqual(@as(u32, 0x76543210), q.words[0]);
-    try std.testing.expectEqual(@as(u32, 0xfedcba98), q.words[1]);
-    try std.testing.expectEqual(bf16(1.0), q.scales[0]);
 }

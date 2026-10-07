@@ -22,6 +22,7 @@ const kernels = [_]Kernel{
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
     .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
     .{ .name = "glm_exl3", .flags = &.{ "-O3", "-lineinfo" } }, // cuda/exl3/experts.py, tensorfold_exl3_experts_v1
+    .{ .name = "glm_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: GLM torch glue (copies, token lists, greedy)
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
@@ -106,6 +107,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     runner.addImport("lanes", mods.lanes);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
     _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true);
+    b.installArtifact(glmCheck(b, target, optimize, cuda, mods.core));
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
@@ -191,4 +193,14 @@ pub fn checkDistFatbins(b: *std.Build, dir: []const u8) *std.Build.Step {
     const check = b.addSystemCommand(&.{ "sh", "-c", "for file do [ -f \"$file\" ] && [ -s \"$file\" ] || { echo \"missing or empty CUDA fatbin: $file\" >&2; exit 1; }; done", "check-fatbins" });
     for (kernels) |k| check.addFileArg(b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) })));
     return &check.step;
+}
+
+/// `tf-glm`: GLM-5.3-Flash on two CUDA ranks (zig/src/families/glm/cuda) and its check against the Python engine.
+fn glmCheck(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Step.Compile {
+    const config = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/config.zig"), .target = target, .optimize = optimize });
+    const main = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda/glm_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    main.addImport("cuda", cuda);
+    main.addImport("core", core);
+    main.addImport("glm_config", config);
+    return b.addExecutable(.{ .name = "tf-glm", .root_module = main });
 }
