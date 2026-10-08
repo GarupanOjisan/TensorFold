@@ -101,3 +101,21 @@ The reference sets `k1`, `k2`, `k3` are `m1`, `m2`, `m3` with `-e TF_GLM_KDA_CHU
 - Reference sets `v1`..`v4` (v4: one 123,312-token prompt, context 262,144) are `k1`..`k3` with `-e TF_GLM_KV=fp8
   -e TF_GLM_LATENT_MMA=1 -e TF_GLM_SPARSE_ONEPASS=1 -e TF_GLM_SCORE_RB=4`; `b1` is the six prompts with `TF_GLM_KV=bf16`. `aot/v18` is
   `aot/m18` plus the kernels of `v1`..`v4` and `b1` (`aot_pack.py --base aot/m18 --only ...`).
+
+## 8. The rest of v1.8's single-stream production configuration
+
+- `TF_GLM_HC_DEC` (default on): a decode window's hyper-connection mixing dots in `hc_partial_kernel` (`glm_hc.cu`, a copy of v1.8's
+  `hc.cu`, 48 blocks a row, `_hc_partial`'s bits), `TF_GLM_HC_MMA` (default on): a prompt chunk's in `_hc_partial_mma`; `_hc_finish` after both.
+- `TF_GLM_L2PF` (default on; `0`, `1`/`bulk`, `lines`, `touch`; `_MB`, `_SITES`, `_ROWS`): `glm_l2pf.zig` and `glm_l2pf.cu` (a copy
+  of `l2pf.cu`) prefetch the next kernels' weights into L2 from a side stream at the sites a / f / o of decode windows of up
+  to 64 rows, forked and joined with events so that it also runs inside the captured graphs; the MoE then runs its shared
+  expert before the routed experts, as v1.8 does under it.
+- Not ported, because the Zig engine does not use them: windows of 9 to 16 rows (`TF_GLM_MAX_ROWS`, `TF_GLM_WIDE_GRAPHS`: v1.8 runs
+  them for copy drafts, which are off here; its MTP depth is at most 7, 8 rows), copy drafts (`TF_GLM_COPY_*`), DFlash2
+  (`TF_GLM_DFLASH_POLICY`), multi-stream serving (`TF_GLM_MULTI_*`, `FILL_*`, `PREFILL_OVERLAP`, `HC_SPLIT`, `HC_EXCHANGE`), the
+  reply-shaping and pacing settings of the Python server (`ASSISTANT_ENDS`, `CLEAR_THINKING`, `KEEP_REASONING*`,
+  `STREAM_SMOOTH*`, `SHARED_PREFIX`, `CACHE_*`, `DISPLAY_KV_*`). `LOADS=0`, `FUSE`, `PASS=128`, `Q4_TILE`, `SEQ_ROWS`, `L2PF_BLOCKS/KB/THREADS`,
+  `DRAFT_QUANT=mse`, `LATENT_STAGES`, `SCORE_RB` stay at v1.8's defaults.
+
+Acceptance: `tf-glm check` against the production-setting captures `v18a` (6 prompts), `v18b` (42 lengths, 8k, 32k) and `p4` (one
+123k-token prompt), `aot/p18b` = `aot/v18` plus their kernels, at depth 3 and 7.

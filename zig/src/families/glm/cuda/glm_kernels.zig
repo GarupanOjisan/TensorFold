@@ -13,7 +13,7 @@ fn int(x: usize) i32 {
 }
 
 pub const Kernels = struct {
-    mods: [10]cuda.Module,
+    mods: [12]cuda.Module,
     chain: cuda.Function,
     prep: cuda.Function,
     step: cuda.Function,
@@ -54,6 +54,8 @@ pub const Kernels = struct {
     plan_offsets: cuda.Function,
     plan_scatter: cuda.Function,
     kda_chunk: cuda.Function,
+    hc_partial: cuda.Function,
+    l2pf: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -82,6 +84,12 @@ pub const Kernels = struct {
         errdefer k.mods[9].unload();
         k.kda_chunk = try k.mods[9].function("_ZN12tf_kda_chunk12chunk_kernelEiPK13__nv_bfloat16iiS2_iS2_iS2_S2_PKfS4_S4_S2_ffiiPS0_Pf");
         try k.kda_chunk.allowDynamicShared(kda_chunk_smem);
+        k.mods[10] = try cuda.Module.load(d, cuda.kernels.glm_hc);
+        errdefer k.mods[10].unload();
+        k.hc_partial = try k.mods[10].function("_ZN9tf_glm_hc17hc_partial_kernelEPK13__nv_bfloat16S2_Pfi");
+        k.mods[11] = try cuda.Module.load(d, cuda.kernels.glm_l2pf);
+        errdefer k.mods[11].unload();
+        k.l2pf = try k.mods[11].function("_ZN7tf_l2pf11l2pf_kernelEPKxiiPj");
         k.chain = try k.mods[0].function(sym.kda_chain);
         k.prep = try k.mods[0].function(sym.kda_prep);
         k.step = try k.mods[0].function(sym.kda_step);
@@ -388,6 +396,28 @@ pub const Chain = struct {
     q_tmp: u64 = 0, // the wide path's scratch (rows >= 64)
     y_tmp: u64 = 0,
 };
+
+/// hc.hc_partial (v1.8 hc.cu): decode rows' 24 mixing dots and sum of squares of x [rows, 16384] bf16 against fn [24, 16384]
+/// into part [rows, 16, 32] fp32 (glue._hc_partial's bits, 48 blocks a row).
+pub fn hcPartial(k: *const Kernels, s: cuda.Stream, x: u64, fn_w: u64, part: u64, rows: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(x);
+    a.add(fn_w);
+    a.add(part);
+    a.add(int(rows));
+    try go(k.hc_partial, s, .{ 16, 3, (rows + 3) / 4 }, 288, 0, &a);
+}
+
+/// l2pf.prefetch: `count` (address, bytes) pieces of the table at `table` + 16 `first` into L2 (mode 0: cp.async.bulk.prefetch.L2,
+/// 1: prefetch.global.L2::evict_last per line, 2: loads), on the stream given.
+pub fn l2Prefetch(k: *const Kernels, s: cuda.Stream, table: u64, first: usize, count: usize, mode: i32, blocks: usize, threads: usize, sink: u64) !void {
+    var a: cuda.Args = .{};
+    a.add(table + 16 * first);
+    a.add(int(count));
+    a.add(mode);
+    a.add(sink);
+    try go(k.l2pf, s, .{ blocks, 1, 1 }, threads, 0, &a);
+}
 
 /// kda.py WIDE_ROWS (TF_GLM_KDA_WIDE_ROWS, v1.8's default 1; 64 was v0.6.6's): from this many rows a chain runs as prep, step
 /// and out (the same bits as the one-block chain). The engine sets it from the environment before it sizes its buffers.

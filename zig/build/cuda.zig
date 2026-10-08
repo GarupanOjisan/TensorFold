@@ -23,6 +23,8 @@ const kernels = [_]Kernel{
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
     .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
     .{ .name = "glm_kda_chunk", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda_chunked.py, tensorfold_glm_kda_chunk
+    .{ .name = "glm_hc", .flags = &.{"-O3"} }, // glm5_next/cuda/hc.cu, tensorfold_glm_hc_v2
+    .{ .name = "glm_l2pf", .flags = &.{"-O3"} }, // glm5_next/cuda/l2pf.cu, tensorfold_glm_l2pf_v2
     .{ .name = "glm_exl3", .flags = &.{ "-O3", "-lineinfo" } }, // cuda/exl3/experts.py, tensorfold_exl3_experts_v1
     .{ .name = "glm_exl3d", .flags = &.{"-O3"} }, // glm5_next/cuda/exl3.cu [v1.8], tensorfold_glm_exl3_v20
     .{ .name = "glm_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: GLM torch glue (copies, token lists, greedy)

@@ -6,6 +6,7 @@ const cuda = @import("cuda");
 const wt = @import("glm_weights.zig");
 const tri = @import("glm_triton.zig");
 const kern = @import("glm_kernels.zig");
+const l2pf = @import("glm_l2pf.zig");
 
 const Weights = wt.Weights;
 const Mat = wt.Mat;
@@ -303,6 +304,14 @@ pub const Engine = struct {
     /// TF_GLM_KV (default fp8, v1.8's production setting; bf16 the earlier format): the DSA latent cache and the indexer's
     /// pooled keys as e4m3 rows with a power-of-two scale each (kv8.py).
     kv_fp8: bool = true,
+    /// TF_GLM_HC_DEC / TF_GLM_HC_MMA (default on): hyper-connection mixing dots of decode rows in hc.cu, of prompt rows on the
+    /// tensor cores.
+    hc_dec: bool = true,
+    /// TF_GLM_L2PF (default on): decode windows of up to TF_GLM_L2PF_ROWS rows prefetch the next kernels' weights into L2 from
+    /// a side stream (glm_l2pf.zig); `l2pf_active` is set while such a window runs.
+    l2pf: ?l2pf.Prefetch = null,
+    l2pf_active: bool = false,
+    hc_mma: bool = true,
     /// TF_GLM_LATENT_MMA / TF_GLM_SPARSE_ONEPASS (default on): a prompt chunk's absorb and expand on the tensor cores, its
     /// sparse attention in one pass a row.
     latent_mma: bool = true,
@@ -395,6 +404,10 @@ pub const Engine = struct {
         errdefer e.full_dev.free();
         e.full_host = try std.heap.page_allocator.alloc(u16, wt.world * max_rows * w.head.n);
         e.kda_chunked = kdaChunked();
+        const pf_settings = try l2pf.Settings.fromEnv();
+        e.l2pf = if (pf_settings.on()) try l2pf.Prefetch.build(std.heap.page_allocator, d, w, pf_settings) else null;
+        e.hc_dec = envOn("TF_GLM_HC_DEC");
+        e.hc_mma = envOn("TF_GLM_HC_MMA");
         e.latent_mma = envOn("TF_GLM_LATENT_MMA");
         e.sparse_onepass = envOn("TF_GLM_SPARSE_ONEPASS");
         e.index_ring = std.mem.alignForward(usize, capacity, 16);
@@ -416,6 +429,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
+        if (e.l2pf) |*p| p.deinit();
         e.full_dev.free();
         std.heap.page_allocator.free(e.full_host);
         e.mem.free();
@@ -527,8 +541,9 @@ pub const Engine = struct {
         }
     }
 
-    fn outProj(e: *Engine, b: *const Buffers, x: u64, xs: u64, q: Mat, rows: usize) !u64 {
+    fn outProj(e: *Engine, b: *const Buffers, x: u64, xs: u64, q: Mat, rows: usize, site: ?struct { u32, usize }) !u64 {
         try e.mm(b, x, q.k, xs, q, b.part, rows, true);
+        if (site) |s| try e.pfSite(s[0], s[1]);
         return e.gather(b, rows);
     }
 
@@ -547,6 +562,7 @@ pub const Engine = struct {
         try e.mm(b, fa, e.width, b.xs_fa, kw.fb, b.ka, rows, false);
         if (!b.prefill) try e.t.groupSums(ga, e.width, b.xs_ga, rows, 128);
         try e.mm(b, ga, e.width, b.xs_ga, kw.gb, b.kg, rows, false);
+        try e.pfSite(l.index, 2);
         const rec_layer = ll * 128 * 128 * f4;
         const rec_half = st.kda_layers * rec_layer;
         const scr: KdaScratch = if (b.prefill) b.kscr else .{ .out = st.scr.out + li * max_rows * ll * 128 * bf, .k = st.scr.k + li * max_rows * ll * 128 * f4, .v = st.scr.v + li * max_rows * ll * 128 * bf, .g = st.scr.g + li * max_rows * ll * 128 * f4, .b = st.scr.b + li * max_rows * ll * f4 };
@@ -585,7 +601,7 @@ pub const Engine = struct {
             try e.t.convShift(st.conv + li * conv_layer, b.kproj, rows, 1, 3 * ll * 128, 3 * 3 * ll * 128, b.rows * e.width, e.width);
         }
         if (!b.prefill) try e.t.groupSums(scr.out, ll * 128, b.kxs, rows, ll * 128);
-        return e.outProj(b, scr.out, b.kxs, kw.o, rows);
+        return e.outProj(b, scr.out, b.kxs, kw.o, rows, .{ l.index, 0 });
     }
 
     fn dsaBlock(e: *Engine, l: *const wt.Layer, b: *Buffers, kc: u64, pos_dev: u64, host_pos: usize, index: ?[3]u64, rows: usize) !u64 {
@@ -611,6 +627,7 @@ pub const Engine = struct {
             try e.t.indexUpdate(b.ikr, c.i_dim + c.i_heads, b.igr, ix.ln_w, ix.ln_b, ix.ape, ix3[0], ix3[1], ix3[2], pos_dev, rows, e.index_ring);
         }
         if (b.prefill and e.latent_mma) try e.t.absorbQMma(b.q, a.wk, b.qa, rows, hl, qk, lw) else try e.t.absorbQ(b.q, a.wk, b.qa, rows, hl, qk, lw);
+        try e.pfSite(l.index, 2);
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(qk), -0.5));
         if (!all_sparse) {
             const s = b.lat_s;
@@ -645,7 +662,7 @@ pub const Engine = struct {
         }
         if (b.prefill and e.latent_mma) try e.t.expandVMma(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw) else try e.t.expandV(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw);
         try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
-        return e.outProj(b, b.vn, b.xs_ao, a.o, rows);
+        return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
     }
 
     /// TORCH-GLUE `pos_dev + r0`: block j's first position into its own 16-byte slot (the host knows pos).
@@ -658,24 +675,25 @@ pub const Engine = struct {
         }
     }
 
-    fn mlpBlock(e: *Engine, m: wt.Mlp, b: *const Buffers, rows: usize) !u64 {
+    fn mlpBlock(e: *Engine, m: wt.Mlp, b: *const Buffers, rows: usize, layer: u32) !u64 {
         const c = e.w.cfg;
         try e.mm(b, b.normed, c.hidden, b.xs, m.gu, b.gu, rows, false);
         try e.t.swiglu(b.gu, b.act, b.xs_act, rows, m.width, c.swiglu_limit);
-        return e.outProj(b, b.act, b.xs_act, m.down, rows);
+        return e.outProj(b, b.act, b.xs_act, m.down, rows, .{ layer, 1 });
     }
 
-    fn moeBlock(e: *Engine, m: wt.Moe, b: *const Buffers, rows: usize) !u64 {
+    fn moeBlock(e: *Engine, m: wt.Moe, b: *const Buffers, rows: usize, layer: u32) !u64 {
         const c = e.w.cfg;
         const d: usize = c.hidden;
         const slots: usize = c.topk + 1;
         try e.t.router(b.normed, d, m.router, b.rpart, b.mlog, rows, d, c.experts);
         try e.t.select(b.mlog, m.bias, b.pick, b.wts, rows, c.topk, c.experts, c.routed_scale, true);
-        if (e.exl3_v18) try kern.routed18(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit, b.prefill) else try kern.routed(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit);
         const sh = m.shared;
-        try e.mm(b, b.normed, d, b.xs, sh.gu, b.sgu, rows, false);
-        try e.t.swiglu(b.sgu, b.sact, b.sxs, rows, sh.width, c.swiglu_limit);
-        try e.mm(b, b.sact, sh.width, b.sxs, sh.down, b.sy, rows, true);
+        // TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same bits), while the
+        // L2 still holds what site "a" prefetched for it
+        if (e.l2pf_active) try e.sharedExpert(b, sh, rows);
+        if (e.exl3_v18) try kern.routed18(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit, b.prefill) else try kern.routed(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit);
+        if (!e.l2pf_active) try e.sharedExpert(b, sh, rows);
         // forward.py moe_block: the shared row read from sy where it is (a prompt chunk always, a decode window unless
         // TF_GLM_COMBINE_SY=0), else copied into the routed rows' last slot
         if (e.exl3_v18 and (b.prefill or e.combine_sy)) {
@@ -684,7 +702,16 @@ pub const Engine = struct {
             try e.copyRows(b.sy, d * f4, b.exl3.y + c.topk * d * f4, slots * d * f4, d * f4, rows);
             try e.t.combine(b.exl3.y, b.wts, b.part, rows, d, slots);
         }
+        try e.pfSite(layer, 1);
         return e.gather(b, rows);
+    }
+
+    /// forward.shared_front: the MoE's shared expert on b.normed into b.sy.
+    fn sharedExpert(e: *Engine, b: *const Buffers, sh: wt.Mlp, rows: usize) !void {
+        const c = e.w.cfg;
+        try e.mm(b, b.normed, c.hidden, b.xs, sh.gu, b.sgu, rows, false);
+        try e.t.swiglu(b.sgu, b.sact, b.sxs, rows, sh.width, c.swiglu_limit);
+        try e.mm(b, b.sact, sh.width, b.sxs, sh.down, b.sy, rows, true);
     }
 
     fn copyRows(e: *Engine, src: u64, src_ld: usize, dst: u64, dst_ld: usize, bytes: usize, rows: usize) !void {
@@ -697,12 +724,22 @@ pub const Engine = struct {
         try cuda.launch.launch(e.k.copy_rows, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, e.s, &a);
     }
 
+    /// glue.hc_pre: the mixing dots of a prompt chunk on the tensor cores (TF_GLM_HC_MMA), of a decode window in hc.cu
+    /// (TF_GLM_HC_DEC), else glue._hc_partial; then _hc_finish.
+    fn hcPre(e: *Engine, b: *const Buffers, h: wt.Hc, norm: u64, rows: usize) !void {
+        const c = e.w.cfg;
+        const d: usize = c.hidden;
+        const s: usize = c.hc;
+        if (b.prefill and e.hc_mma) try e.t.hcPartialMma(b.x, h.fn_, b.hcpart, rows, d, s) else if (e.hc_dec) try kern.hcPartial(e.k, e.s, b.x, h.fn_, b.hcpart, rows) else try e.t.hcPartial(b.x, h.fn_, b.hcpart, rows, d, s);
+        try e.t.hcFinish(b.x, h.base, h.scale, norm, b.normed, b.xs, b.post, b.comb, b.hcpart, rows, d, s, c.eps, c.hc_eps, c.sinkhorn);
+    }
+
     fn layerForward(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, host_pos: usize) !void {
         const c = e.w.cfg;
         const d: usize = c.hidden;
         const s: usize = c.hc;
         const h = l.attn_hc.?;
-        try e.t.hcPre(b.x, h.fn_, h.base, h.scale, l.in_norm, b.normed, b.xs, b.post, b.comb, b.hcpart, rows, d, s, c.eps, c.hc_eps, c.sinkhorn);
+        try e.hcPre(b, h, l.in_norm, rows);
         const g = switch (l.kind) {
             .kda => try e.kdaBlock(l, b, rows, host_pos),
             .mla => blk: {
@@ -712,13 +749,27 @@ pub const Engine = struct {
         };
         try e.t.hcPost(b.x, b.x, g, b.post, b.comb, wt.world, rows, d, s);
         const f = l.ffn_hc.?;
-        try e.t.hcPre(b.x, f.fn_, f.base, f.scale, l.post_norm, b.normed, b.xs, b.post, b.comb, b.hcpart, rows, d, s, c.eps, c.hc_eps, c.sinkhorn);
-        const g2 = if (l.mlp) |m| try e.mlpBlock(m, b, rows) else try e.moeBlock(l.moe.?, b, rows);
+        try e.hcPre(b, f, l.post_norm, rows);
+        const g2 = if (l.mlp) |m| try e.mlpBlock(m, b, rows, l.index) else try e.moeBlock(l.moe.?, b, rows, l.index);
         try e.t.hcPost(b.x, b.x, g2, b.post, b.comb, wt.world, rows, d, s);
     }
 
     /// forward.compute with host_pos: logits of every row (decode) or of the last row (a prompt chunk).
     pub fn compute(e: *Engine, b: *Buffers, rows: usize) !void {
+        const prefetch = !b.prefill and !e.l2pf_active and if (e.l2pf) |p| rows <= p.s.rows else false;
+        if (!prefetch) return e.computeWindow(b, rows);
+        e.l2pf_active = true; // TF_GLM_L2PF: this decode window's sites prefetch (joined below)
+        defer e.l2pf_active = false;
+        try e.computeWindow(b, rows);
+        try e.l2pf.?.join(e.s);
+    }
+
+    /// The L2 prefetch at `layer`'s site `which` (0 a, 1 f, 2 o) while a decode window runs.
+    fn pfSite(e: *Engine, layer: u32, which: usize) !void {
+        if (e.l2pf_active) try e.l2pf.?.site(e.k, e.s, layer, which);
+    }
+
+    fn computeWindow(e: *Engine, b: *Buffers, rows: usize) !void {
         const c = e.w.cfg;
         const d: usize = c.hidden;
         try e.t.embed(b.ids, e.w.embed, b.x, rows, d, c.hc);
@@ -824,7 +875,7 @@ pub const Engine = struct {
         const g = try e.dsaBlock(l, b, e.st.mtp_kc, e.st.mtp_pos_dev, e.st.mtp_len, ix, n);
         try e.t.residualAdd(b.mx, b.mx, g, wt.world, n, d);
         try e.t.rmsnorm(b.mx, d, l.post_norm, b.normed, d, b.xs, n, d, c.eps);
-        const g2 = try e.moeBlock(l.moe.?, b, n);
+        const g2 = try e.moeBlock(l.moe.?, b, n, l.index);
         try e.t.residualAdd(b.mx, b.mx, g2, wt.world, n, d);
         try e.t.rmsnorm(b.mx + (n - 1) * d * bf, d, m.head_norm, b.fnormed, d, b.fxs, 1, d, c.eps);
         try e.draftHead(b, b.fnormed, 1);

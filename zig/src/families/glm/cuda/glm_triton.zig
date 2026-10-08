@@ -175,8 +175,17 @@ pub const Tri = struct {
 
     /// glue.hc_pre (glue.py:162): x [R, S*D] streams -> out [R, D] normed and xs, post [R, S], comb [R, S, S]; part is [R, 16, 32] fp32.
     /// `scale` is the layer's 3 fp32 mixing scales (a pointer, the kernel's SCALE parameter).
-    pub fn hcPre(t: Tri, x: u64, fn_w: u64, base: u64, scale: u64, norm_w: u64, out: u64, xs: u64, post: u64, comb: u64, part: u64, rows: usize, d: usize, streams: usize, eps: f32, hc_eps: f32, iters: usize) !void {
+    pub fn hcPartial(t: Tri, x: u64, fn_w: u64, part: u64, rows: usize, d: usize, streams: usize) !void {
         try t.run("_hc_partial", .{ rows, hc_blocks, 1 }, &.{ p("X", "*bf16", x), p("FN", "*bf16", fn_w), p("PART", "*fp32", part) }, &.{ ci("WIDE", streams * d), ci("NB", hc_blocks), ci("SUB", 128) });
+    }
+
+    /// glue._hc_partial_mma (v1.8 glue.py:155; TF_GLM_HC_MMA): a prompt chunk's mixing dots on the tensor cores, 64 rows a program.
+    pub fn hcPartialMma(t: Tri, x: u64, fn_w: u64, part: u64, rows: usize, d: usize, streams: usize) !void {
+        try t.run("_hc_partial_mma", .{ cdiv(rows, 64), hc_blocks, 1 }, &.{ p("X", "*bf16", x), p("FN", "*bf16", fn_w), p("PART", "*fp32", part), int("R", rows) }, &.{ ci("WIDE", streams * d), ci("NB", hc_blocks), ci("BM", 64), ci("BK", 64) });
+    }
+
+    /// hc_pre's second half: `part`'s blocks summed in order, the collapsed row and its RMSNorm, post and comb.
+    pub fn hcFinish(t: Tri, x: u64, base: u64, scale: u64, norm_w: u64, out: u64, xs: u64, post: u64, comb: u64, part: u64, rows: usize, d: usize, streams: usize, eps: f32, hc_eps: f32, iters: usize) !void {
         try t.run("_hc_finish", .{ rows, 1, 1 }, &.{ p("X", "*bf16", x), p("PART", "*fp32", part), p("BASE", "*fp32", base), p("SCALE", "*fp32", scale), p("NW", "*bf16", norm_w), p("OUT", "*bf16", out), p("XS", "*fp32", xs), p("POST", "*fp32", post), p("COMB", "*fp32", comb), aot.float("eps_norm", eps), aot.float("hc_eps", hc_eps) }, &.{ ci("D", d), ci("S", streams), ci("NB", hc_blocks), ci("ITERS", iters), ci("BLOCK", d) });
     }
 
