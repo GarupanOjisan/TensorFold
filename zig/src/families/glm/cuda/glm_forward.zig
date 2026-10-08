@@ -298,6 +298,9 @@ pub const Engine = struct {
     /// TF_GLM_EXL3_DEC (default on): v1.8's routed-expert kernels, plan and direct shared-expert combine; 0: the generic
     /// grouped kernel of v0.6.6 (the A/B path).
     exl3_v18: bool = true,
+    /// TF_GLM_KDA_CHUNKED (default on, v1.8's production setting): prompt chunks run KDA in chunked (WY) form, which
+    /// needs prompt chunks to start on a grid of 32 (`kdaChunked`, the server's `promptGrid`); 0: the serial chain.
+    kda_chunked: bool = true,
     /// TF_GLM_COMBINE_SY (default on, with exl3_v18): decode windows combine the shared expert's row where it is.
     combine_sy: bool = true,
     capturing: bool = false,
@@ -311,6 +314,7 @@ pub const Engine = struct {
 
     /// Buffers for windows of max_rows rows, prompt chunks of prefill_rows and the MTP head, and one sequence's state.
     pub fn init(w: *const Weights, d: *const cuda.Driver, s: cuda.Stream, t: tri.Tri, k: *const kern.Kernels, comm: Comm, capacity: usize, long_context: bool) !Engine {
+        if (std.c.getenv("TF_GLM_KDA_WIDE_ROWS")) |v| kern.wide_rows = try std.fmt.parseInt(usize, std.mem.span(v), 10);
         const c = w.cfg;
         const ll: usize = c.kda_heads / wt.world;
         const width = 3 * ll * 128 + 2 * 128 + ll;
@@ -373,6 +377,7 @@ pub const Engine = struct {
         e.full_dev = try cuda.DeviceBuffer.alloc(d, wt.world * max_rows * w.head.n * bf);
         errdefer e.full_dev.free();
         e.full_host = try std.heap.page_allocator.alloc(u16, wt.world * max_rows * w.head.n);
+        e.kda_chunked = kdaChunked();
         e.exl3_v18 = if (std.c.getenv("TF_GLM_EXL3_DEC")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         e.combine_sy = e.exl3_v18 and (if (std.c.getenv("TF_GLM_COMBINE_SY")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true);
         e.use_graphs = if (std.c.getenv("TF_GLM_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
@@ -507,7 +512,7 @@ pub const Engine = struct {
         return e.gather(b, rows);
     }
 
-    fn kdaBlock(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize) !u64 {
+    fn kdaBlock(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize, host_pos: usize) !u64 {
         const c = e.w.cfg;
         const kw = l.kda.?;
         const li = e.st.kda_index[l.index];
@@ -526,7 +531,7 @@ pub const Engine = struct {
         const rec_half = st.kda_layers * rec_layer;
         const scr: KdaScratch = if (b.prefill) b.kscr else .{ .out = st.scr.out + li * max_rows * ll * 128 * bf, .k = st.scr.k + li * max_rows * ll * 128 * f4, .v = st.scr.v + li * max_rows * ll * 128 * bf, .g = st.scr.g + li * max_rows * ll * 128 * f4, .b = st.scr.b + li * max_rows * ll * f4 };
         const conv_layer = 3 * 3 * ll * 128 * bf;
-        try kern.chain(e.k, e.s, .{
+        const chain: kern.Chain = .{
             .heads = ll,
             .p = p,
             .p_stride = e.width,
@@ -552,7 +557,9 @@ pub const Engine = struct {
             .b_save = scr.b,
             .q_tmp = b.q_tmp,
             .y_tmp = b.y_tmp,
-        });
+        };
+        // kda.chain: a prompt chunk takes the chunked form under TF_GLM_KDA_CHUNKED=1 (scratch's k/v/g/b are not written)
+        if (b.prefill and e.kda_chunked) try kern.chainChunked(e.k, e.s, chain, host_pos) else try kern.chain(e.k, e.s, chain);
         if (b.prefill) {
             // a prompt chunk keeps every row: the layer's conv window moves now (its state half flips in prefillChunk)
             try e.t.convShift(st.conv + li * conv_layer, b.kproj, rows, 1, 3 * ll * 128, 3 * 3 * ll * 128, b.rows * e.width, e.width);
@@ -680,7 +687,7 @@ pub const Engine = struct {
         const h = l.attn_hc.?;
         try e.t.hcPre(b.x, h.fn_, h.base, h.scale, l.in_norm, b.normed, b.xs, b.post, b.comb, b.hcpart, rows, d, s, c.eps, c.hc_eps, c.sinkhorn);
         const g = switch (l.kind) {
-            .kda => try e.kdaBlock(l, b, rows),
+            .kda => try e.kdaBlock(l, b, rows, host_pos),
             .mla => blk: {
                 const di = e.st.dsa_index[l.index];
                 break :blk try e.dsaBlock(l, b, e.st.kc[di], e.st.pos_dev, host_pos, if (e.st.long_context) e.st.index[di] else null, rows);
@@ -872,6 +879,17 @@ pub const Engine = struct {
         }
     }
 };
+
+/// TF_GLM_KDA_CHUNKED: on unless "0".
+pub fn kdaChunked() bool {
+    return if (std.c.getenv("TF_GLM_KDA_CHUNKED")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+}
+
+/// engine.prompt_grid: the rows a prompt chunk and a kept prompt state start on. Chunked KDA depends on the alignment of its
+/// 32-row sub-chunks, so under TF_GLM_KDA_CHUNKED the grid is 64 (a multiple of 32 that divides the 2,048-row chunks).
+pub fn promptGrid() u32 {
+    return if (kdaChunked()) 64 else 0;
+}
 
 pub fn denseLimit(w: *const Weights) usize {
     return @as(usize, w.cfg.i_topk) + w.cfg.kpool - 1;

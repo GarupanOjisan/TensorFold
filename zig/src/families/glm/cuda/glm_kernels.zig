@@ -13,7 +13,7 @@ fn int(x: usize) i32 {
 }
 
 pub const Kernels = struct {
-    mods: [9]cuda.Module,
+    mods: [10]cuda.Module,
     chain: cuda.Function,
     prep: cuda.Function,
     step: cuda.Function,
@@ -53,6 +53,7 @@ pub const Kernels = struct {
     plan_rank: cuda.Function,
     plan_offsets: cuda.Function,
     plan_scatter: cuda.Function,
+    kda_chunk: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -77,6 +78,10 @@ pub const Kernels = struct {
         errdefer k.mods[7].unload();
         k.mods[8] = try cuda.Module.load(d, cuda.kernels.experts);
         errdefer k.mods[8].unload();
+        k.mods[9] = try cuda.Module.load(d, cuda.kernels.glm_kda_chunk);
+        errdefer k.mods[9].unload();
+        k.kda_chunk = try k.mods[9].function("_ZN12tf_kda_chunk12chunk_kernelEiPK13__nv_bfloat16iiS2_iS2_iS2_S2_PKfS4_S4_S2_ffiiPS0_Pf");
+        try k.kda_chunk.allowDynamicShared(kda_chunk_smem);
         k.chain = try k.mods[0].function(sym.kda_chain);
         k.prep = try k.mods[0].function(sym.kda_prep);
         k.step = try k.mods[0].function(sym.kda_step);
@@ -384,8 +389,39 @@ pub const Chain = struct {
     y_tmp: u64 = 0,
 };
 
-/// kda.py:58: from this many rows a chain runs as prep, step and out.
-pub const wide_rows = 64;
+/// kda.py WIDE_ROWS (TF_GLM_KDA_WIDE_ROWS, v1.8's default 1; 64 was v0.6.6's): from this many rows a chain runs as prep, step
+/// and out (the same bits as the one-block chain). The engine sets it from the environment before it sizes its buffers.
+pub var wide_rows: usize = 1;
+
+/// sizeof(Smem) of kda_chunk.cu's chunk_kernel (nvcc).
+const kda_chunk_smem: u32 = 98560;
+
+/// kda_chunked.chain: a prompt chunk of `c.rows` rows whose first row sits at absolute position `pos`, in 32-row
+/// sub-chunks at absolute positions (TF_GLM_KDA_CHUNKED=1). Writes `c.out` and `c.state_out` only; the conv state is read.
+pub fn chainChunked(k: *const Kernels, s: cuda.Stream, c: Chain, pos: usize) !void {
+    var a: cuda.Args = .{};
+    a.add(int(c.heads));
+    a.add(c.p);
+    a.add(int(c.p_stride));
+    a.add(int(c.b_off));
+    a.add(c.a);
+    a.add(int(c.a_stride));
+    a.add(c.g);
+    a.add(int(c.g_stride));
+    a.add(c.conv_state);
+    a.add(c.conv_w);
+    a.add(c.state_in);
+    a.add(c.a_log);
+    a.add(c.dt_bias);
+    a.add(c.norm_w);
+    a.add(c.eps);
+    a.add(c.lower);
+    a.add(int(c.rows));
+    a.add(int(pos % 32));
+    a.add(c.out);
+    a.add(c.state_out);
+    try go(k.kda_chunk, s, .{ c.heads, 1, 1 }, 256, kda_chunk_smem, &a);
+}
 
 pub fn chain(k: *const Kernels, s: cuda.Stream, c: Chain) !void {
     var a: cuda.Args = .{};

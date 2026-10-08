@@ -16,6 +16,7 @@ pub const formats: []const []const u8 = &.{"exl3-mcg-4bit"};
 pub const default_context: i64 = 1048576;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fwd.Engine.prefill_rows;
+pub const promptGrid = fwd.promptGrid;
 /// One sequence's caches, allocated at load: one stream at a time.
 pub const max_lanes: u32 = 1;
 pub const default_port: u16 = 29660;

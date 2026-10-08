@@ -32,6 +32,7 @@ pub const torch_indexing: []const u8 = if (available) &Blob("fatbin_torch_indexi
 pub const torch_movement: []const u8 = if (available) &Blob("fatbin_torch_movement").bytes else &.{};
 pub const torch_nemotron_constants: []const u8 = if (available) &Blob("fatbin_torch_nemotron_constants").bytes else &.{};
 pub const glm_kda: []const u8 = if (available) &Blob("fatbin_glm_kda").bytes else &.{};
+pub const glm_kda_chunk: []const u8 = if (available) &Blob("fatbin_glm_kda_chunk").bytes else &.{};
 pub const glm_exl3: []const u8 = if (available) &Blob("fatbin_glm_exl3").bytes else &.{};
 pub const glm_exl3d: []const u8 = if (available) &Blob("fatbin_glm_exl3d").bytes else &.{};
 pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes else &.{};

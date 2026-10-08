@@ -102,6 +102,7 @@ pub const Server = struct {
         }
         if (srv.info.prefill_step > 0) {
             srv.chunks = try chunk_plan.markers(srv, a, srv.info.prefill_step);
+            srv.chunks.grid = srv.info.prefill_grid;
             log.line("prompt chunks of up to {d},{d:0>3} tokens, cut at replies {d}+ tokens apart", .{ srv.info.prefill_step / 1000, srv.info.prefill_step % 1000, srv.chunks.min_chunk });
         }
         return srv;

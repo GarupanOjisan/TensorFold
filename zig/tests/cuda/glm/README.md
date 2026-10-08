@@ -73,3 +73,16 @@ the shared expert before the routed ones (it matters with `TF_GLM_L2PF` only).
 The reference sets `m1`, `m2`, `m3` are `q1`, `q2`, `q3` with `OFF_EXTRA="-e TF_GLM_EXL3_LOADS=nc -e TF_GLM_EXL3_DEC=1
 -e TF_GLM_EXL3_FUSE=1 -e TF_GLM_EXL3_XROW=1 -e TF_GLM_EXL3_PROMPT=1 -e TF_GLM_EXL3_ORDER=1 -e TF_GLM_EXL3_ROWROT=1
 -e TF_GLM_EXL3_PASS=64 -e TF_GLM_COMBINE_SY=1"` (`cap18.sh` appends it). `aot/m18` is `aot/q18` plus `_combine_sy`.
+
+## 6. v1.8's KDA kernels (TF_GLM_KDA_CHUNKED, TF_GLM_KDA_WIDE_ROWS)
+
+A prompt chunk runs each KDA layer through `chunk_kernel` (`glm_kda_chunk.cu`, a copy of v1.8's `kda_chunk.cu` lines 1-711):
+32-row sub-chunks at absolute positions, one block of 256 threads a head, no per-row k/v/g/b saved. `TF_GLM_KDA_CHUNKED=0`
+runs the serial chain as before. Its rows depend on the alignment of the sub-chunks, so under it chunk starts and kept prompt
+states sit on a grid of 64 rows (`engine.prompt_grid`): the server rounds its chunk starts and the cut before the
+conversation's text down to it (`Info.prefill_grid`, `chunk_plan.Plan.grid`); the 2,048-row chunks of `tf-glm check` start on it anyway.
+Decode windows take the three-kernel chain (`prep`, `step`, `out`) from one row on (`TF_GLM_KDA_WIDE_ROWS`, default 1; 64 was
+v0.6.6's); `glm_kda.cu` already holds those kernels, v1.8 only appended the multi-stream segment variants after line 353, and
+`replay_layers` and the conv shift are unchanged for one stream.
+
+The reference sets `k1`, `k2`, `k3` are `m1`, `m2`, `m3` with `-e TF_GLM_KDA_CHUNKED=1 -e TF_GLM_KDA_WIDE_ROWS=1`.

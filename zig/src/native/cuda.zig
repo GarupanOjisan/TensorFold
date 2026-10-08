@@ -378,7 +378,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         if (want > 0) h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = loaded.ctx, .vtable = &vt }, .{ .lookahead = F.cache_lookahead, .planned = F.cache_planned }, want);
     }
     errdefer if (h.cache) |*store| store.deinit();
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prefill_step = if (kept) F.prompt_rows else 0 }, .{ .ctx = loaded.ctx, .text = F.explain });
+    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prefill_step = if (kept) F.prompt_rows else 0, .prefill_grid = if (kept and @hasDecl(F, "promptGrid")) F.promptGrid() else 0 }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

@@ -117,6 +117,9 @@ pub const Info = struct {
     structures: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
+    /// Chunk starts and kept prompt states sit on multiples of this many rows (a family whose prompt kernels depend on
+    /// the alignment of their sub-chunks; 0: anywhere).
+    prefill_grid: u32 = 0,
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
     startup: []const u8 = "",
 };
