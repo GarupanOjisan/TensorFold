@@ -13,7 +13,7 @@ fn int(x: usize) i32 {
 }
 
 pub const Kernels = struct {
-    mods: [6]cuda.Module,
+    mods: [7]cuda.Module,
     chain: cuda.Function,
     prep: cuda.Function,
     step: cuda.Function,
@@ -33,6 +33,11 @@ pub const Kernels = struct {
     transpose16: cuda.Function,
     q4_group: cuda.Function,
     q4_prefill: cuda.Function,
+    q4_prefill_f32: cuda.Function,
+    quantize4_mse: cuda.Function,
+    make_f8: cuda.Function,
+    /// v1.8's decode matmul qmm_kernel by tile config (qmm_cfgs), fp32 out, K slices in a cluster.
+    qmm: [qmm_cfgs.len][2][2]cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -50,6 +55,9 @@ pub const Kernels = struct {
         errdefer k.mods[4].unload();
         k.mods[5] = try cuda.Module.load(d, cuda.kernels.nemotron_ops);
         errdefer k.mods[5].unload();
+        // TF_GLM_DENSE=q4's decode matmul: v1.8's qmm.cu (cuda/kernels/qmm.py `qmm`, `qmm_cfg`)
+        k.mods[6] = try cuda.Module.load(d, cuda.kernels.qmm);
+        errdefer k.mods[6].unload();
         k.chain = try k.mods[0].function(sym.kda_chain);
         k.prep = try k.mods[0].function(sym.kda_prep);
         k.step = try k.mods[0].function(sym.kda_step);
@@ -69,8 +77,16 @@ pub const Kernels = struct {
         k.transpose16 = try k.mods[5].function("tf_transpose_pad16");
         k.q4_group = try k.mods[3].function(q4_sym.group);
         k.q4_prefill = try k.mods[4].function(q4_sym.prefill);
+        k.q4_prefill_f32 = try k.mods[4].function(q4_sym.prefill_f32);
+        k.quantize4_mse = try k.mods[2].function("tf_glm_quantize4_mse");
+        k.make_f8 = try k.mods[2].function("tf_glm_make_f8");
         try k.q4_group.allowDynamicShared(q4_group_smem);
         try k.q4_prefill.allowDynamicShared(q4_prefill_smem);
+        try k.q4_prefill_f32.allowDynamicShared(q4_prefill_smem);
+        inline for (qmm_cfgs, 0..) |c, i| inline for (.{ false, true }, 0..) |fp32, j| inline for (.{ false, true }, 0..) |cluster, l| {
+            k.qmm[i][j][l] = try k.mods[6].function(comptime c.symbol(fp32, cluster));
+            try k.qmm[i][j][l].allowDynamicShared(c.smem());
+        };
         // group_kernel's members list grows with the rows (a prompt chunk's 2048 rows * 9 slots * 4 B): experts.cu:292-305
         try k.group.allowDynamicShared(96 << 10);
         return k;
@@ -85,7 +101,35 @@ pub const Kernels = struct {
 const q4_sym = struct {
     const group = "_ZN12tf_qmm_group12group_kernelILi64ELi16ELi64ELi1ELi4ELi8ELb0ELb0ELb0ELb0EEEvPK13__nv_bfloat16PKfNS_5PartsEiiiii";
     const prefill = "_ZN14tf_qmm_prefill14prefill_kernelILi64ELi128ELi128ELi2ELi4ELi3ELb0EEEvPK13__nv_bfloat16PKjS3_S3_Pviiiiii";
+    const prefill_f32 = "_ZN14tf_qmm_prefill14prefill_kernelILi64ELi128ELi128ELi2ELi4ELi3ELb1EEEvPK13__nv_bfloat16PKjS3_S3_Pviiiiii";
 };
+
+/// v1.8 qmm.cu's qmm_kernel<64, 16, bn, 1, wn, stages> for a decode window (rows <= 16). Config 0 is `qmm` with the
+/// 16-row tile; 1 and 2 are `qmm_cfg` 2 and 4. dec_tile (glm qmm.py DEC_TILES) picks one by the projection's shape.
+const QmmCfg = struct {
+    bn: u32,
+    wn: u32,
+    stages: u32,
+
+    fn symbol(c: QmmCfg, comptime fp32: bool, comptime cluster: bool) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN6tf_qmm10qmm_kernelILi64ELi16ELi{d}ELi1ELi{d}ELi{d}ELb{d}ELb{d}ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii", .{ c.bn, c.wn, c.stages, @intFromBool(fp32), @intFromBool(cluster) });
+    }
+
+    /// Tile<64, 16, bn, 1, wn, stages>::SMEM: the pipeline's stages, or the cluster sum's partials if larger.
+    fn smem(c: QmmCfg) u32 {
+        const stage = 16 * 128 + c.bn * 64 / 2 + 2 * (c.bn * 2) + 16 * 4;
+        const partials = (c.bn / c.wn / 8) * 4 * (c.wn * 32) * 4;
+        return @max(c.stages * stage, partials);
+    }
+};
+const qmm_cfgs = [_]QmmCfg{ .{ .bn = 64, .wn = 4, .stages = 4 }, .{ .bn = 128, .wn = 8, .stages = 4 }, .{ .bn = 128, .wn = 4, .stages = 6 } };
+
+/// glm qmm.py DEC_TILES (TF_GLM_Q4_TILE unset): the config index of a few projection shapes, else 0.
+fn decCfg(n: usize, kk: usize) usize {
+    const table = [_][3]usize{ .{ 4096, 4096, 1 }, .{ 2048, 4096, 1 }, .{ 8192, 1536, 1 }, .{ 4096, 8192, 2 }, .{ 4096, 1024, 1 } };
+    for (table) |t| if (t[0] == n and t[1] == kk) return t[2];
+    return 0;
+}
 const q4_group_smem: u32 = 35328; // LaneTile<64, 16, 64, 1, 4, 8>::SMEM
 const q4_prefill_smem: u32 = 62976; // Tile<64, 128, 128, 2, 4, 3>::SMEM
 
@@ -101,9 +145,13 @@ pub fn q4Bytes(n: usize, k: usize) usize {
     return npad * k / 2 + 2 * (k / 64) * npad * 2 + 512;
 }
 
-/// qmm.quantize4 then qmm.make_q4 of a bf16 (n, k) matrix into `at` (q4Bytes), with `tmp` for the MLX arrays
-/// (n k / 2 + 4 n k / 64 bytes).
-pub fn quantize4(k: *const Kernels, s: cuda.Stream, w: u64, n: usize, kk: usize, at: u64, tmp: u64) !Q4 {
+/// Which ranges a group's 16 levels span: its min and max (qmm.quantize4, the draft head's), or the least-squares one
+/// of 16 clippings (qmm.quantize4_mse, TF_GLM_DENSE=q4's projections).
+pub const Quant = enum { minmax, mse };
+
+/// qmm.quantize4 or quantize4_mse, then qmm.make_q4, of a bf16 (n, k) matrix into `at` (q4Bytes), with `tmp` for the
+/// MLX arrays (n k / 2 + 4 n k / 64 bytes).
+pub fn quantize4(k: *const Kernels, s: cuda.Stream, kind: Quant, w: u64, n: usize, kk: usize, at: u64, tmp: u64) !Q4 {
     const kg = kk / 64;
     const npad = (n + 127) / 128 * 128;
     const mw = tmp;
@@ -116,7 +164,8 @@ pub fn quantize4(k: *const Kernels, s: cuda.Stream, w: u64, n: usize, kk: usize,
     a.add(mw);
     a.add(ms);
     a.add(mb);
-    try go(k.quantize4, s, .{ (n * kg + 255) / 256, 1, 1 }, 256, 0, &a);
+    const threads: usize = if (kind == .mse) 64 else 256; // the MSE search keeps a group's 64 values in registers
+    try go(if (kind == .mse) k.quantize4_mse else k.quantize4, s, .{ (n * kg + threads - 1) / threads, 1, 1 }, threads, 0, &a);
     const q: Q4 = .{ .w = at, .s = at + npad * kk / 2, .b = at + npad * kk / 2 + kg * npad * 2, .n = n, .k = kk, .npad = npad };
     const total: u64 = @as(u64, npad / 64) * kg * 512;
     var p: cuda.Args = .{};
@@ -133,6 +182,50 @@ pub fn quantize4(k: *const Kernels, s: cuda.Stream, w: u64, n: usize, kk: usize,
         try go(k.transpose16, s, .{ (kg * npad + 255) / 256, 1, 1 }, 256, 0, &t);
     }
     return q;
+}
+
+/// An e4m3 matrix (qmm.F8): values [n, k] and an fp32 scale per row and 128 columns.
+pub const F8 = struct { w: u64, s: u64, n: usize, k: usize };
+
+/// qmm.make_f8 of a bf16 (n, k) matrix (k a multiple of 128) into `w` (n k bytes) and `s` (n k / 32 bytes).
+pub fn makeF8(k: *const Kernels, s: cuda.Stream, src: u64, n: usize, kk: usize, w: u64, scale: u64) !F8 {
+    if (kk % 128 != 0) return error.F8Width;
+    var a: cuda.Args = .{};
+    a.add(src);
+    a.add(int(n));
+    a.add(int(kk));
+    a.add(w);
+    a.add(scale);
+    try go(k.make_f8, s, .{ (n * kk / 128 + 63) / 64, 1, 1 }, 64, 0, &a);
+    return .{ .w = w, .s = scale, .n = n, .k = kk };
+}
+
+/// glm qmm.split_k: the K slices of a 4-bit (n, k) matmul, from SHAPE_SK or else the generic rule (q4SplitK).
+pub fn denseSplitK(n: usize, kk: usize) usize {
+    const table = [_][3]usize{ .{ 12576, 4096, 4 }, .{ 4096, 4096, 2 }, .{ 2048, 4096, 4 }, .{ 8192, 1536, 4 }, .{ 8192, 512, 4 }, .{ 4096, 8192, 8 } };
+    for (table) |t| if (t[0] == n and t[1] == kk) return t[2];
+    return q4SplitK(n, kk);
+}
+
+/// qmm.matmul of a 4-bit q for a decode window (shared.matmul -> `qmm` or, with dec_tile, `qmm_cfg`: v1.8's qmm_kernel):
+/// x (rows <= 16, k) bf16, rows `x_stride` elements apart, with its group sums xs -> out (rows, n), fp32 with `f32`.
+pub fn qmmDecode(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, rows: usize, fp32: bool) !void {
+    if (rows > 16) return error.WindowTooWide;
+    if (x % 16 != 0 or (rows > 1 and x_stride % 8 != 0)) return error.MisalignedInput; // Python would clone x (cp.async reads 16 bytes)
+    const sk = denseSplitK(q.n, q.k);
+    const cfg = decCfg(q.n, q.k);
+    const c = qmm_cfgs[cfg];
+    const tiles = (q.n + c.bn - 1) / c.bn;
+    var a: cuda.Args = .{};
+    for ([_]u64{ x, xs, q.w, q.s, q.b, out, 0 }) |v| a.add(v); // part: unused, the K slices sum in a cluster
+    // M, N, K, SK, npad (the scales' row stride), ldx, group (one row tile: one)
+    for ([_]usize{ rows, q.n, q.k, sk, q.npad, if (rows == 1) q.k else x_stride, 1 }) |v| a.add(int(v));
+    try cuda.launch.launch(k.qmm[cfg][@intFromBool(fp32)][@intFromBool(sk > 1)], .{
+        .grid = .{ .x = u(tiles), .y = 1, .z = u(sk) },
+        .block = .{ .x = c.wn * 32 },
+        .shared = c.smem(),
+        .cluster = if (sk > 1) .{ .x = 1, .y = 1, .z = u(sk) } else null,
+    }, s, &a);
 }
 
 /// qmm.matmul of a 4-bit q on sm_12x (shared.matmul -> qmm_group, the kernel's own tile): x (rows, k) bf16 with
@@ -158,15 +251,16 @@ pub fn q4Matmul(k: *const Kernels, s: cuda.Stream, x: u64, xs: u64, q: Q4, out: 
     }, s, &a);
 }
 
-/// shared.prefill_matmul (a prompt chunk's 4-bit projection): bf16 out.
-pub fn q4Prefill(k: *const Kernels, s: cuda.Stream, x: u64, q: Q4, out: u64, rows: usize) !void {
+/// shared.prefill_matmul (a prompt chunk's 4-bit projection): x rows `x_stride` elements apart, out bf16 or fp32.
+pub fn q4Prefill(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, q: Q4, out: u64, rows: usize, fp32: bool) !void {
+    if (x % 16 != 0 or (rows > 1 and x_stride % 8 != 0)) return error.MisalignedInput;
     const rows_t = (rows + 127) / 128;
     const band = (12 << 20) / (128 * q.k * 2);
     const group = @max(1, @min(rows_t, band));
     var a: cuda.Args = .{};
     for ([_]u64{ x, q.w, q.s, q.b, out }) |v| a.add(v);
-    for ([_]usize{ rows, q.n, q.k, q.npad, q.k, group }) |v| a.add(int(v));
-    try go(k.q4_prefill, s, .{ rows_t * ((q.n + 127) / 128), 1, 1 }, 256, q4_prefill_smem, &a);
+    for ([_]usize{ rows, q.n, q.k, q.npad, if (rows == 1) q.k else x_stride, group }) |v| a.add(int(v));
+    try go(if (fp32) k.q4_prefill_f32 else k.q4_prefill, s, .{ rows_t * ((q.n + 127) / 128), 1, 1 }, 256, q4_prefill_smem, &a);
 }
 
 /// glm qmm.split_k for shapes outside its SHAPE_SK table (the draft head's): K slices until column tiles times slices reach 192.
@@ -180,6 +274,23 @@ pub fn q4SplitK(n: usize, kk: usize) usize {
 
 test "the draft head's shape takes one K slice" {
     try std.testing.expectEqual(@as(usize, 1), q4SplitK(77440, 4096));
+}
+
+test "the dense 4-bit matmuls' K slices, tile configs and shared memory" {
+    const t = std.testing;
+    // every per-rank shape of TF_GLM_DENSE=q4: n, k, slices (SHAPE_SK, else the generic rule), config (DEC_TILES)
+    const shapes = [_][4]usize{
+        .{ 12576, 4096, 4, 0 }, .{ 4096, 128, 1, 0 },  .{ 4096, 4096, 2, 1 }, .{ 12288, 4096, 1, 0 }, .{ 4096, 6144, 4, 0 },
+        .{ 2048, 4096, 4, 1 },  .{ 8192, 1536, 4, 1 }, .{ 4096, 8192, 8, 2 }, .{ 160, 4096, 8, 0 },   .{ 4096, 1536, 2, 0 },
+        .{ 4096, 1024, 2, 1 },
+    };
+    for (shapes) |s| {
+        try t.expectEqual(s[2], denseSplitK(s[0], s[1]));
+        try t.expectEqual(s[3], decCfg(s[0], s[1]));
+    }
+    try t.expectEqual(@as(u32, 17664), qmm_cfgs[0].smem()); // Tile<64, 16, 64, 1, 4, 4>
+    try t.expectEqual(@as(u32, 26880), qmm_cfgs[1].smem()); // Tile<64, 16, 128, 1, 8, 4>
+    try t.expectEqual(@as(u32, 40320), qmm_cfgs[2].smem()); // Tile<64, 16, 128, 1, 4, 6>
 }
 
 fn go(f: cuda.Function, s: cuda.Stream, grid: [3]usize, block: usize, shared: usize, args: *cuda.Args) !void {

@@ -13,6 +13,7 @@ const kernels = [_]Kernel{
     .{ .name = "probe", .flags = &.{"-O3"} },
     .{ .name = "qmm_group", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
     .{ .name = "qmm_prefill", .flags = &.{"-O3"} },
+    .{ .name = "qmm", .flags = &.{"-O3"} }, // glm5_next/cuda: TF_GLM_DENSE=q4's decode matmul (v1.8 cuda/kernels/qmm.cu)
     .{ .name = "experts", .flags = &.{"-O3"} }, // cuda/experts.py, tensorfold_experts_v7
     .{ .name = "experts_prefill", .flags = &.{"-O3"} },
     .{ .name = "experts_pack", .flags = &.{"-O3"} },

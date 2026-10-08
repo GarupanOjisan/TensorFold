@@ -1,6 +1,7 @@
 //! `tf-glm`: GLM-5.3-Flash on two CUDA ranks without Python, and its check against the Python engine's replies.
 //!   tf-glm check MODEL --rank R --master HOST [--port P] --prompts prompts.json --want tokens.json
 //!          [--max-tokens N] [--context N] [--depth D] [--only NAME,...] [--kernels DIR]
+//!   tf-glm qdump MODEL --rank R --out DIR [--only NAME,...]   (TF_GLM_DENSE=q4's quantization of a few tensors, as bytes)
 //! Run once on each Spark (rank 0 on HOST). Each prompt is prefilled and decoded serially, then with MTP drafts;
 //! rank 0 prints whether both equal the capture's serial reply.
 const std = @import("std");
@@ -25,6 +26,7 @@ const Opts = struct {
     depth: usize = 3,
     only: []const u8 = "",
     kernels: ?[]const u8 = null,
+    out: []const u8 = "",
 };
 
 pub fn main(init: std.process.Init) !u8 {
@@ -32,9 +34,10 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 3 or !(std.mem.eql(u8, args[1], "check") or std.mem.eql(u8, args[1], "follow"))) {
+    if (args.len < 3 or !(std.mem.eql(u8, args[1], "check") or std.mem.eql(u8, args[1], "follow") or std.mem.eql(u8, args[1], "qdump"))) {
         std.debug.print("usage: tf-glm check MODEL --rank R --master HOST --prompts P --want W [options]\n" ++
-            "       tf-glm follow MODEL --master HOST [--port P] [--context N] [--kernels DIR]   (rank 1 of a server)\n", .{});
+            "       tf-glm follow MODEL --master HOST [--port P] [--context N] [--kernels DIR]   (rank 1 of a server)\n" ++
+            "       tf-glm qdump MODEL --rank R --out DIR [--only NAME,...]\n", .{});
         return 2;
     }
     var o: Opts = .{ .model = args[2] };
@@ -52,11 +55,13 @@ pub fn main(init: std.process.Init) !u8 {
         else if (std.mem.eql(u8, a, "--depth")) o.depth = try std.fmt.parseInt(usize, v, 10)
         else if (std.mem.eql(u8, a, "--only")) o.only = v
         else if (std.mem.eql(u8, a, "--kernels")) o.kernels = v
+        else if (std.mem.eql(u8, a, "--out")) o.out = v
         else {
             std.debug.print("unknown option {s}\n", .{a});
             return 2;
         }
     }
+    if (std.mem.eql(u8, args[1], "qdump")) return qdump(init, o);
     const kernels_dir = o.kernels orelse init.environ_map.get("TENSORFOLD_CUDA_KERNELS") orelse return error.NoKernelDir;
     if (std.mem.eql(u8, args[1], "follow")) return follow(init, o, kernels_dir);
 
@@ -72,6 +77,20 @@ pub fn main(init: std.process.Init) !u8 {
     defer lib.close();
     var pair = if (o.rank == 0) try cuda.Pair.listen(o.port) else try cuda.Pair.connect(o.master, o.port, 600);
     defer pair.close();
+    // both ranks must run the same TF_GLM_DENSE: their all-gathered partials would mix 4-bit and BF16 projections
+    const dense_mine: u32 = @intFromEnum(try wt.denseKind());
+    var dense_theirs: u32 = undefined;
+    if (o.rank == 0) {
+        try pair.send(std.mem.asBytes(&dense_mine));
+        try pair.recv(std.mem.asBytes(&dense_theirs));
+    } else {
+        try pair.recv(std.mem.asBytes(&dense_theirs));
+        try pair.send(std.mem.asBytes(&dense_mine));
+    }
+    if (dense_mine != dense_theirs) {
+        std.log.err("the two ranks run different TF_GLM_DENSE (kind {d} here, {d} on the other rank)", .{ dense_mine, dense_theirs });
+        return error.RankSettingsDiffer;
+    }
     var id: cuda.nccl.UniqueId = undefined;
     if (o.rank == 0) {
         try lib.check(lib.api.ncclGetUniqueId(&id), "ncclGetUniqueId");
@@ -85,15 +104,15 @@ pub fn main(init: std.process.Init) !u8 {
     const cfg_text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, arena, .limited(1 << 22));
     const cfg = try glm_config.parse(gpa, cfg_text);
 
+    var k = try kern.Kernels.load(&driver);
+    defer k.deinit();
     var t0 = now(io);
-    var w = try wt.load(gpa, io, &driver, .{ .d = &driver, .s = stream }, o.model, cfg, o.rank, true);
+    var w = try wt.load(gpa, io, &driver, .{ .d = &driver, .s = stream }, &k, o.model, cfg, o.rank, true);
     defer w.deinit(gpa);
     std.debug.print("[tf-glm] rank {d}: weights {d:.1} GiB in {d:.1} s\n", .{ o.rank, @as(f64, @floatFromInt(w.bytes)) / (1 << 30), secs(io, t0) });
 
     var set = try cuda.aot.Set.load(gpa, io, &driver, ctx.device, kernels_dir);
     defer set.deinit();
-    var k = try kern.Kernels.load(&driver);
-    defer k.deinit();
     const long_context = o.context > fwd.denseLimit(&w);
     var e = try fwd.Engine.init(&w, &driver, stream, .{ .set = &set, .s = stream }, &k, .{ .lib = &lib, .comm = comm }, o.context + fwd.Engine.max_rows, long_context);
     defer e.deinit();
@@ -144,6 +163,26 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     return if (failed == 0) 0 else 1;
+}
+
+/// The quantization of a few tensors of one rank, on one GPU without NCCL (compared with v1.8's by qdump.py).
+fn qdump(init: std.process.Init, o: Opts) !u8 {
+    const gpa = init.gpa;
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    var stream = try cuda.Stream.init(&driver, true);
+    defer stream.deinit();
+    var k = try kern.Kernels.load(&driver);
+    defer k.deinit();
+    const cfg_path = try std.fs.path.join(gpa, &.{ o.model, "config.json" });
+    defer gpa.free(cfg_path);
+    const cfg_text = try std.Io.Dir.cwd().readFileAlloc(init.io, cfg_path, gpa, .limited(1 << 22));
+    defer gpa.free(cfg_text);
+    const cfg = try glm_config.parse(gpa, cfg_text);
+    try wt.dumpQuant(gpa, init.io, &driver, .{ .d = &driver, .s = stream }, &k, o.model, cfg, o.rank, o.out, o.only);
+    return 0;
 }
 
 /// Rank 1 of a served GLM: load this rank, then run rank 0's commands until it stops.

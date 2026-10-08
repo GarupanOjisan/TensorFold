@@ -27,15 +27,24 @@ def main() -> int:
     ap.add_argument("--manifest", action="append", required=True, help="a capture's manifest (repeatable)")
     ap.add_argument("--cache", action="append", required=True, help="that capture's Triton cache, in the same order")
     ap.add_argument("--jit", required=True)
+    ap.add_argument("--base", help="a set to extend: its kernels stay as they are, the manifests add the new ones")
+    ap.add_argument("--only", default="", help="comma-separated kernel names: add only these from the manifests")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
     jit = json.loads(Path(a.jit).read_text())
     out = Path(a.out)
     (out / "cubins").mkdir(parents=True, exist_ok=True)
     kernels, seen = [], set()
+    if a.base:
+        base = Path(a.base)
+        for k in json.loads((base / "aot.json").read_text())["kernels"]:
+            seen.add(k["hash"])
+            kernels.append(k)
+            shutil.copyfile(base / "cubins" / f"{k['hash']}.cubin", out / "cubins" / f"{k['hash']}.cubin")
+    only = set(filter(None, a.only.split(",")))
     for manifest, cache in zip(a.manifest, a.cache, strict=True):
         for k in json.loads(Path(manifest).read_text())["kernels"]:
-            if k["hash"] not in seen:
+            if k["hash"] not in seen and (not only or k["name"] in only):
                 seen.add(k["hash"])
                 kernels.append(entry(k, jit, Path(cache), out))
     kernels.sort(key=lambda x: (x["fn"], x["hash"]))

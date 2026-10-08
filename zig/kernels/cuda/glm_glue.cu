@@ -3,6 +3,7 @@
 // greedy pick. Every result is a copy or an integer, so bits cannot differ from torch's.
 
 #include <cuda_bf16.h>
+#include <cuda_fp8.h>
 #include <stdint.h>
 
 // rows of `bytes` bytes (a multiple of 4) from src (row stride src_ld bytes) to dst (dst_ld): forward.py:407's
@@ -140,7 +141,8 @@ extern "C" __global__ void tf_glm_topk(const unsigned short* __restrict__ logits
 
 // qmm.quantize4 (v0.6.6 glm5_next/cuda/qmm.py:158): bf16 (n, k) -> MLX affine 4-bit groups of 64, one thread a group.
 // scale = bf16(max((hi - lo) / 15, 1e-8)), bias = bf16(lo), q = round-half-even((w - bias) / scale) in 0..15, input
-// 8 i + j of a group at bits 4 j of its word i; fp32 arithmetic as torch's, divisions correctly rounded.
+// 8 i + j of a group at bits 4 j of its word i; fp32 arithmetic as torch's. torch's CUDA tensor / Python scalar multiplies
+// by the fp32 reciprocal (BinaryDivTrueKernel.cu), tensor / tensor divides correctly rounded.
 extern "C" __global__ void tf_glm_quantize4(const __nv_bfloat16* __restrict__ w, int n, int k, uint32_t* __restrict__ words,
                                             __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ biases) {
   const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -153,7 +155,7 @@ extern "C" __global__ void tf_glm_quantize4(const __nv_bfloat16* __restrict__ w,
     lo = fminf(lo, v);
     hi = fmaxf(hi, v);
   }
-  const __nv_bfloat16 sb = __float2bfloat16_rn(fmaxf(__fdiv_rn(hi - lo, 15.0f), 1e-8f));
+  const __nv_bfloat16 sb = __float2bfloat16_rn(fmaxf(__fmul_rn(hi - lo, 1.0f / 15.0f), 1e-8f));
   const __nv_bfloat16 bb = __float2bfloat16_rn(lo);
   const float s = __bfloat162float(sb), b = __bfloat162float(bb);
   for (int wi = 0; wi < 8; ++wi) {
@@ -166,4 +168,98 @@ extern "C" __global__ void tf_glm_quantize4(const __nv_bfloat16* __restrict__ w,
   }
   scales[g] = sb;
   biases[g] = bb;
+}
+
+// The squared error of one group of 64 under scale s and bias b, summed in torch's order for `(...).sum(-1)` over 64
+// contiguous fp32 values (Reduce.cuh: 32 lanes, lane t adds x[t] and x[t + 32], then shfl_down sums at offsets
+// 16, 8, 4, 2, 1; checked bit for bit against torch 2.13 on this checkpoint's groups): every op rounds, as torch's
+// separate kernels do (q * s, + b, - g, squared).
+__device__ __forceinline__ float group_error(const float (&g)[64], float s, float b) {
+  float l[32];
+#pragma unroll
+  for (int t = 0; t < 32; ++t) {
+    float e[2];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const float v = g[t + 32 * h];
+      const float q = fminf(fmaxf(rintf(__fdiv_rn(__fsub_rn(v, b), s)), 0.0f), 15.0f);
+      const float d = __fsub_rn(__fadd_rn(__fmul_rn(q, s), b), v);
+      e[h] = __fmul_rn(d, d);
+    }
+    l[t] = __fadd_rn(e[0], e[1]);
+  }
+#pragma unroll
+  for (int off = 16; off > 0; off >>= 1)
+#pragma unroll
+    for (int t = 0; t < off; ++t) l[t] = __fadd_rn(l[t], l[t + off]);
+  return l[0];
+}
+
+// qmm.quantize4_mse_raw (v1.8 glm5_next/cuda/qmm.py:179), TF_GLM_DENSE=q4: groups of 64 as quantize4, each group's range
+// the one of 16 clippings a = 1 - 0.45 i / 15 of its min and max with the least squared error (the first on a tie),
+// scale and bias stored as bf16. a is a Python float, cast to fp32 where torch multiplies the fp32 tensor by it.
+// MLX layout out, as tf_glm_quantize4.
+extern "C" __global__ void tf_glm_quantize4_mse(const __nv_bfloat16* __restrict__ w, int n, int k, uint32_t* __restrict__ words,
+                                                __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ biases) {
+  const long long gi = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const int kg = k / 64;
+  if (gi >= (long long)n * kg) return;
+  const __nv_bfloat16* x = w + gi * 64;
+  float g[64];
+#pragma unroll
+  for (int i = 0; i < 64; ++i) g[i] = __bfloat162float(x[i]);
+  float lo0 = g[0], hi0 = g[0];
+#pragma unroll
+  for (int i = 1; i < 64; ++i) {
+    lo0 = fminf(lo0, g[i]);
+    hi0 = fmaxf(hi0, g[i]);
+  }
+  float best_err = 0.0f, best_s = 0.0f, best_b = 0.0f;
+  __nv_bfloat16 best_sb, best_bb;
+  for (int i = 0; i < 16; ++i) {
+    const float a = (float)(1.0 - 0.45 * (double)i / 15.0);
+    const float lo = __fmul_rn(lo0, a), hi = __fmul_rn(hi0, a);
+    const __nv_bfloat16 sb = __float2bfloat16_rn(fmaxf(__fmul_rn(__fsub_rn(hi, lo), 1.0f / 15.0f), 1e-8f));
+    const __nv_bfloat16 bb = __float2bfloat16_rn(lo);
+    const float s = __bfloat162float(sb), b = __bfloat162float(bb);
+    const float err = group_error(g, s, b);
+    if (i == 0 || err < best_err) {
+      best_err = err;
+      best_s = s;
+      best_b = b;
+      best_sb = sb;
+      best_bb = bb;
+    }
+  }
+#pragma unroll
+  for (int wi = 0; wi < 8; ++wi) {
+    uint32_t word = 0;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const float q = fminf(fmaxf(rintf(__fdiv_rn(__fsub_rn(g[wi * 8 + j], best_b), best_s)), 0.0f), 15.0f);
+      word |= (uint32_t)q << (4 * j);
+    }
+    words[gi * 8 + wi] = word;
+  }
+  scales[gi] = best_sb;
+  biases[gi] = best_bb;
+}
+
+// qmm.make_f8 (v1.8 qmm.py:412): bf16 (n, k) -> e4m3 (n, k) and an fp32 scale per row and 128 columns, one thread a block:
+// scale = max(absmax * (1 / 448), 1e-30) (torch multiplies by the reciprocal of a Python scalar), value =
+// e4m3(clamp(w / scale, -448, 448)), round to nearest even.
+extern "C" __global__ void tf_glm_make_f8(const __nv_bfloat16* __restrict__ w, int n, int k, uint8_t* __restrict__ q8,
+                                          float* __restrict__ scale) {
+  const long long b = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const int kb = k / 128;
+  if (b >= (long long)n * kb) return;
+  const __nv_bfloat16* x = w + b * 128;
+  float amax = 0.0f;
+  for (int i = 0; i < 128; ++i) amax = fmaxf(amax, fabsf(__bfloat162float(x[i])));
+  const float s = fmaxf(__fmul_rn(amax, 1.0f / 448.0f), 1e-30f);
+  for (int i = 0; i < 128; ++i) {
+    const float v = fminf(fmaxf(__fdiv_rn(__bfloat162float(x[i]), s), -448.0f), 448.0f);
+    q8[b * 128 + i] = (uint8_t)__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
+  }
+  scale[b] = s;
 }

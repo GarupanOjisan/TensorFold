@@ -53,9 +53,10 @@ pub const Node = struct {
         errdefer n.lib.close();
         n.pair = if (rank == 0) try cuda.Pair.listen(port) else try cuda.Pair.connect(master, port, 1800);
         errdefer n.pair.close();
-        // both ranks must have been started with the same window
-        var mine = [2]u32{ @intCast(context), 0x474c4d31 };
-        var theirs: [2]u32 = undefined;
+        // both ranks must have been started with the same window and the same TF_GLM_DENSE (their all-gathered partials
+        // would mix 4-bit and BF16 projections)
+        var mine = [3]u32{ @intCast(context), 0x474c4d31, @intFromEnum(try wt.denseKind()) };
+        var theirs: [3]u32 = undefined;
         if (rank == 0) {
             try n.pair.send(std.mem.sliceAsBytes(&mine));
             try n.pair.recv(std.mem.sliceAsBytes(&theirs));
@@ -64,7 +65,7 @@ pub const Node = struct {
             try n.pair.send(std.mem.sliceAsBytes(&mine));
         }
         if (!std.mem.eql(u32, &mine, &theirs)) {
-            std.log.err("the two GLM ranks were started with different windows: {d} here, {d} on the other rank", .{ mine[0], theirs[0] });
+            std.log.err("the two GLM ranks were started with different settings: window {d} here, {d} on the other rank; TF_GLM_DENSE {t} here, kind {d} there", .{ mine[0], theirs[0], try wt.denseKind(), theirs[2] });
             return error.RankSettingsDiffer;
         }
         var id: cuda.nccl.UniqueId = undefined;
@@ -81,12 +82,12 @@ pub const Node = struct {
         const cfg_text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, gpa, .limited(1 << 22));
         defer gpa.free(cfg_text);
         const cfg = try glm_config.parse(gpa, cfg_text);
-        n.w = try wt.load(gpa, io, d, .{ .d = d, .s = n.stream }, dir, cfg, rank, true);
+        n.k = try kern.Kernels.load(d);
+        errdefer n.k.deinit();
+        n.w = try wt.load(gpa, io, d, .{ .d = d, .s = n.stream }, &n.k, dir, cfg, rank, true);
         errdefer n.w.deinit(gpa);
         n.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, kernels);
         errdefer n.set.deinit();
-        n.k = try kern.Kernels.load(d);
-        errdefer n.k.deinit();
         const long_context = context > fwd.denseLimit(&n.w);
         n.e = try Engine.init(&n.w, d, n.stream, .{ .set = &n.set, .s = n.stream }, &n.k, .{ .lib = &n.lib, .comm = n.comm }, context + Engine.max_rows, long_context);
         return n;

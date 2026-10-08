@@ -151,3 +151,8 @@ __global__ void __launch_bounds__(WM * WN * 32) prefill_kernel(
 template __global__ void tf_qmm_prefill::prefill_kernel<64, 128, 128, 2, 4, 3, false>(
     const __nv_bfloat16*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, int, int, int,
     int, int, int);
+
+// and the fp32-out one (out_proj, the shared expert's down projection).
+template __global__ void tf_qmm_prefill::prefill_kernel<64, 128, 128, 2, 4, 3, true>(
+    const __nv_bfloat16*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, int, int, int,
+    int, int, int);

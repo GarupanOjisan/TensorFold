@@ -43,6 +43,8 @@ pub const router_ks = 8;
 pub const split_target = 192;
 pub const b16_bn = 64;
 pub const b16_bk = 64;
+/// qmm.F8_BN_DECODE (v1.8 qmm.py): `_fmm`'s columns a program for windows of up to 16 rows.
+pub const f8_bn_decode = 32;
 /// latent.CHUNK, KT, HB, HB_WIDE (latent.py:12-15).
 pub const chunk = 512;
 pub const kt = 32;
@@ -185,6 +187,17 @@ pub const Tri = struct {
         if (sk == 1) return;
         const total = m * n;
         try t.run("_reduce", .{ cdiv(total, 1024), 1, 1 }, &.{ p("PART", "*fp32", part), p("OUT", ot, out), int("total", total) }, &.{ ci("SK", sk), ci("BLOCK", 1024), flag("F32", wide) });
+    }
+
+    /// qmm._matmul_f8 (v1.8 qmm.py:417) for a window of up to 16 rows on one K slice (the head's shape): `_fmm`, BM 16 and
+    /// BLOCK_N F8_BN_DECODE columns a program, over e4m3 `w` [n, k] with its fp32 block scales `sc` [n, k / 128].
+    /// `part` is unused (Python passes OUT as PART when sk is 1).
+    pub fn matmulF8(t: Tri, x: u64, x_stride: usize, w: u64, sc: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
+        _ = part;
+        if (k % 128 != 0) return error.KNotMultipleOf128;
+        if (m > 16 or b16SplitK(n, k) != 1) return error.F8ShapeNotCaptured;
+        const ot = if (wide) "*fp32" else "*bf16";
+        try t.run("_fmm", .{ 1, cdiv(n, f8_bn_decode), 1 }, &.{ p("X", "*bf16", x), p("W", "*fp8e4nv", w), p("S", "*fp32", sc), p("OUT", ot, out), p("PART", ot, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", 1), ci("BM", 16), ci("BLOCK_N", f8_bn_decode), ci("BK", b16_bk), flag("F32", wide), flag("SEQ", false) });
     }
 
     /// qmm.group_sums (qmm.py:117): x [m, k] bf16 (rows strided) -> xs [m, k/64] fp32.

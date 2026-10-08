@@ -8,7 +8,7 @@ const tri = @import("glm_triton.zig");
 const kern = @import("glm_kernels.zig");
 
 const Weights = wt.Weights;
-const B16 = wt.B16;
+const Mat = wt.Mat;
 
 const bf = 2;
 const f4 = 4;
@@ -278,7 +278,6 @@ pub const Engine = struct {
     last_logits: u64, // a prompt's last row's logits, kept past the MTP absorb that reuses pbuf
     last_hidden: u64, // and its final-normed hidden row, the first draft's input
     draft_head: kern.Q4, // weights.draft_head: the head quantized to 4 bits, read by draft steps only
-    draft_mem: cuda.DeviceBuffer,
     /// Both ranks' logits rows for a draw over the whole vocabulary: [rank][row][head.n] bf16, on the device and here.
     full_dev: cuda.DeviceBuffer,
     full_host: []u16,
@@ -357,14 +356,7 @@ pub const Engine = struct {
         e.np_max = np_max;
         e.n_graphs = 0;
         e.capturing = false;
-        e.draft_mem = try cuda.DeviceBuffer.alloc(d, kern.q4Bytes(w.head.n, w.head.k));
-        errdefer e.draft_mem.free();
-        {
-            var tmp = try cuda.DeviceBuffer.alloc(d, w.head.n * w.head.k / 2 + 4 * w.head.n * w.head.k / 64);
-            defer tmp.free();
-            e.draft_head = try kern.quantize4(k, s, w.head.ptr, w.head.n, w.head.k, e.draft_mem.ptr, tmp.ptr);
-            try s.synchronize();
-        }
+        e.draft_head = w.draft_head;
         e.full_dev = try cuda.DeviceBuffer.alloc(d, wt.world * max_rows * w.head.n * bf);
         errdefer e.full_dev.free();
         e.full_host = try std.heap.page_allocator.alloc(u16, wt.world * max_rows * w.head.n);
@@ -384,7 +376,6 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
-        e.draft_mem.free();
         e.full_dev.free();
         std.heap.page_allocator.free(e.full_host);
         e.mem.free();
@@ -486,13 +477,18 @@ pub const Engine = struct {
         return b.gath;
     }
 
-    /// forward.mm for BF16 weights: x rows (stride in elements) times q.T into out.
-    fn mm(e: *Engine, b: *const Buffers, x: u64, x_stride: usize, q: B16, out: u64, rows: usize, wide: bool) !void {
-        try e.t.matmulB16(x, x_stride, q.ptr, out, b.sk, rows, q.n, q.k, wide);
+    /// forward.mm: x rows (stride in elements) times q.T into out (fp32 with `wide`). BF16 and FP8 weights ignore the
+    /// group sums `xs` (qmm.matmul); a 4-bit q takes the prompt matmul in a prompt chunk, else the decode matmul on `xs`.
+    fn mm(e: *Engine, b: *const Buffers, x: u64, x_stride: usize, xs: u64, q: Mat, out: u64, rows: usize, wide: bool) !void {
+        switch (q.kind) {
+            .b16 => try e.t.matmulB16(x, x_stride, q.ptr, out, b.sk, rows, q.n, q.k, wide),
+            .q4 => if (b.prefill) try kern.q4Prefill(e.k, e.s, x, x_stride, q.q4(), out, rows, wide) else try kern.qmmDecode(e.k, e.s, x, x_stride, xs, q.q4(), out, rows, wide),
+            .f8 => try e.t.matmulF8(x, x_stride, q.ptr, q.s, out, b.sk, rows, q.n, q.k, wide),
+        }
     }
 
-    fn outProj(e: *Engine, b: *const Buffers, x: u64, q: B16, rows: usize) !u64 {
-        try e.mm(b, x, q.k, q, b.part, rows, true);
+    fn outProj(e: *Engine, b: *const Buffers, x: u64, xs: u64, q: Mat, rows: usize) !u64 {
+        try e.mm(b, x, q.k, xs, q, b.part, rows, true);
         return e.gather(b, rows);
     }
 
@@ -503,14 +499,14 @@ pub const Engine = struct {
         const ll: usize = c.kda_heads / wt.world;
         const st = &e.st;
         const p = if (b.prefill) b.kproj else st.proj + li * max_rows * e.width * bf;
-        try e.mm(b, b.normed, c.hidden, kw.proj, p, rows, false);
+        try e.mm(b, b.normed, c.hidden, b.xs, kw.proj, p, rows, false);
         const fa = p + kw.fa_off * bf;
         const ga = p + kw.ga_off * bf;
-        // B16 weights ignore the group sums (qmm.matmul), but the Python decode path still launches _group_sums
+        // f_b and g_b read these group sums when 4-bit; BF16 weights ignore them (qmm.matmul), but Python still launches _group_sums
         if (!b.prefill) try e.t.groupSums(fa, e.width, b.xs_fa, rows, 128);
-        try e.mm(b, fa, e.width, kw.fb, b.ka, rows, false);
+        try e.mm(b, fa, e.width, b.xs_fa, kw.fb, b.ka, rows, false);
         if (!b.prefill) try e.t.groupSums(ga, e.width, b.xs_ga, rows, 128);
-        try e.mm(b, ga, e.width, kw.gb, b.kg, rows, false);
+        try e.mm(b, ga, e.width, b.xs_ga, kw.gb, b.kg, rows, false);
         const rec_layer = ll * 128 * 128 * f4;
         const rec_half = st.kda_layers * rec_layer;
         const scr: KdaScratch = if (b.prefill) b.kscr else .{ .out = st.scr.out + li * max_rows * ll * 128 * bf, .k = st.scr.k + li * max_rows * ll * 128 * f4, .v = st.scr.v + li * max_rows * ll * 128 * bf, .g = st.scr.g + li * max_rows * ll * 128 * f4, .b = st.scr.b + li * max_rows * ll * f4 };
@@ -547,7 +543,7 @@ pub const Engine = struct {
             try e.t.convShift(st.conv + li * conv_layer, b.kproj, rows, 1, 3 * ll * 128, 3 * 3 * ll * 128, b.rows * e.width, e.width);
         }
         if (!b.prefill) try e.t.groupSums(scr.out, ll * 128, b.kxs, rows, ll * 128);
-        return e.outProj(b, scr.out, kw.o, rows);
+        return e.outProj(b, scr.out, b.kxs, kw.o, rows);
     }
 
     fn dsaBlock(e: *Engine, l: *const wt.Layer, b: *Buffers, kc: u64, pos_dev: u64, host_pos: usize, index: ?[3]u64, rows: usize) !u64 {
@@ -557,18 +553,18 @@ pub const Engine = struct {
         const qk: usize = c.nope;
         const lw: usize = c.kv_lora;
         const dense_limit = denseLimit(e.w);
-        try e.mm(b, b.normed, c.hidden, a.proj, b.dp, rows, false);
+        try e.mm(b, b.normed, c.hidden, b.xs, a.proj, b.dp, rows, false);
         const qkv = c.q_lora + c.kv_lora;
         try e.t.rmsnorm(b.dp, qkv, a.q_norm, b.qr, c.q_lora, b.xs_qr, rows, c.q_lora, c.eps);
         try e.t.rmsnorm(b.dp + c.q_lora * bf, qkv, a.kv_norm, b.lat, c.kv_lora, b.xs_lat, rows, c.kv_lora, c.eps);
-        try e.mm(b, b.qr, c.q_lora, a.q_b, b.q, rows, false);
+        try e.mm(b, b.qr, c.q_lora, b.xs_qr, a.q_b, b.q, rows, false);
         // _dsa_latent
         try e.t.latentWrite(b.lat, c.kv_lora, kc, pos_dev, rows, lw);
         const all_sparse = host_pos >= dense_limit;
         const sparse_rows = index != null and (all_sparse or host_pos + rows - 1 >= dense_limit);
         if (index) |ix3| {
             const ix = a.index;
-            try e.mm(b, b.normed, c.hidden, ix.kw, b.ikr, rows, false);
+            try e.mm(b, b.normed, c.hidden, b.xs, ix.kw, b.ikr, rows, false);
             try e.t.router(b.normed, c.hidden, ix.gate, b.rpart, b.igr, rows, c.hidden, c.i_dim);
             try e.t.indexUpdate(b.ikr, c.i_dim + c.i_heads, b.igr, ix.ln_w, ix.ln_b, ix.ape, ix3[0], ix3[1], ix3[2], pos_dev, rows);
         }
@@ -586,7 +582,7 @@ pub const Engine = struct {
         }
         if (sparse_rows) {
             const ix = a.index;
-            try e.mm(b, b.qr, c.q_lora, ix.qb, b.qi, rows, false);
+            try e.mm(b, b.qr, c.q_lora, b.xs_qr, ix.qb, b.qi, rows, false);
             const np = tri.poolBucket(host_pos, rows, e.np_max);
             const bsz = @min(rows, tri.select_rows);
             const blocks = (rows + bsz - 1) / bsz;
@@ -599,7 +595,7 @@ pub const Engine = struct {
         }
         try e.t.expandV(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw);
         try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
-        return e.outProj(b, b.vn, a.o, rows);
+        return e.outProj(b, b.vn, b.xs_ao, a.o, rows);
     }
 
     /// TORCH-GLUE `pos_dev + r0`: block j's first position into its own 16-byte slot (the host knows pos).
@@ -625,9 +621,9 @@ pub const Engine = struct {
 
     fn mlpBlock(e: *Engine, m: wt.Mlp, b: *const Buffers, rows: usize) !u64 {
         const c = e.w.cfg;
-        try e.mm(b, b.normed, c.hidden, m.gu, b.gu, rows, false);
+        try e.mm(b, b.normed, c.hidden, b.xs, m.gu, b.gu, rows, false);
         try e.t.swiglu(b.gu, b.act, b.xs_act, rows, m.width, c.swiglu_limit);
-        return e.outProj(b, b.act, m.down, rows);
+        return e.outProj(b, b.act, b.xs_act, m.down, rows);
     }
 
     fn moeBlock(e: *Engine, m: wt.Moe, b: *const Buffers, rows: usize) !u64 {
@@ -638,9 +634,9 @@ pub const Engine = struct {
         try e.t.select(b.mlog, m.bias, b.pick, b.wts, rows, c.topk, c.experts, c.routed_scale, true);
         try kern.routed(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit);
         const sh = m.shared;
-        try e.mm(b, b.normed, d, sh.gu, b.sgu, rows, false);
+        try e.mm(b, b.normed, d, b.xs, sh.gu, b.sgu, rows, false);
         try e.t.swiglu(b.sgu, b.sact, b.sxs, rows, sh.width, c.swiglu_limit);
-        try e.mm(b, b.sact, sh.width, sh.down, b.sy, rows, true);
+        try e.mm(b, b.sact, sh.width, b.sxs, sh.down, b.sy, rows, true);
         try e.copyRows(b.sy, d * f4, b.exl3.y + c.topk * d * f4, slots * d * f4, d * f4, rows);
         try e.t.combine(b.exl3.y, b.wts, b.part, rows, d, slots);
         return e.gather(b, rows);
@@ -685,8 +681,8 @@ pub const Engine = struct {
         try e.t.streamMean(b.x, b.hidden, rows, d, c.hc);
         try e.t.rmsnorm(b.hidden, d, e.w.norm, b.fnormed, d, b.fxs, rows, d, c.eps);
         if (b.prefill) {
-            try e.mm(b, b.fnormed + (rows - 1) * d * bf, d, e.w.head, b.logits, 1, false);
-        } else try e.mm(b, b.fnormed, d, e.w.head, b.logits, rows, false);
+            try e.mm(b, b.fnormed + (rows - 1) * d * bf, d, b.fxs, e.w.head, b.logits, 1, false);
+        } else try e.mm(b, b.fnormed, d, b.fxs, e.w.head, b.logits, rows, false);
     }
 
     /// A decode window's forward: logits [R, V/2] in buf.logits.
@@ -776,7 +772,7 @@ pub const Engine = struct {
         try e.t.rmsnorm(b.me, d, m.enorm, b.mcat, 2 * d, null, n, d, c.eps);
         try e.t.rmsnorm(b.hin, d, m.hnorm, b.mcat + d * bf, 2 * d, null, n, d, c.eps);
         if (!b.prefill) try e.t.groupSums(b.mcat, 2 * d, b.mxs, n, 2 * d);
-        try e.mm(b, b.mcat, 2 * d, m.eh, b.mx, n, false);
+        try e.mm(b, b.mcat, 2 * d, b.mxs, m.eh, b.mx, n, false);
         const l = &m.layer;
         try e.t.rmsnorm(b.mx, d, l.in_norm, b.normed, d, b.xs, n, d, c.eps);
         const ix: ?[3]u64 = if (e.st.long_context) e.st.index[e.st.dsa_layers] else null;
@@ -792,7 +788,7 @@ pub const Engine = struct {
     /// The MTP head's logits from the 4-bit draft head (mtp.py: `w.draft_head`, forward.mm): a prompt chunk's on the
     /// prefill matmul, a decode step's on qmm_group with the rows' group sums (b.fxs, from the final norm).
     fn draftHead(e: *Engine, b: *const Buffers, x: u64, rows: usize) !void {
-        if (b.prefill) return kern.q4Prefill(e.k, e.s, x, e.draft_head, b.logits, rows);
+        if (b.prefill) return kern.q4Prefill(e.k, e.s, x, e.draft_head.k, e.draft_head, b.logits, rows, false);
         try kern.q4Matmul(e.k, e.s, x, b.fxs, e.draft_head, b.logits, rows);
     }
 

@@ -35,3 +35,25 @@ python3 -B zig/tests/cuda/nemotron/aot_pack.py --manifest c2/manifest.json --cac
 (rank 0 first or second): each prompt prefilled, then decoded serially and with MTP drafts (`--depth`), against the
 capture's serial reply. Build with the container's nvcc so the lifted CUDA kernels compile as the Python
 extensions did.
+
+## 4. TF_GLM_DENSE=q4 (v1.8 patches 0002 and 0005)
+
+The engine quantizes the dense projections at load, as v1.8 does by default: every `q4()` / `stack()` matrix of
+`weights.py` (KDA input stack, `f_b`, `g_b`, `o_proj`; DSA `q_a`+`kv_a`, `q_b`, `o_proj`; the indexer's `wk`+`weights_proj`
+and `wq_b`; the dense MLP's and the shared expert's gate/up and down; the MTP `eh_proj`) becomes 4-bit groups of 64
+(`tf_glm_quantize4_mse`, `qmm.quantize4_mse`) after the two-rank split, and the head becomes e4m3 with fp32 block scales
+(`tf_glm_make_f8`, `qmm.make_f8`). `TF_GLM_DENSE=b16` keeps the BF16 path (`bf16` also works). The decode matmul is
+v1.8's `qmm.cu` (`qmm_kernel`, copied and checked by `copies.py` against `$TF_PYTHON_REPO_V18`), the prompt matmul
+`qmm_prefill.cu`, the head `_fmm` (Triton).
+
+Byte equality of the quantizer with v1.8: `qdump.py MODEL 0 DIR` (v1.8 image, GPU, `PYTHONPATH=py18/src`) writes the
+tiled words, scales and biases of 13 tensors, the FP8 head and the 4-bit draft head; `tf-glm qdump MODEL --rank 0 --out
+DIR2` writes the same files from the Zig kernels; `cmp` them. The quantizer's error sum follows torch's CUDA reduction
+order (32 lanes of x[t] + x[t + 32], then shfl_down at 16, 8, 4, 2, 1), and `/ 15`, `/ 448` multiply by the fp32
+reciprocal as torch does for a Python scalar.
+
+Reference tokens: `pycap18.sh` with the production settings captures features this port lacks, so `cap18.sh RUN bf16|q4` (a reference for
+the port) sets those switches to their v0.6.6 behaviour (`TF_GLM_KV=bf16`, `KDA_CHUNKED=0`, `EXL3_*=0`, `L2PF=0`,
+`HC_DEC=0`, `HC_MMA=0`, `LATENT_MMA=0`, `SPARSE_ONEPASS=0`, `KDA_WIDE_ROWS=64`, `SEQ_ROWS=1000000`, `COMBINE_SY=0`,
+`SCORE_RB=1`, `WIDE_GRAPHS=0`) and `TF_GLM_DENSE=q4` or `bf16`. With `bf16` those replies equal the v0.6.6 set
+(`c2`) token for token. The `_fmm` kernels join `c234` with `aot_pack.py --base aot/c234 --only _fmm`.

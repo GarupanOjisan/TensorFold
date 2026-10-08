@@ -6,33 +6,52 @@ const cuda = @import("cuda");
 const core = @import("core");
 const glm_config = @import("glm_config");
 const Source = @import("glm_source.zig").Source;
+const kern = @import("glm_kernels.zig");
 
 pub const Config = glm_config.Config;
 pub const world = 2;
 const prefix = "model.language_model.";
 
-/// A BF16 matrix [n, k], row-major (qmm.B16).
-pub const B16 = struct { ptr: u64, n: usize, k: usize };
+/// How a dense (non-expert) projection is held. TF_GLM_DENSE (v1.8 qmm.dense_kind): `q4`, the default, quantizes the
+/// projections at load to 4-bit groups of 64 (MSE-searched) and the head to FP8; `b16` keeps the checkpoint's BF16.
+pub const Kind = enum { b16, q4, f8 };
+
+/// A projection [n, k]: BF16 rows (qmm.B16: ptr), tiled 4-bit groups (qmm.Q4: ptr the words, s and b the bf16 scales and
+/// biases, npad the columns padded to 128) or e4m3 rows with fp32 scales per 128 columns (qmm.F8: ptr, s).
+pub const Mat = struct {
+    kind: Kind = .b16,
+    ptr: u64,
+    n: usize,
+    k: usize,
+    s: u64 = 0,
+    b: u64 = 0,
+    npad: usize = 0,
+
+    pub fn q4(m: Mat) kern.Q4 {
+        std.debug.assert(m.kind == .q4);
+        return .{ .w = m.ptr, .s = m.s, .b = m.b, .n = m.n, .k = m.k, .npad = m.npad };
+    }
+};
 
 pub const Hc = struct { fn_: u64, base: u64, scale: u64 }; // [24, S*D] bf16, [24] f32, [3] f32
 
 pub const Kda = struct {
-    proj: B16, // [q | k | v | f_a | g_a | b] of this rank
+    proj: Mat, // [q | k | v | f_a | g_a | b] of this rank
     fa_off: usize,
     ga_off: usize,
     b_off: usize,
-    fb: B16,
-    gb: B16,
+    fb: Mat,
+    gb: Mat,
     conv: u64, // [3 * LL * 128, taps] bf16
     a_log: u64, // [LL] f32
     dt_bias: u64, // [LL * 128] f32
     norm: u64, // [128] bf16
-    o: B16,
+    o: Mat,
 };
 
 pub const Index = struct {
-    kw: B16, // [wk | weights_proj]
-    qb: B16,
+    kw: Mat, // [wk | weights_proj]
+    qb: Mat,
     ln_w: u64,
     ln_b: u64,
     gate: u64, // index_kpool_compress_gate [128, D] bf16
@@ -40,17 +59,17 @@ pub const Index = struct {
 };
 
 pub const Dsa = struct {
-    proj: B16, // [q_a | kv_a], replicated
+    proj: Mat, // [q_a | kv_a], replicated
     q_norm: u64,
     kv_norm: u64,
-    q_b: B16,
-    o: B16,
+    q_b: Mat,
+    o: Mat,
     index: Index,
     wk: u64, // AbsorbW: kv_b's key rows [HL, qk_dim, kv_lora] bf16
     wv: u64, // and its value rows [HL, v_dim, kv_lora]
 };
 
-pub const Mlp = struct { gu: B16, down: B16, width: usize };
+pub const Mlp = struct { gu: Mat, down: Mat, width: usize };
 
 /// One layer's routed experts (exl3.experts.Exl3RoutedExperts): trellis pointer tables (i64), widths (i32 half-bits).
 pub const Exl3 = struct {
@@ -87,7 +106,7 @@ pub const Layer = struct {
     moe: ?Moe = null,
 };
 
-pub const Mtp = struct { enorm: u64, hnorm: u64, eh: B16, head_norm: u64, layer: Layer };
+pub const Mtp = struct { enorm: u64, hnorm: u64, eh: Mat, head_norm: u64, layer: Layer };
 
 pub const Weights = struct {
     cfg: Config,
@@ -95,7 +114,8 @@ pub const Weights = struct {
     embed: u64, // [vocab, D] bf16, whole on both ranks
     layers: []Layer,
     norm: u64,
-    head: B16, // this rank's half of the vocabulary
+    head: Mat, // this rank's half of the vocabulary
+    draft_head: kern.Q4, // the head quantized to 4 bits (min/max ranges) from its BF16 rows, read by draft steps only
     mtp: ?Mtp,
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     bytes: usize = 0,
@@ -140,6 +160,8 @@ const Loader = struct {
     d: *const cuda.Driver,
     rank: u32,
     w: *Weights,
+    kernels: *const kern.Kernels,
+    dense: Kind,
     host: std.ArrayList(u8) = .empty, // staging for strided splits and stacks
 
     fn name(l: *Loader, comptime fmt: []const u8, args: anytype) ![]const u8 {
@@ -196,6 +218,14 @@ const Loader = struct {
     fn stack(l: *Loader, names: []const []const u8, dtype: core.safetensors.DType) !struct { ptr: u64, rows: usize, cols: usize } {
         var all: std.ArrayList(u8) = .empty;
         defer all.deinit(l.gpa);
+        const shape = try l.stackHost(names, dtype, &all);
+        const ptr = try l.alloc(all.items.len);
+        try l.src.ops.upload(ptr, all.items);
+        return .{ .ptr = ptr, .rows = shape.rows, .cols = shape.cols };
+    }
+
+    /// `stack`'s rank parts in `all`, not yet uploaded.
+    fn stackHost(l: *Loader, names: []const []const u8, dtype: core.safetensors.DType, all: *std.ArrayList(u8)) !struct { rows: usize, cols: usize } {
         var one: std.ArrayList(u8) = .empty;
         defer one.deinit(l.gpa);
         var rows: usize = 0;
@@ -214,18 +244,58 @@ const Loader = struct {
             rows += shape[0];
             try all.appendSlice(l.gpa, one.items);
         }
-        const ptr = try l.alloc(all.items.len);
-        try l.src.ops.upload(ptr, all.items);
-        return .{ .ptr = ptr, .rows = rows, .cols = cols };
+        return .{ .rows = rows, .cols = cols };
     }
 
     fn upOne(l: *Loader, full: []const u8, dtype: core.safetensors.DType) !u64 {
         return (try l.stack(&.{full}, dtype)).ptr;
     }
 
-    fn b16(l: *Loader, names: []const []const u8) !B16 {
-        const s = try l.stack(names, .bf16);
-        return .{ .ptr = s.ptr, .n = s.rows, .k = s.cols };
+    /// A dense projection (weights.py `q4`, `stack`): the rank parts of `names` in rows, BF16 as stored or, under
+    /// TF_GLM_DENSE=q4, quantized on the GPU after the tp split, as `qmm.make_dense_q4`.
+    fn mat(l: *Loader, names: []const []const u8) !Mat {
+        var all: std.ArrayList(u8) = .empty;
+        defer all.deinit(l.gpa);
+        const shape = try l.stackHost(names, .bf16, &all);
+        if (l.dense == .b16) {
+            const ptr = try l.alloc(all.items.len);
+            try l.src.ops.upload(ptr, all.items);
+            return .{ .ptr = ptr, .n = shape.rows, .k = shape.cols };
+        }
+        var raw = try cuda.DeviceBuffer.alloc(l.d, all.items.len);
+        defer raw.free();
+        try l.src.ops.upload(raw.ptr, all.items);
+        return l.quantize(raw.ptr, shape.rows, shape.cols, true);
+    }
+
+    /// Bf16 rows [n, k] on the device as a dense q4 projection: groups of 64 along k as 4-bit (`mse`: the
+    /// least-squares search, else min/max), else, where k is not a multiple of 64, as FP8 (make_dense_q4's rule).
+    fn quantize(l: *Loader, raw: u64, n: usize, k: usize, mse: bool) !Mat {
+        const s = l.src.ops.s;
+        if (k % 64 == 0) {
+            const at = try l.alloc(kern.q4Bytes(n, k));
+            var tmp = try cuda.DeviceBuffer.alloc(l.d, n * k / 2 + 4 * n * (k / 64));
+            defer tmp.free();
+            const q = try kern.quantize4(l.kernels, s, if (mse) .mse else .minmax, raw, n, k, at, tmp.ptr);
+            try s.synchronize();
+            return .{ .kind = .q4, .ptr = q.w, .n = n, .k = k, .s = q.s, .b = q.b, .npad = q.npad };
+        }
+        return l.f8(raw, n, k);
+    }
+
+    /// qmm.draft_quantize4 (TF_GLM_DRAFT_QUANT unset: min/max ranges) of bf16 rows [n, k] on the device.
+    fn quantize4Draft(l: *Loader, raw: u64, n: usize, k: usize) !kern.Q4 {
+        const m = try l.quantize(raw, n, k, false);
+        return m.q4();
+    }
+
+    /// qmm.make_f8 of bf16 rows [n, k] on the device.
+    fn f8(l: *Loader, raw: u64, n: usize, k: usize) !Mat {
+        const q = try l.alloc(n * k);
+        const sc = try l.alloc(n * (k / 128) * 4);
+        const m = try kern.makeF8(l.kernels, l.src.ops.s, raw, n, k, q, sc);
+        try l.src.ops.s.synchronize();
+        return .{ .kind = .f8, .ptr = m.w, .n = n, .k = k, .s = m.s };
     }
 
     fn hc(l: *Loader, i: usize, site: []const u8) !Hc {
@@ -253,7 +323,7 @@ const Loader = struct {
         const ll = c.kda_heads / world;
         const p = try l.layerNames(i, &.{ "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.f_a_proj.weight", "self_attn.g_a_proj.weight", "self_attn.b_proj.weight" });
         defer l.free(&p);
-        const proj = try l.b16(&p);
+        const proj = try l.mat(&p);
         const cv = try l.layerNames(i, &.{ "self_attn.q_conv1d.weight", "self_attn.k_conv1d.weight", "self_attn.v_conv1d.weight" });
         defer l.free(&cv);
         const conv = try l.stack(&cv, .bf16);
@@ -266,13 +336,13 @@ const Loader = struct {
             .fa_off = width,
             .ga_off = width + 128,
             .b_off = width + 256,
-            .fb = try l.b16(r[0..1]),
-            .gb = try l.b16(r[1..2]),
+            .fb = try l.mat(r[0..1]),
+            .gb = try l.mat(r[1..2]),
             .conv = conv.ptr,
             .a_log = try l.upOne(r[2], .f32),
             .dt_bias = try l.upOne(r[3], .f32),
             .norm = try l.upOne(r[4], .bf16),
-            .o = try l.b16(r[5..6]),
+            .o = try l.mat(r[5..6]),
         };
     }
 
@@ -304,14 +374,14 @@ const Loader = struct {
         const wv_ptr = try l.alloc(wv.len);
         try l.src.ops.upload(wv_ptr, wv);
         return .{
-            .proj = try l.b16(p[0..2]),
+            .proj = try l.mat(p[0..2]),
             .q_norm = try l.upOne(p[2], .bf16),
             .kv_norm = try l.upOne(p[3], .bf16),
-            .q_b = try l.b16(p[4..5]),
-            .o = try l.b16(p[5..6]),
+            .q_b = try l.mat(p[4..5]),
+            .o = try l.mat(p[5..6]),
             .index = .{
-                .kw = try l.b16(x[0..2]),
-                .qb = try l.b16(x[2..3]),
+                .kw = try l.mat(x[0..2]),
+                .qb = try l.mat(x[2..3]),
                 .ln_w = try l.upOne(x[3], .bf16),
                 .ln_b = try l.upOne(x[4], .bf16),
                 .gate = try l.upOne(x[5], .bf16),
@@ -325,8 +395,8 @@ const Loader = struct {
     fn mlp(l: *Loader, i: usize, comptime sub: []const u8) !Mlp {
         const p = try l.layerNames(i, &.{ sub ++ "gate_proj.weight", sub ++ "up_proj.weight", sub ++ "down_proj.weight" });
         defer l.free(&p);
-        const gu = try l.b16(p[0..2]);
-        return .{ .gu = gu, .down = try l.b16(p[2..3]), .width = gu.n / 2 };
+        const gu = try l.mat(p[0..2]);
+        return .{ .gu = gu, .down = try l.mat(p[2..3]), .width = gu.n / 2 };
     }
 
     /// The routed experts of layer `i` (experts.prepare): trellises stacked per projection, suh/svh stacked.
@@ -445,8 +515,19 @@ const Loader = struct {
     }
 };
 
-/// Every weight of rank `rank` of the checkpoint in `dir`, uploaded on `ops`'s stream.
-pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @import("glm_source.zig").Ops, dir: []const u8, cfg: Config, rank: u32, mtp: bool) !Weights {
+/// TF_GLM_DENSE (qmm.dense_kind): `q4`, the default, or `b16`. The FP8 mode of Python's `fp8` is not ported.
+pub fn denseKind() !Kind {
+    const v = std.c.getenv("TF_GLM_DENSE") orelse return .q4;
+    const s = std.mem.span(v);
+    if (s.len == 0 or std.mem.eql(u8, s, "q4")) return .q4;
+    if (std.mem.eql(u8, s, "b16") or std.mem.eql(u8, s, "bf16")) return .b16;
+    std.log.err("TF_GLM_DENSE is q4 or b16, not {s}", .{s});
+    return error.BadDenseKind;
+}
+
+/// Every weight of rank `rank` of the checkpoint in `dir`, uploaded on `ops`'s stream; the dense projections are
+/// quantized on the GPU with `kernels` as TF_GLM_DENSE says.
+pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @import("glm_source.zig").Ops, kernels: *const kern.Kernels, dir: []const u8, cfg: Config, rank: u32, mtp: bool) !Weights {
     // by prefix, so the vision tower's tensors (5-D convolutions past safetensors.max_rank) are never parsed
     var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
     defer ck.close();
@@ -456,28 +537,126 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @imp
     defer src.deinit();
     try src.add(&ck);
     try src.add(&ck_head);
-    var w: Weights = .{ .cfg = cfg, .rank = rank, .embed = 0, .layers = try gpa.alloc(Layer, cfg.layers), .norm = 0, .head = undefined, .mtp = null };
+    var w: Weights = .{ .cfg = cfg, .rank = rank, .embed = 0, .layers = try gpa.alloc(Layer, cfg.layers), .norm = 0, .head = undefined, .draft_head = undefined, .mtp = null };
     errdefer w.deinit(gpa);
-    var l: Loader = .{ .gpa = gpa, .ck = &ck, .src = &src, .d = d, .rank = rank, .w = &w };
+    var l: Loader = .{ .gpa = gpa, .ck = &ck, .src = &src, .d = d, .rank = rank, .w = &w, .kernels = kernels, .dense = try denseKind() };
     defer l.host.deinit(gpa);
     w.embed = try l.upOne(prefix ++ "embed_tokens.weight", .bf16);
     for (w.layers, 0..) |*lw, i| lw.* = try l.layer(i, false);
     w.norm = try l.upOne(prefix ++ "norm.weight", .bf16);
-    // the head: this rank's half of the vocabulary rows
+    // the head: this rank's half of the vocabulary rows, as BF16 rows only until the draft head (min/max 4-bit, from
+    // the BF16 rows as weights.py does) and, under TF_GLM_DENSE=q4, the FP8 head are made from them
     const head = try ck_head.expect("lm_head.weight", .bf16, &.{ cfg.vocab, cfg.hidden });
-    const vl = cfg.vocab / world;
-    const half = head.bytes[rank * vl * cfg.hidden * 2 ..][0 .. vl * cfg.hidden * 2];
-    w.head = .{ .ptr = try l.alloc(half.len), .n = vl, .k = cfg.hidden };
-    try src.upload(w.head.ptr, half);
+    const vl: usize = cfg.vocab / world;
+    const hk: usize = cfg.hidden;
+    const half = head.bytes[rank * vl * hk * 2 ..][0 .. vl * hk * 2];
+    var raw = try cuda.DeviceBuffer.alloc(d, half.len);
+    defer raw.free();
+    try src.upload(raw.ptr, half);
+    try src.flush();
+    w.draft_head = (try l.quantize4Draft(raw.ptr, vl, hk));
+    if (l.dense == .b16) {
+        w.head = .{ .ptr = try l.alloc(half.len), .n = vl, .k = hk };
+        try ops.d.check(ops.d.api.cuMemcpyDtoDAsync_v2(w.head.ptr, raw.ptr, half.len, ops.s.handle), "cuMemcpyDtoDAsync");
+        try ops.s.synchronize();
+    } else w.head = try l.f8(raw.ptr, vl, hk);
     if (cfg.mtp > 0 and mtp) {
         const i = cfg.layers;
         const n = try l.layerNames(i, &.{ "enorm.weight", "hnorm.weight", "eh_proj.weight", "shared_head.norm.weight" });
         defer l.free(&n);
-        w.mtp = .{ .enorm = try l.upOne(n[0], .bf16), .hnorm = try l.upOne(n[1], .bf16), .eh = try l.b16(n[2..3]), .head_norm = try l.upOne(n[3], .bf16), .layer = try l.layer(i, true) };
+        w.mtp = .{ .enorm = try l.upOne(n[0], .bf16), .hnorm = try l.upOne(n[1], .bf16), .eh = try l.mat(n[2..3]), .head_norm = try l.upOne(n[3], .bf16), .layer = try l.layer(i, true) };
     }
     try src.flush();
     try ops.s.synchronize();
     return w;
+}
+
+/// The tensors `tf-glm qdump` quantizes: v1.8's TF_GLM_DENSE=q4 stacks (zig/tests/cuda/glm/qdump.py has the same list).
+const dump_sets = [_]struct { name: []const u8, parts: []const []const u8 }{
+    .{ .name = "l0_kda_proj", .parts = &.{ "layers.0.self_attn.q_proj", "layers.0.self_attn.k_proj", "layers.0.self_attn.v_proj", "layers.0.self_attn.f_a_proj", "layers.0.self_attn.g_a_proj", "layers.0.self_attn.b_proj" } },
+    .{ .name = "l0_kda_fb", .parts = &.{"layers.0.self_attn.f_b_proj"} },
+    .{ .name = "l0_kda_o", .parts = &.{"layers.0.self_attn.o_proj"} },
+    .{ .name = "l0_mlp_gu", .parts = &.{ "layers.0.mlp.gate_proj", "layers.0.mlp.up_proj" } },
+    .{ .name = "l0_mlp_down", .parts = &.{"layers.0.mlp.down_proj"} },
+    .{ .name = "l3_dsa_proj", .parts = &.{ "layers.3.self_attn.q_a_proj", "layers.3.self_attn.kv_a_proj_with_mqa" } },
+    .{ .name = "l3_dsa_qb", .parts = &.{"layers.3.self_attn.q_b_proj"} },
+    .{ .name = "l3_dsa_o", .parts = &.{"layers.3.self_attn.o_proj"} },
+    .{ .name = "l3_ix_kw", .parts = &.{ "layers.3.self_attn.indexer.wk", "layers.3.self_attn.indexer.weights_proj" } },
+    .{ .name = "l3_ix_qb", .parts = &.{"layers.3.self_attn.indexer.wq_b"} },
+    .{ .name = "l3_sh_gu", .parts = &.{ "layers.3.mlp.shared_experts.gate_proj", "layers.3.mlp.shared_experts.up_proj" } },
+    .{ .name = "l3_sh_down", .parts = &.{"layers.3.mlp.shared_experts.down_proj"} },
+    .{ .name = "mtp_eh", .parts = &.{"layers.45.eh_proj"} },
+};
+
+/// `tf-glm qdump`: the dense quantization of a few tensors of `rank` (the loader's own path), the head's FP8 and
+/// draft-head 4-bit rows too, as raw bytes in `out`: NAME.w, .s, .b (words, scales, biases), head.q8, head.sc,
+/// draft.w, .s, .b. `only` (comma separated names, or empty) picks some.
+pub fn dumpQuant(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @import("glm_source.zig").Ops, kernels: *const kern.Kernels, dir: []const u8, cfg: Config, rank: u32, out: []const u8, only: []const u8) !void {
+    var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
+    defer ck.close();
+    var ck_head = try core.Checkpoint.openModelPrefix(gpa, io, dir, "lm_head.");
+    defer ck_head.close();
+    var src = try Source.init(gpa, ops);
+    defer src.deinit();
+    try src.add(&ck);
+    try src.add(&ck_head);
+    var w: Weights = .{ .cfg = cfg, .rank = rank, .embed = 0, .layers = &.{}, .norm = 0, .head = undefined, .draft_head = undefined, .mtp = null };
+    defer for (w.buffers.items) |*b| b.free();
+    defer w.buffers.deinit(gpa);
+    var l: Loader = .{ .gpa = gpa, .ck = &ck, .src = &src, .d = d, .rank = rank, .w = &w, .kernels = kernels, .dense = .q4 };
+    defer l.host.deinit(gpa);
+    try std.Io.Dir.cwd().createDirPath(io, out);
+    const want = struct {
+        fn has(list: []const u8, name: []const u8) bool {
+            if (list.len == 0) return true;
+            var it = std.mem.splitScalar(u8, list, ',');
+            while (it.next()) |n| if (std.mem.eql(u8, n, name)) return true;
+            return false;
+        }
+    };
+    for (dump_sets) |set| {
+        if (!want.has(only, set.name)) continue;
+        var names: [6][]const u8 = undefined;
+        for (set.parts, 0..) |p, i| names[i] = try std.fmt.allocPrint(gpa, prefix ++ "{s}.weight", .{p});
+        defer for (names[0..set.parts.len]) |n| gpa.free(n);
+        const m = try l.mat(names[0..set.parts.len]);
+        const kg = m.k / 64;
+        try dumpFile(gpa, io, d, ops, out, set.name, "w", m.ptr, m.npad * m.k / 2);
+        try dumpFile(gpa, io, d, ops, out, set.name, "s", m.s, kg * m.npad * 2);
+        try dumpFile(gpa, io, d, ops, out, set.name, "b", m.b, kg * m.npad * 2);
+        std.debug.print("{s}: {d} x {d}\n", .{ set.name, m.n, m.k });
+    }
+    if (want.has(only, "head") or want.has(only, "draft")) {
+        const head = try ck_head.expect("lm_head.weight", .bf16, &.{ cfg.vocab, cfg.hidden });
+        const vl: usize = cfg.vocab / world;
+        const hk: usize = cfg.hidden;
+        const half = head.bytes[rank * vl * hk * 2 ..][0 .. vl * hk * 2];
+        var raw = try cuda.DeviceBuffer.alloc(d, half.len);
+        defer raw.free();
+        try src.upload(raw.ptr, half);
+        try src.flush();
+        if (want.has(only, "head")) {
+            const f = try l.f8(raw.ptr, vl, hk);
+            try dumpFile(gpa, io, d, ops, out, "head", "q8", f.ptr, vl * hk);
+            try dumpFile(gpa, io, d, ops, out, "head", "sc", f.s, vl * hk / 32);
+        }
+        if (want.has(only, "draft")) {
+            const q = try l.quantize4Draft(raw.ptr, vl, hk);
+            try dumpFile(gpa, io, d, ops, out, "draft", "w", q.w, q.npad * q.k / 2);
+            try dumpFile(gpa, io, d, ops, out, "draft", "s", q.s, q.k / 64 * q.npad * 2);
+            try dumpFile(gpa, io, d, ops, out, "draft", "b", q.b, q.k / 64 * q.npad * 2);
+        }
+    }
+}
+
+fn dumpFile(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @import("glm_source.zig").Ops, dir: []const u8, name: []const u8, ext: []const u8, ptr: u64, bytes: usize) !void {
+    const host = try gpa.alloc(u8, bytes);
+    defer gpa.free(host);
+    try d.check(d.api.cuMemcpyDtoHAsync_v2(host.ptr, ptr, bytes, ops.s.handle), "cuMemcpyDtoHAsync");
+    try ops.s.synchronize();
+    const path = try std.fmt.allocPrint(gpa, "{s}/{s}.{s}", .{ dir, name, ext });
+    defer gpa.free(path);
+    try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = host });
 }
 
 test "split rules match split.py on the tensors GLM reads" {
