@@ -9,6 +9,7 @@ IMAGE=${IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}
 SNAP=${SNAP:?the EXL3 snapshot under ~/.cache/huggingface/hub}
 for c in $(docker ps -q --filter name=tf-) ; do echo "PREFLIGHT: containers running on spark1"; docker ps; exit 3; done
 [ -z "$(ssh "$WORKER" docker ps -q --filter name=tf-)" ] || { echo "PREFLIGHT: containers running on spark2"; exit 3; }
+cp "$(dirname "$0")/capture_glm.py" ${PY066:-$HOME/tf-native/py066}/
 rsync -a --delete ${PY066:-$HOME/tf-native/py066}/ "$WORKER:tf-native/py066/" --exclude .git
 rsync -a ~/tf-native/bin/ "$WORKER:tf-native/bin/"
 rsync -a $(dirname "$0")/../../../../tools/zig/triton_aot_manifest.py "$WORKER:tf-native/py066/tools-zig/"
