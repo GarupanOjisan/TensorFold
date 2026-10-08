@@ -73,3 +73,67 @@ extern "C" __global__ void tf_glm_greedy(const __nv_bfloat16* __restrict__ logit
     out[2 * r + 1] = (uint32_t)(best_i[0] + offset);
   }
 }
+
+// decode.py:31-37 for sampled rows on one rank: torch.topk(logits.float(), k) of the rank's vocabulary slice, as
+// (value as fp32 bits, column + offset) pairs; which pairs, not their order, matters (the host chooser sorts them).
+// The k-th largest bf16 key is found in two 8-bit radix passes; columns above it are all taken, columns equal to it
+// in column order until k. grid (rows), block 1024, k <= 1024.
+__device__ __forceinline__ uint32_t tf_glm_key(unsigned short b) {
+  return (b & 0x8000) ? (uint32_t)(~b & 0xffff) : (uint32_t)(b | 0x8000);
+}
+
+extern "C" __global__ void tf_glm_topk(const unsigned short* __restrict__ logits, int vocab, int ld, int k, int offset,
+                                       uint32_t* __restrict__ out) {
+  __shared__ int hist[256];
+  __shared__ int sel_hi, sel_lo, above_hi, need_eq, written;
+  const int r = blockIdx.x;
+  const unsigned short* row = logits + (int64_t)r * ld;
+  uint32_t* o = out + (int64_t)r * 2 * k;
+  for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+  __syncthreads();
+  for (int i = threadIdx.x; i < vocab; i += blockDim.x) atomicAdd(&hist[tf_glm_key(row[i]) >> 8], 1);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int above = 0, b = 255;
+    while (b > 0 && above + hist[b] < k) above += hist[b--];
+    sel_hi = b;
+    above_hi = above;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < 256; i += blockDim.x) hist[i] = 0;
+  __syncthreads();
+  for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+    const uint32_t key = tf_glm_key(row[i]);
+    if ((int)(key >> 8) == sel_hi) atomicAdd(&hist[key & 0xff], 1);
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    int above = above_hi, b = 255;
+    while (b > 0 && above + hist[b] < k) above += hist[b--];
+    sel_lo = b;
+    need_eq = k - above;
+    written = 0;
+  }
+  __syncthreads();
+  const uint32_t threshold = ((uint32_t)sel_hi << 8) | (uint32_t)sel_lo;
+  for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+    const uint32_t key = tf_glm_key(row[i]);
+    if (key > threshold) {
+      const int at = atomicAdd(&written, 1);
+      o[2 * at] = __float_as_uint(__uint_as_float((uint32_t)row[i] << 16));
+      o[2 * at + 1] = (uint32_t)(i + offset);
+    }
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {   // ties at the threshold, lowest columns first
+    int at = written, left = need_eq;
+    for (int i = 0; i < vocab && left > 0; ++i) {
+      if (tf_glm_key(row[i]) == threshold) {
+        o[2 * at] = __float_as_uint(__uint_as_float((uint32_t)row[i] << 16));
+        o[2 * at + 1] = (uint32_t)(i + offset);
+        ++at;
+        --left;
+      }
+    }
+  }
+}

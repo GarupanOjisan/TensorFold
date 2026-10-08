@@ -27,6 +27,7 @@ pub const Kernels = struct {
     copy_rows: cuda.Function,
     tokens: cuda.Function,
     greedy: cuda.Function,
+    topk: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -50,6 +51,7 @@ pub const Kernels = struct {
         k.copy_rows = try k.mods[2].function("tf_glm_copy_rows");
         k.tokens = try k.mods[2].function("tf_glm_tokens");
         k.greedy = try k.mods[2].function("tf_glm_greedy");
+        k.topk = try k.mods[2].function("tf_glm_topk");
         // group_kernel's members list grows with the rows (a prompt chunk's 2048 rows * 9 slots * 4 B): experts.cu:292-305
         try k.group.allowDynamicShared(96 << 10);
         return k;

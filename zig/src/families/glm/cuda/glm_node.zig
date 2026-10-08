@@ -106,19 +106,35 @@ pub const Node = struct {
 
     // -- the commands (rank 0 sends, both run) ------------------------------------------------------------------
     /// The prompt's caches and its first token (the MTP head absorbs the prompt too when `mtp`).
-    pub fn prefill(n: *Node, prompt: []const u32, mtp: bool) !u32 {
+    /// k 0: greedy, the first token returned; else the last row's k candidates a rank gathered (Engine.cand_host).
+    pub fn prefill(n: *Node, prompt: []const u32, mtp: bool, k: usize) !u32 {
         n.words.clearRetainingCapacity();
-        try n.words.append(n.gpa, @intFromBool(mtp));
+        try n.words.appendSlice(n.gpa, &.{ @intFromBool(mtp), @intCast(k) });
         try n.words.appendSlice(n.gpa, prompt);
         try n.send(.prefill, n.words.items);
-        return dec.prefill(&n.e, prompt, mtp);
+        try dec.prefillCaches(&n.e, prompt, mtp);
+        return n.pick(n.e.last_logits, 1, k, null);
     }
 
-    /// A window's forward; each row's greedy token into `out`.
-    pub fn verify(n: *Node, rows: []const u32, out: []u32) !void {
-        try n.send(.verify, rows);
+    /// A window's forward: each row's greedy token into `out` (k 0), or each row's k candidates a rank gathered.
+    pub fn verify(n: *Node, rows: []const u32, k: usize, out: []u32) !void {
+        n.words.clearRetainingCapacity();
+        try n.words.append(n.gpa, @intCast(k));
+        try n.words.appendSlice(n.gpa, rows);
+        try n.send(.verify, n.words.items);
         try n.e.forward(rows);
-        try n.e.greedy(&n.e.buf, n.e.buf.logits, rows.len, n.e.w.head.n, out);
+        _ = try n.pick(n.e.buf.logits, rows.len, k, out);
+    }
+
+    fn pick(n: *Node, logits: u64, rows: usize, k: usize, out: ?[]u32) !u32 {
+        if (k > 0) {
+            try n.e.candidates(&n.e.buf, logits, rows, k);
+            return 0;
+        }
+        var one: [Engine.max_rows]u32 = undefined;
+        const dst = out orelse one[0..rows];
+        try n.e.greedy(&n.e.buf, logits, rows, n.e.w.head.n, dst);
+        return dst[0];
     }
 
     /// Commit the last window's first `keep` of its `rows` rows.
@@ -159,8 +175,8 @@ pub const Node = struct {
             try n.pair.recv(std.mem.sliceAsBytes(buf.items));
             const w = buf.items;
             switch (@as(Kind, @enumFromInt(head[0]))) {
-                .prefill => _ = try n.prefill(w[1..], w[0] != 0),
-                .verify => try n.verify(w, scratch[0..w.len]),
+                .prefill => _ = try n.prefill(w[2..], w[0] != 0, w[1]),
+                .verify => try n.verify(w[1..], w[0], scratch[0 .. w.len - 1]),
                 .keep => try n.keep(w[0], w[1]),
                 .draft => try n.draft(@enumFromInt(w[0]), w[2..], scratch[0..w[1]]),
                 .quit => return,

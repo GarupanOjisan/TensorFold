@@ -80,16 +80,39 @@ const Glm = struct {
         g.pending_rows = 0;
     }
 
+    /// Each row's draw among the gathered candidates (exact_sampling.choose_rows), row r keyed at position0 + r.
+    fn choose(g: *Glm, s: *lanes.Stream, k: usize, rows: usize, position0: u64, out: []u32) !void {
+        const sm = s.sampling.?;
+        const host = &g.n.e.cand_host;
+        var values: [2 * fwd.Engine.max_k]f64 = undefined;
+        var ids: [2 * fwd.Engine.max_k]u64 = undefined;
+        for (0..rows) |r| {
+            var m: usize = 0;
+            for (0..2) |rank| {
+                const base = (rank * rows + r) * 2 * k;
+                for (0..k) |j| {
+                    values[m] = @as(f32, @bitCast(host[base + 2 * j]));
+                    ids[m] = host[base + 2 * j + 1];
+                    m += 1;
+                }
+            }
+            out[r] = @intCast(try lanes.sampling.choose(g.gpa, values[0..m], ids[0..m], position0 + r, sm));
+        }
+    }
+
     fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
         const g = of(p);
         const e = &g.n.e;
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + max_rows > e.st.capacity) return error.PromptTooLong;
-        if (s.sampling) |sm| if (sm.temperature > 0) return error.SamplingNotPorted;
+        const k = try candidateCount(s);
         g.stream = s;
         g.pending_rows = 0;
         g.held_n = 0;
-        _ = g.take(try g.n.prefill(ids, g.drafts));
+        const first = try g.n.prefill(ids, g.drafts, k);
+        var one: [1]u32 = .{first};
+        if (k > 0) try g.choose(s, k, 1, ids.len, &one);
+        _ = g.take(one[0]);
     }
 
     fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -118,7 +141,7 @@ const Glm = struct {
         if (windows.len != 1) return error.OneStreamAtATime;
         const w = windows[0];
         if (w.parents != null) return error.TreesNotBuilt;
-        if (g.pending_rows != 0) return error.UnkeptWindow;
+        try g.commit(g.pending_rows); // no keep since the last window: all of its rows stay (Nemotron's bindLane)
         const rows = w.rows();
         if (rows > max_rows) return error.WindowTooWide;
         if (w.held > g.held_n) return error.NoHeldDrafts;
@@ -128,7 +151,9 @@ const Glm = struct {
         ids[0] = w.pending;
         @memcpy(ids[1..][0..w.held], g.held[0..w.held]);
         @memcpy(ids[1 + w.held ..][0..w.tokens.len], w.tokens);
-        try g.n.verify(ids[0..rows], out[0].sampled[0..rows]);
+        const k = try candidateCount(w.stream);
+        try g.n.verify(ids[0..rows], k, out[0].sampled[0..rows]);
+        if (k > 0) try g.choose(w.stream, k, rows, w.positions[0], out[0].sampled[0..rows]);
         @memcpy(out[0].drafts[0 .. rows - 1], ids[1..rows]);
         g.pending_rows = rows;
         g.held_n = 0;
@@ -193,7 +218,7 @@ const Glm = struct {
     fn measure(g: *Glm, io: std.Io) !void {
         var prompt: [64]u32 = undefined;
         for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + i);
-        _ = try g.n.prefill(&prompt, true);
+        _ = try g.n.prefill(&prompt, true, 0);
         var out: [max_rows]u32 = undefined;
         var ids: [max_rows]u32 = undefined;
         for (&ids, 0..) |*t, i| t.* = @intCast(2000 + i);
@@ -201,7 +226,7 @@ const Glm = struct {
             var best: f64 = std.math.inf(f64);
             for (0..3) |_| {
                 const t0 = now(io);
-                try g.n.verify(ids[0..width], out[0..width]);
+                try g.n.verify(ids[0..width], 0, out[0..width]);
                 best = @min(best, ms(io, t0));
                 try g.n.keep(width, 1);
             }
@@ -221,6 +246,14 @@ const Glm = struct {
         std.log.info("GLM window ms by width: {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {d:.1}; MTP step {d:.2} ms", .{ g.costs[0].ms, g.costs[1].ms, g.costs[2].ms, g.costs[3].ms, g.costs[4].ms, g.costs[5].ms, g.costs[6].ms, g.costs[7].ms, g.mtp_ms });
     }
 };
+
+/// A stream's candidates a rank (top_k + MARGIN); 0 for greedy. top_k 0 (the full-vocabulary nucleus) is not ported.
+fn candidateCount(s: *const lanes.Stream) !usize {
+    const sm = s.sampling orelse return 0;
+    if (sm.temperature <= 0) return 0;
+    if (sm.top_k == 0) return error.SamplingNotPorted;
+    return @min(@as(usize, sm.top_k) + 8, fwd.Engine.max_k);
+}
 
 fn now(io: std.Io) i96 {
     return std.Io.Clock.awake.now(io).toNanoseconds();
@@ -249,7 +282,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
-        error.SamplingNotPorted => "this build of the GLM CUDA engine decodes greedily only: send temperature 0",
+        error.SamplingNotPorted => "this build of the GLM CUDA engine samples with top_k 1 to 1016 only: send top_k (or temperature 0)",
         error.OneStreamAtATime => "this build of the GLM CUDA engine serves one request at a time",
         else => null,
     };

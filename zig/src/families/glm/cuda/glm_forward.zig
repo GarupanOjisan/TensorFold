@@ -106,6 +106,8 @@ pub const Buffers = struct {
     pos_at: u64, // block positions, 16 bytes apart (TORCH-GLUE `pos_dev + r0`)
     greedy: u64, // [rows, 2] u32: this rank's (value, token)
     greedy_all: u64, // [2, rows, 2] u32 gathered
+    cand: u64, // [rows, 2 * max_k] u32: this rank's sampled candidates
+    cand_all: u64, // [2, rows, 2 * max_k] gathered
 
     pub const pos_slots = 16;
 };
@@ -214,6 +216,9 @@ fn carve(a: *Arena, w: *const Weights, rows: usize, capacity: usize, prefill: bo
     b.pos_at = a.take(Buffers.pos_slots * 16);
     b.greedy = a.take(rows * 8);
     b.greedy_all = a.take(wt.world * rows * 8);
+    const crows: usize = @min(rows, Engine.max_rows);
+    b.cand = a.take(crows * 2 * Engine.max_k * 4);
+    b.cand_all = a.take(wt.world * crows * 2 * Engine.max_k * 4);
     return b;
 }
 
@@ -261,8 +266,12 @@ pub const Engine = struct {
     np_max: usize,
     last_logits: u64, // a prompt's last row's logits, kept past the MTP absorb that reuses pbuf
     last_hidden: u64, // and its final-normed hidden row, the first draft's input
+    /// The last `candidates` call's gathered pairs: [rank][row][k] of (fp32 value bits, token).
+    cand_host: [wt.world * max_rows * 2 * max_k]u32 = undefined,
 
     pub const max_rows = 8; // engine.MAX_ROWS
+    /// The most candidates a rank gives a sampled row (top_k + exact_sampling.MARGIN).
+    pub const max_k = 1024;
     pub const prefill_rows = 2048; // geometry.PREFILL_ROWS
 
     /// Buffers for windows of max_rows rows, prompt chunks of prefill_rows and the MTP head, and one sequence's state.
@@ -667,6 +676,24 @@ pub const Engine = struct {
     }
 
     // -- sampling -----------------------------------------------------------------------------------------------
+    /// sample_rows' candidates for sampled rows: each rank's top `k` of its vocabulary slice (k = top_k + MARGIN),
+    /// gathered on every rank into cand_host, for the host chooser.
+    pub fn candidates(e: *Engine, b: *const Buffers, logits: u64, rows: usize, k: usize) !void {
+        if (k == 0 or k > max_k or k > e.w.head.n or rows > max_rows) return error.BadCandidateCount;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(i32, @intCast(e.w.head.n)));
+        a.add(@as(i32, @intCast(e.w.head.n)));
+        a.add(@as(i32, @intCast(k)));
+        a.add(@as(i32, @intCast(e.w.rank * e.w.head.n)));
+        a.add(b.cand);
+        try cuda.launch.launch(e.k.topk, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.s, &a);
+        const n = rows * 2 * k;
+        try e.comm.lib.check(e.comm.lib.api.ncclAllGather(b.cand, b.cand_all, n, .u32, e.comm.comm, e.s.handle), "ncclAllGather");
+        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(&e.cand_host, b.cand_all, wt.world * n * 4, e.s.handle), "cuMemcpyDtoHAsync");
+        try e.s.synchronize();
+    }
+
     /// sample_rows, greedy: each rank's row maximum (first column on ties), gathered; the larger value wins, the
     /// smaller token on a tie (np.lexsort((tokens, -values))).
     pub fn greedy(e: *Engine, b: *const Buffers, logits: u64, rows: usize, vocab: usize, out: []u32) !void {

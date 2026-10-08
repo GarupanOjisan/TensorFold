@@ -9,6 +9,14 @@ const bf = 2;
 /// decode.prefill without a resume point: the prompt in chunks, each also absorbed by the MTP head (its rows from
 /// the chunk's second token on), then the first token. The last row's hidden stays in e.last_hidden for the first draft.
 pub fn prefill(e: *Engine, prompt: []const u32, use_mtp: bool) !u32 {
+    try prefillCaches(e, prompt, use_mtp);
+    var first: [1]u32 = undefined;
+    try e.greedy(&e.buf, e.last_logits, 1, e.w.head.n, &first);
+    return first[0];
+}
+
+/// The prompt's caches (and the MTP head's), its last row's logits in e.last_logits.
+pub fn prefillCaches(e: *Engine, prompt: []const u32, use_mtp: bool) !void {
     if (prompt.len == 0) return error.EmptyPrompt;
     const d: usize = e.w.cfg.hidden;
     try e.reset();
@@ -29,9 +37,6 @@ pub fn prefill(e: *Engine, prompt: []const u32, use_mtp: bool) !u32 {
         }
         try e.commitChunk(rows);
     }
-    var first: [1]u32 = undefined;
-    try e.greedy(&e.buf, e.last_logits, 1, e.w.head.n, &first);
-    return first[0];
 }
 
 /// decode.serial_decode, greedy: one token a step until `count` tokens (the first included) or an end token.
