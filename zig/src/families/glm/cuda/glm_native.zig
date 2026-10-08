@@ -286,60 +286,88 @@ fn candidateCount(s: *const lanes.Stream) !usize {
 
 /// sampling.nucleus_rows for one row over the whole vocabulary `row` (bf16 bits by token id). Python reads each
 /// rank's top 1,024 first and every whole shard when a row's nucleus runs past them, so its draw is this one: tokens
-/// by (value desc, id asc) with v = logit / T in float64, mass floor(exp(v - top) 2^40); keep through the first whose
-/// cumulative mass reaches ceil(top_p total) (top_p in (0, 1)), then v >= top + ln(min_p); the Gumbel race
-/// v - ln(-ln u(seed, position, id)) among them, first maximum. Tokens 42 or more below the top are left out: their
-/// mass is 0 (below 2^-40) and their race score stays under the top token's (the race's noise spans 41.1).
+/// in (value desc, id asc) order with v = logit / T in float64, mass floor(exp(v - top) 2^40); keep a token while the
+/// mass before it is below ceil(top_p total) (top_p in (0, 1)), and while v >= top + ln(min_p); the Gumbel race
+/// v - ln(-ln u(seed, position, id)) among them, the first maximum in that order. Both cuts keep a prefix of the
+/// order, so the kept set is found by selection (no sort). Tokens 42 or more below the top are left out: their mass
+/// is 0 (below 2^-40) and their race score stays under the top token's (the race's noise spans 41.1).
 fn nucleus(gpa: std.mem.Allocator, row: []const u16, position: u64, s: lanes.sampling.Sampling) !u32 {
     const t = @max(s.temperature, 1e-6);
     var top = -std.math.inf(f64);
     for (row) |b| top = @max(top, bf16Value(b) / t);
-    const C = struct { v: f64, id: u32, mass: u64 };
-    var cands: std.ArrayList(C) = .empty;
+    var cands: std.ArrayList(Tok) = .empty;
     defer cands.deinit(gpa);
+    try cands.ensureTotalCapacity(gpa, row.len);
     var total: u64 = 0;
+    const floor = top + s.minLog();
     for (row, 0..) |b, i| {
         const v = bf16Value(b) / t;
-        if (v < top - 42.0) continue;
+        if (v < top - 42.0 or v < floor) continue; // min_p's cut keeps a prefix too: drop its tail now
         // floor(exp(d) 2^40) is 0 below d = -40 ln 2 (-27.7): no exp for those
         const mass: u64 = if (v - top < -28.0) 0 else @intFromFloat(@floor(libm_exp(v - top) * 0x1p40));
-        total += mass;
-        try cands.append(gpa, .{ .v = v, .id = @intCast(i), .mass = mass });
+        cands.appendAssumeCapacity(.{ .v = v, .id = @intCast(i), .mass = mass });
     }
-    std.mem.sort(C, cands.items, {}, struct {
-        fn lt(_: void, a: C, b: C) bool {
-            return a.v > b.v or (a.v == b.v and a.id < b.id);
-        }
-    }.lt);
-    var keep = cands.items.len;
-    if (s.top_p > 0.0 and s.top_p < 1.0) {
-        const need = ceilShare(s.top_p, total);
-        var cum: u64 = 0;
-        var below: usize = 0;
-        for (cands.items) |c| {
-            cum += c.mass;
-            if (cum < need) below += 1 else break;
-        }
-        keep = @min(keep, below + 1);
+    // the cut's total is every token's mass, the ones below min_p's floor included
+    for (row) |b| {
+        const v = bf16Value(b) / t;
+        if (v >= floor and v >= top - 42.0) continue;
+        if (v - top >= -28.0) total += @intFromFloat(@floor(libm_exp(v - top) * 0x1p40));
     }
-    if (s.min_p > 0.0) {
-        const floor = top + s.minLog();
-        var n: usize = 0;
-        for (cands.items) |c| {
-            if (c.v >= floor) n += 1;
-        }
-        keep = @min(keep, n);
-    }
-    var best: usize = 0;
-    var best_score = -std.math.inf(f64);
-    for (cands.items[0..keep], 0..) |c, j| {
-        const score = c.v - libm_log(-libm_log(lanes.sampling.uniform(s.seed, position, c.id)));
-        if (j == 0 or score > best_score) {
-            best = j;
+    for (cands.items) |c| total += c.mass;
+    var kept = cands.items;
+    if (s.top_p > 0.0 and s.top_p < 1.0) kept = kept[0..prefixWithin(kept, ceilShare(s.top_p, total))];
+    var best = kept[0];
+    var best_score = raceScore(best, position, s.seed);
+    for (kept[1..]) |c| {
+        const score = raceScore(c, position, s.seed);
+        if (score > best_score or (score == best_score and before(c, best))) {
+            best = c;
             best_score = score;
         }
     }
-    return cands.items[best].id;
+    return best.id;
+}
+
+const Tok = struct { v: f64, id: u32, mass: u64 };
+
+fn before(a: Tok, b: Tok) bool {
+    return a.v > b.v or (a.v == b.v and a.id < b.id);
+}
+
+fn raceScore(c: Tok, position: u64, seed: u64) f64 {
+    return c.v - libm_log(-libm_log(lanes.sampling.uniform(seed, position, c.id)));
+}
+
+/// Reorders `a` so its kept tokens come first and returns how many: a token is kept when the mass of the tokens
+/// before it in (value desc, id asc) order is below `need` (quickselect on that order, expected linear).
+fn prefixWithin(a: []Tok, need: u64) usize {
+    var lo: usize = 0;
+    var hi: usize = a.len;
+    var rem = need;
+    while (hi > lo) {
+        // pivot: the middle element, moved to the end; partition [lo, hi - 1) into before-pivot and after-pivot
+        std.mem.swap(Tok, &a[lo + (hi - lo) / 2], &a[hi - 1]);
+        const p = a[hi - 1];
+        var m = lo;
+        var sum: u64 = 0;
+        for (lo..hi - 1) |i| {
+            if (before(a[i], p)) {
+                sum += a[i].mass;
+                std.mem.swap(Tok, &a[i], &a[m]);
+                m += 1;
+            }
+        }
+        std.mem.swap(Tok, &a[m], &a[hi - 1]); // pivot at m, [lo, m) before it, (m, hi) after it
+        if (sum >= rem) {
+            hi = m; // the kept tokens all lie before the pivot
+            continue;
+        }
+        // [lo, m) and the pivot are kept; the rest only while mass remains
+        if (sum + p.mass >= rem) return m + 1;
+        rem -= sum + p.mass;
+        lo = m + 1;
+    }
+    return lo;
 }
 
 extern "c" fn exp(x: f64) f64;
