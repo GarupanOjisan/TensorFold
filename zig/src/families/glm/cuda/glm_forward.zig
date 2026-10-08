@@ -198,6 +198,14 @@ fn carve(a: *Arena, w: *const Weights, rows: usize, capacity: usize, prefill: bo
         .ids = a.take(maxu * 4),
         .count = a.take(4),
         .members = a.take(maxu * rows * 4),
+        .plan = .{
+            .members = a.take(bs * 4),
+            .items = a.take(kern.maxItems(bs, e_n + 1, 16) * 12),
+            .counts = a.take(8),
+            .rank = a.take(if (bs > 1024) bs * 4 else 4),
+            .hist = a.take(if (bs > 1024) (bs + 1023) / 1024 * (e_n + 1) * 4 else 4),
+            .order = a.take((bs / 16 + 1024) * 4),
+        },
     };
     b.sgu = a.take(rows * 2 * sl * bf);
     b.sact = a.take(rows * sl * bf);
@@ -287,6 +295,11 @@ pub const Engine = struct {
     graphs: [max_graphs]GraphEntry = undefined,
     n_graphs: usize = 0,
     use_graphs: bool = true,
+    /// TF_GLM_EXL3_DEC (default on): v1.8's routed-expert kernels, plan and direct shared-expert combine; 0: the generic
+    /// grouped kernel of v0.6.6 (the A/B path).
+    exl3_v18: bool = true,
+    /// TF_GLM_COMBINE_SY (default on, with exl3_v18): decode windows combine the shared expert's row where it is.
+    combine_sy: bool = true,
     capturing: bool = false,
 
     pub const max_rows = 8; // engine.MAX_ROWS
@@ -360,6 +373,8 @@ pub const Engine = struct {
         e.full_dev = try cuda.DeviceBuffer.alloc(d, wt.world * max_rows * w.head.n * bf);
         errdefer e.full_dev.free();
         e.full_host = try std.heap.page_allocator.alloc(u16, wt.world * max_rows * w.head.n);
+        e.exl3_v18 = if (std.c.getenv("TF_GLM_EXL3_DEC")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        e.combine_sy = e.exl3_v18 and (if (std.c.getenv("TF_GLM_COMBINE_SY")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true);
         e.use_graphs = if (std.c.getenv("TF_GLM_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         return e;
     }
@@ -632,13 +647,19 @@ pub const Engine = struct {
         const slots: usize = c.topk + 1;
         try e.t.router(b.normed, d, m.router, b.rpart, b.mlog, rows, d, c.experts);
         try e.t.select(b.mlog, m.bias, b.pick, b.wts, rows, c.topk, c.experts, c.routed_scale, true);
-        try kern.routed(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit);
+        if (e.exl3_v18) try kern.routed18(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit, b.prefill) else try kern.routed(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit);
         const sh = m.shared;
         try e.mm(b, b.normed, d, b.xs, sh.gu, b.sgu, rows, false);
         try e.t.swiglu(b.sgu, b.sact, b.sxs, rows, sh.width, c.swiglu_limit);
         try e.mm(b, b.sact, sh.width, b.sxs, sh.down, b.sy, rows, true);
-        try e.copyRows(b.sy, d * f4, b.exl3.y + c.topk * d * f4, slots * d * f4, d * f4, rows);
-        try e.t.combine(b.exl3.y, b.wts, b.part, rows, d, slots);
+        // forward.py moe_block: the shared row read from sy where it is (a prompt chunk always, a decode window unless
+        // TF_GLM_COMBINE_SY=0), else copied into the routed rows' last slot
+        if (e.exl3_v18 and (b.prefill or e.combine_sy)) {
+            try e.t.combineSy(b.exl3.y, b.sy, b.wts, b.part, rows, d, slots);
+        } else {
+            try e.copyRows(b.sy, d * f4, b.exl3.y + c.topk * d * f4, slots * d * f4, d * f4, rows);
+            try e.t.combine(b.exl3.y, b.wts, b.part, rows, d, slots);
+        }
         return e.gather(b, rows);
     }
 

@@ -57,3 +57,19 @@ the port) sets those switches to their v0.6.6 behaviour (`TF_GLM_KV=bf16`, `KDA_
 `HC_DEC=0`, `HC_MMA=0`, `LATENT_MMA=0`, `SPARSE_ONEPASS=0`, `KDA_WIDE_ROWS=64`, `SEQ_ROWS=1000000`, `COMBINE_SY=0`,
 `SCORE_RB=1`, `WIDE_GRAPHS=0`) and `TF_GLM_DENSE=q4` or `bf16`. With `bf16` those replies equal the v0.6.6 set
 (`c2`) token for token. The `_fmm` kernels join `c234` with `aot_pack.py --base aot/c234 --only _fmm`.
+
+## 5. v1.8's routed-expert kernels (TF_GLM_EXL3_DEC)
+
+`moeBlock` runs v1.8's `exl3_mm.routed` at two ranks by default: `experts.route` (the plan kernels of `experts.cu`, items of 16
+pairs, 64 for a prompt chunk), then, for a decode window, `rot_rows` (one rotated input a row where every expert shares one
+gate/up `suh`, found at load), `dec_kernel` for gate/up (16-byte trellis loads one step ahead, `TF_GLM_EXL3_LOADS=nc`),
+`gateup_epilogue_kernel` and `dec_kernel` for down with its epilogue fused (`FUSE=1`); for a prompt chunk `rot_rows`,
+`prompt_order_kernel`, `prompt_gateup_kernel<64, 8, shx>` and `prompt_down_kernel<64, 8>`. The shared expert's row goes into
+the combine where it is (`_combine_sy`, `TF_GLM_COMBINE_SY`). The device code is `glm_exl3d.cu`, a copy of v1.8's `exl3.cu` lines
+1-912. `TF_GLM_EXL3_DEC=0` runs the generic grouped path of v0.6.6 (the A/B path; it also copies the shared row as before).
+Not ported: the decode path's `LOADS=0`, `FUSE=0/2/3` and `PASS=128` variants, the grouped fallback's `NFIRST/SEQ/PF`, and
+the shared expert before the routed ones (it matters with `TF_GLM_L2PF` only).
+
+The reference sets `m1`, `m2`, `m3` are `q1`, `q2`, `q3` with `OFF_EXTRA="-e TF_GLM_EXL3_LOADS=nc -e TF_GLM_EXL3_DEC=1
+-e TF_GLM_EXL3_FUSE=1 -e TF_GLM_EXL3_XROW=1 -e TF_GLM_EXL3_PROMPT=1 -e TF_GLM_EXL3_ORDER=1 -e TF_GLM_EXL3_ROWROT=1
+-e TF_GLM_EXL3_PASS=64 -e TF_GLM_COMBINE_SY=1"` (`cap18.sh` appends it). `aot/m18` is `aot/q18` plus `_combine_sy`.

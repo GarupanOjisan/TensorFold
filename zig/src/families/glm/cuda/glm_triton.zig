@@ -200,6 +200,13 @@ pub const Tri = struct {
         try t.run("_fmm", .{ 1, cdiv(n, f8_bn_decode), 1 }, &.{ p("X", "*bf16", x), p("W", "*fp8e4nv", w), p("S", "*fp32", sc), p("OUT", ot, out), p("PART", ot, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", 1), ci("BM", 16), ci("BLOCK_N", f8_bn_decode), ci("BK", b16_bk), flag("F32", wide), flag("SEQ", false) });
     }
 
+    /// glue.combine_shared (v1.8 glue.py:514): `combine` with the shared expert's row read from sy [R, D] fp32 instead of
+    /// y's last slot; the same terms in the same slot order.
+    pub fn combineSy(t: Tri, y: u64, sy: u64, wts: u64, out: u64, rows: usize, d: usize, slots: usize) !void {
+        const block = @min(1024, d);
+        try t.run("_combine_sy", .{ rows, d / block, 1 }, &.{ p("Y", "*fp32", y), p("SY", "*fp32", sy), p("WTS", "*fp32", wts), p("OUT", "*fp32", out) }, &.{ ci("D", d), ci("SLOTS", slots), ci("BLOCK", block) });
+    }
+
     /// qmm.group_sums (qmm.py:117): x [m, k] bf16 (rows strided) -> xs [m, k/64] fp32.
     pub fn groupSums(t: Tri, x: u64, x_stride: usize, xs: u64, m: usize, k: usize) !void {
         try t.run("_group_sums", .{ m, cdiv(k / 64, 16), 1 }, &.{ p("X", "*bf16", x), p("XS", "*fp32", xs), int("x_stride", x_stride) }, &.{ ci("K", k), ci("GB", 16) });

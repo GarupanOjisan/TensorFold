@@ -89,6 +89,10 @@ pub const Exl3 = struct {
     dims: usize,
     width: usize, // I on this rank
     k2: u32, // every trellis here has the same width (checked)
+    gate_base: u64, // the trellises of all experts as one block [E, K/16, N/16, 32] words (v1.8's kernels)
+    up_base: u64,
+    down_base: u64,
+    shared_suh: u64, // [D] f16 if every expert's gate and up suh is this vector bit for bit (exl3_mm.shared_suh), else 0
 };
 
 pub const Moe = struct { router: u64, bias: u64, ex: Exl3, shared: Mlp };
@@ -406,6 +410,9 @@ const Loader = struct {
         const d: usize = c.hidden;
         const width: usize = c.moe_inter / world;
         var k2: u32 = 0;
+        var bases: [3]u64 = undefined;
+        var gate_row: ?[]u8 = null; // expert 0's gate suh, while every expert's gate and up suh equal it
+        defer if (gate_row) |g| l.gpa.free(g);
         var ptrs: [3]u64 = undefined;
         var k2s: [3]u64 = undefined;
         var scales: [6]u64 = undefined; // suh_g, svh_g, suh_u, svh_u, suh_d, svh_d
@@ -442,6 +449,7 @@ const Loader = struct {
                 table[e] = @intCast(block + e * each);
                 widths[e] = @intCast(this_k2);
             }
+            bases[j] = block;
             ptrs[j] = try l.alloc(e_n * 8);
             try l.src.ops.upload(ptrs[j], std.mem.sliceAsBytes(table));
             k2s[j] = try l.alloc(e_n * 4);
@@ -461,6 +469,17 @@ const Loader = struct {
                 if (bytes.items.len != want) return error.ScaleShape;
                 scales[j * 2 + s] = try l.alloc(bytes.items.len);
                 try l.src.ops.upload(scales[j * 2 + s], bytes.items);
+                if (s == 0 and j < 2) {
+                    const row = kk * 2;
+                    if (j == 0) gate_row = try l.gpa.dupe(u8, bytes.items[0..row]);
+                    if (gate_row) |g| for (0..e_n) |e| {
+                        if (!std.mem.eql(u8, g, bytes.items[e * row ..][0..row])) {
+                            l.gpa.free(g);
+                            gate_row = null;
+                            break;
+                        }
+                    };
+                }
             }
             // the codebook marker (I32 [1]) is replicated and unread, as in the Python loader
             for (0..e_n) |e| {
@@ -486,6 +505,14 @@ const Loader = struct {
             .dims = d,
             .width = width,
             .k2 = k2,
+            .gate_base = bases[0],
+            .up_base = bases[1],
+            .down_base = bases[2],
+            .shared_suh = if (gate_row) |g| blk: {
+                const ptr = try l.alloc(g.len);
+                try l.src.ops.upload(ptr, g);
+                break :blk ptr;
+            } else 0,
         };
     }
 

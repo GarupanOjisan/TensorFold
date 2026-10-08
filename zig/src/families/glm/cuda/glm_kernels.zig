@@ -13,7 +13,7 @@ fn int(x: usize) i32 {
 }
 
 pub const Kernels = struct {
-    mods: [7]cuda.Module,
+    mods: [9]cuda.Module,
     chain: cuda.Function,
     prep: cuda.Function,
     step: cuda.Function,
@@ -38,6 +38,21 @@ pub const Kernels = struct {
     make_f8: cuda.Function,
     /// v1.8's decode matmul qmm_kernel by tile config (qmm_cfgs), fp32 out, K slices in a cluster.
     qmm: [qmm_cfgs.len][2][2]cuda.Function,
+    /// v1.8's routed-expert kernels (glm_exl3d: glm5_next/cuda/exl3.cu) and the plan kernels of experts.cu.
+    rot_rows: cuda.Function,
+    rot_pairs: cuda.Function,
+    dec_gu_rows: cuda.Function,
+    dec_gu: cuda.Function,
+    dec_down: cuda.Function,
+    gu_epilogue18: cuda.Function,
+    prompt_order: cuda.Function,
+    prompt_gu_rows: cuda.Function,
+    prompt_gu: cuda.Function,
+    prompt_down: cuda.Function,
+    plan_small: cuda.Function,
+    plan_rank: cuda.Function,
+    plan_offsets: cuda.Function,
+    plan_scatter: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -58,6 +73,10 @@ pub const Kernels = struct {
         // TF_GLM_DENSE=q4's decode matmul: v1.8's qmm.cu (cuda/kernels/qmm.py `qmm`, `qmm_cfg`)
         k.mods[6] = try cuda.Module.load(d, cuda.kernels.qmm);
         errdefer k.mods[6].unload();
+        k.mods[7] = try cuda.Module.load(d, cuda.kernels.glm_exl3d);
+        errdefer k.mods[7].unload();
+        k.mods[8] = try cuda.Module.load(d, cuda.kernels.experts);
+        errdefer k.mods[8].unload();
         k.chain = try k.mods[0].function(sym.kda_chain);
         k.prep = try k.mods[0].function(sym.kda_prep);
         k.step = try k.mods[0].function(sym.kda_step);
@@ -87,6 +106,23 @@ pub const Kernels = struct {
             k.qmm[i][j][l] = try k.mods[6].function(comptime c.symbol(fp32, cluster));
             try k.qmm[i][j][l].allowDynamicShared(c.smem());
         };
+        k.rot_rows = try k.mods[7].function(e18.rot_rows);
+        k.rot_pairs = try k.mods[7].function(e18.rot_pairs);
+        k.dec_gu_rows = try k.mods[7].function(e18.dec_gu_rows);
+        k.dec_gu = try k.mods[7].function(e18.dec_gu);
+        k.dec_down = try k.mods[7].function(e18.dec_down);
+        k.gu_epilogue18 = try k.mods[7].function(e18.gu_epilogue);
+        k.prompt_order = try k.mods[7].function(e18.prompt_order);
+        k.prompt_gu_rows = try k.mods[7].function(e18.prompt_gu_rows);
+        k.prompt_gu = try k.mods[7].function(e18.prompt_gu);
+        k.prompt_down = try k.mods[7].function(e18.prompt_down);
+        try k.prompt_gu_rows.allowDynamicShared(prompt_smem_rows);
+        try k.prompt_gu.allowDynamicShared(prompt_smem);
+        try k.prompt_down.allowDynamicShared(prompt_smem);
+        k.plan_small = try k.mods[8].function(e18.plan_small);
+        k.plan_rank = try k.mods[8].function(e18.plan_rank);
+        k.plan_offsets = try k.mods[8].function(e18.plan_offsets);
+        k.plan_scatter = try k.mods[8].function(e18.plan_scatter);
         // group_kernel's members list grows with the rows (a prompt chunk's 2048 rows * 9 slots * 4 B): experts.cu:292-305
         try k.group.allowDynamicShared(96 << 10);
         return k;
@@ -123,6 +159,27 @@ const QmmCfg = struct {
     }
 };
 const qmm_cfgs = [_]QmmCfg{ .{ .bn = 64, .wn = 4, .stages = 4 }, .{ .bn = 128, .wn = 8, .stages = 4 }, .{ .bn = 128, .wn = 4, .stages = 6 } };
+
+/// glm_exl3d.cu's and experts.cu's instantiations (cuobjdump -symbols), and the prompt kernels' dynamic shared memory
+/// (exl3.cu prompt_smem<64, XM>: three stages of the members' rows and the trellis words, or an epilogue half).
+const e18 = struct {
+    const rot_rows = "_ZN12tf_glm_exl3d13rot_in_kernelILb1EEEvPK13__nv_bfloat16iPKiPK6__halfS8_PS6_S9_ii";
+    const rot_pairs = "_ZN12tf_glm_exl3d13rot_in_kernelILb0EEEvPK13__nv_bfloat16iPKiPK6__halfS8_PS6_S9_ii";
+    const dec_gu_rows = "_ZN12tf_glm_exl3d10dec_kernelILi8ELi4ELi16ELi0ELb1ELi1ELi1EEEvPK6__halfS3_PKjS5_PKiS7_S7_PfiiiiiiS3_S3_S3_PvfPi";
+    const dec_gu = "_ZN12tf_glm_exl3d10dec_kernelILi8ELi4ELi16ELi0ELb0ELi1ELi1EEEvPK6__halfS3_PKjS5_PKiS7_S7_PfiiiiiiS3_S3_S3_PvfPi";
+    const dec_down = "_ZN12tf_glm_exl3d10dec_kernelILi8ELi4ELi16ELi1ELb0ELi1ELi1EEEvPK6__halfS3_PKjS5_PKiS7_S7_PfiiiiiiS3_S3_S3_PvfPi";
+    const gu_epilogue = "_ZN12tf_glm_exl3d22gateup_epilogue_kernelEPKfPKiPK6__halfS6_S6_PS4_iiiif";
+    const prompt_order = "_ZN12tf_glm_exl3d19prompt_order_kernelEPKiS1_Piii";
+    const prompt_gu_rows = "_ZN12tf_glm_exl3d20prompt_gateup_kernelILi64ELi8ELb1EEEvPK6__halfS3_PKjS5_PKiS7_S7_S3_S3_S3_PS1_iiifiS7_";
+    const prompt_gu = "_ZN12tf_glm_exl3d20prompt_gateup_kernelILi64ELi8ELb0EEEvPK6__halfS3_PKjS5_PKiS7_S7_S3_S3_S3_PS1_iiifiS7_";
+    const prompt_down = "_ZN12tf_glm_exl3d18prompt_down_kernelILi64ELi8EEEvPK6__halfPKjPKiS7_S7_S3_PfiiiS7_";
+    const plan_small = "_ZN10tf_experts11plan_kernelEPKiiiiPiS2_S2_";
+    const plan_rank = "_ZN10tf_experts9plan_rankEPKiiiPiS2_";
+    const plan_offsets = "_ZN10tf_experts12plan_offsetsEiiiPiS0_S0_";
+    const plan_scatter = "_ZN10tf_experts12plan_scatterEPKiiiS1_S1_Pi";
+};
+const prompt_smem: u32 = 43008; // prompt_smem<64>(): XM = 2 copies of the member rows (gate and up apart; the down kernel)
+const prompt_smem_rows: u32 = 33792; // prompt_smem<64, 1>(): one copy (gate/up of a layer whose experts share one suh)
 
 /// glm qmm.py DEC_TILES (TF_GLM_Q4_TILE unset): the config index of a few projection shapes, else 0.
 fn decCfg(n: usize, kk: usize) usize {
@@ -428,6 +485,7 @@ pub const Exl3Scratch = struct {
     ids: u64, // [min(P, E)] i32
     count: u64, // [1] i32
     members: u64, // [min(P, E) * rows] i32, -1 filled
+    plan: Plan, // routed18's plan (TF_GLM_EXL3_DEC)
 
     pub const gu_sk = 4; // GLM_GATEUP (8, 4, 4, 1)
     pub const d_sk = 1; // GLM_DOWN (8, 4, 1, 1)
@@ -506,6 +564,133 @@ pub fn routed(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick: 
     }
 }
 
+/// experts.Plan's scratch (experts.py:113): pairs grouped by expert into items of at most `tile` pairs.
+pub const Plan = struct {
+    members: u64, // [pairs] i32
+    items: u64, // [max_items(pairs, experts, 16), 3] i32: (expert, first member, count)
+    counts: u64, // [2] i32: items, distinct experts
+    rank: u64, // [pairs] i32 when the plan is wide (pairs > 1024), else one word
+    hist: u64, // [ceil(pairs / 1024), experts] i32 when wide
+    order: u64, // a prompt plan's launch order, [pairs / 16 + 1024] i32
+};
+
+/// experts.max_items: the items a plan of `pairs` can hold.
+pub fn maxItems(pairs: usize, experts: usize, tile: usize) usize {
+    return @min(pairs, experts) + pairs / tile;
+}
+
+/// experts.route (experts.cu:306): `picks` [pairs] expert ids -> the plan; `experts` counts the shared expert's id.
+pub fn route(k: *const Kernels, s: cuda.Stream, picks: u64, pairs: usize, experts: usize, tile: usize, p: Plan) !void {
+    var a: cuda.Args = .{};
+    if (pairs <= 1024) {
+        a.add(picks);
+        for ([_]usize{ pairs, experts, tile }) |v| a.add(int(v));
+        for ([_]u64{ p.members, p.items, p.counts }) |v| a.add(v);
+        return go(k.plan_small, s, .{ 1, 1, 1 }, 1024, 0, &a);
+    }
+    const nblk = (pairs + 1023) / 1024;
+    a.add(picks);
+    a.add(int(pairs));
+    a.add(int(experts));
+    a.add(p.rank);
+    a.add(p.hist);
+    try go(k.plan_rank, s, .{ nblk, 1, 1 }, 1024, 0, &a);
+    var b: cuda.Args = .{};
+    for ([_]usize{ nblk, experts, tile }) |v| b.add(int(v));
+    for ([_]u64{ p.hist, p.items, p.counts }) |v| b.add(v);
+    try go(k.plan_offsets, s, .{ 1, 1, 1 }, 1024, 0, &b);
+    var c: cuda.Args = .{};
+    c.add(picks);
+    c.add(int(pairs));
+    c.add(int(experts));
+    for ([_]u64{ p.rank, p.hist, p.members }) |v| c.add(v);
+    try go(k.plan_scatter, s, .{ (pairs + 255) / 256, 1, 1 }, 256, 0, &c);
+}
+
+/// exl3_mm.routed for GLM at two ranks (D 4096, an expert width of 1024) on `plan` (route): Y per routed slot into
+/// `sc.y`. A prompt chunk (`prompt`: plan items of 64 pairs) runs the Y^T kernels, a decode window (under 64 rows,
+/// items of 16) the `dec` kernels with TF_GLM_EXL3_FUSE 1 (the down epilogue fused) and the 16-byte loads
+/// (TF_GLM_EXL3_LOADS=nc). `ex.shared_suh` (0: none) is the one gate/up suh of a layer whose experts all share it.
+pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick: u64, ex: anytype, sc: Exl3Scratch, rows: usize, limit: f32, prompt: bool) !void {
+    const slots = sc.slots;
+    const p = rows * slots;
+    const e_n = ex.count;
+    const d = ex.dims;
+    const i_w = ex.width;
+    const pl = sc.plan;
+    if (d != 4096 or i_w != 1024 or d % 256 != 0) return error.Exl3Shape;
+    if (!prompt and rows >= 64) return error.WindowTooWide; // PROMPT_ROWS: a window from 64 rows takes the prompt plan
+    const tile: usize = if (prompt) 64 else 16;
+    try route(k, s, pick, p, e_n + 1, tile, pl);
+    const rows_in = ex.shared_suh != 0;
+    if (rows_in) { // one rotated input a row, read by all its pairs' gate and up
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(int(x_stride));
+        a.add(@as(u64, 0));
+        a.add(ex.shared_suh);
+        a.add(ex.shared_suh);
+        a.add(sc.xg);
+        a.add(sc.xg);
+        a.add(int(d));
+        a.add(@as(i32, 1));
+        try go(k.rot_rows, s, .{ rows, d / 128, 1 }, 32, 0, &a);
+    } else {
+        var a: cuda.Args = .{};
+        a.add(x);
+        a.add(int(x_stride));
+        a.add(pick);
+        a.add(ex.suh_g);
+        a.add(ex.suh_u);
+        a.add(sc.xg);
+        a.add(sc.xu);
+        a.add(int(d));
+        a.add(int(slots));
+        try go(k.rot_pairs, s, .{ p, d / 128, 2 }, 32, 0, &a);
+    }
+    const xu = if (rows_in) sc.xg else sc.xu;
+    const items = maxItems(p, e_n + 1, tile);
+    if (prompt) {
+        var o: cuda.Args = .{};
+        for ([_]u64{ pl.items, pl.counts, pl.order }) |v| o.add(v);
+        o.add(int(items));
+        o.add(int(e_n));
+        try go(k.prompt_order, s, .{ 1, 1, 1 }, 1024, 0, &o);
+        var g: cuda.Args = .{};
+        for ([_]u64{ sc.xg, xu, ex.gate_base, ex.up_base, pl.items, pl.counts, pl.members, ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| g.add(v);
+        for ([_]usize{ d, i_w, e_n }) |v| g.add(int(v));
+        g.add(limit);
+        g.add(int(slots));
+        g.add(pl.order);
+        try go(if (rows_in) k.prompt_gu_rows else k.prompt_gu, s, .{ i_w / 128, items, 1 }, 256, if (rows_in) prompt_smem_rows else prompt_smem, &g);
+        var dn: cuda.Args = .{};
+        for ([_]u64{ sc.xd, ex.down_base, pl.items, pl.counts, pl.members, ex.svh_d, sc.y }) |v| dn.add(v);
+        for ([_]usize{ i_w, d, e_n }) |v| dn.add(int(v));
+        dn.add(pl.order);
+        return go(k.prompt_down, s, .{ d / 256, items, 1 }, 256, prompt_smem, &dn);
+    }
+    const sk_gu = Exl3Scratch.gu_sk;
+    var g: cuda.Args = .{};
+    for ([_]u64{ sc.xg, xu, ex.gate_base, ex.up_base, pl.items, pl.counts, pl.members, sc.z }) |v| g.add(v);
+    for ([_]usize{ d, i_w, p, sk_gu, e_n, slots }) |v| g.add(int(v));
+    for ([_]u64{ ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| g.add(v);
+    g.add(limit);
+    g.add(@as(u64, 0)); // done: only the gate/up epilogue fused into the kernel (TF_GLM_EXL3_FUSE 2) counts blocks
+    try go(if (rows_in) k.dec_gu_rows else k.dec_gu, s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
+    var e: cuda.Args = .{};
+    for ([_]u64{ sc.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| e.add(v);
+    for ([_]usize{ p, i_w, sk_gu, slots }) |v| e.add(int(v));
+    e.add(limit);
+    try go(k.gu_epilogue18, s, .{ p, i_w / 128, 1 }, 32, 0, &e);
+    var dn: cuda.Args = .{};
+    for ([_]u64{ sc.xd, sc.xd, ex.down_base, ex.down_base, pl.items, pl.counts, pl.members, sc.z }) |v| dn.add(v);
+    for ([_]usize{ i_w, d, p, 1, e_n, slots }) |v| dn.add(int(v));
+    for ([_]u64{ ex.svh_d, ex.svh_d, ex.svh_d, sc.y }) |v| dn.add(v);
+    dn.add(@as(f32, 0));
+    dn.add(@as(u64, 0));
+    try go(k.dec_down, s, .{ items, d / 128, 1 }, 128, 0, &dn);
+}
+
 fn grouped(k: *const Kernels, s: cuda.Stream, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, sc: Exl3Scratch, mats: usize, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, maxu: usize, mt: usize) !void {
     if (kk % (16 * sk * 4) != 0 or n % (16 * 8) != 0) return error.Exl3Tiles;
     var a: cuda.Args = .{};
@@ -526,4 +711,19 @@ fn grouped(k: *const Kernels, s: cuda.Stream, x0: u64, x1: u64, tp0: u64, tp1: u
     a.add(int(maxm));
     a.add(int(sc.slots));
     try go(k.grouped, s, .{ maxu, n / 128, mats * sk * mt }, 128, 0, &a);
+}
+
+test "routed-expert plan items and prompt kernels' shared memory" {
+    const t = std.testing;
+    try t.expectEqual(@as(usize, 9), maxItems(9, 289, 16)); // one row: nine pairs, each its own expert
+    try t.expectEqual(@as(usize, 289 + 18432 / 64), maxItems(18432, 289, 64)); // a 2,048-row chunk
+    // exl3.cu prompt_smem<64, XM>(): the larger of the stages (XM member-row copies and 2 x PWORDS halves, 3 deep) and the epilogue halves
+    const stages = struct {
+        fn bytes(xm: usize) usize {
+            return 3 * (xm * 64 * 40 + 2 * 1024) * 2;
+        }
+    };
+    try t.expectEqual(@as(usize, prompt_smem), stages.bytes(2));
+    try t.expectEqual(@as(usize, 2 * 32 * 132 * 4), prompt_smem_rows); // 33,792 B, above stages.bytes(1) = 27,648 B
+    try t.expect(stages.bytes(1) < prompt_smem_rows);
 }
