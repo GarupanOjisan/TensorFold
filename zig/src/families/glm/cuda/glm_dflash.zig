@@ -164,6 +164,7 @@ pub const Drafter = struct {
         dft.ring = ring;
         dft.cap = cap;
         dft.context_end = 0;
+        dft.prof = null; // `dft` starts undefined: an unset prof is garbage, and tick() would synchronize inside a captured block pass
         dft.kc = @splat(0);
         dft.vc = @splat(0);
         // one allocation: the K and V caches, then the scratch
