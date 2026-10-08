@@ -18,25 +18,32 @@ pub fn prefill(e: *Engine, prompt: []const u32, use_mtp: bool) !u32 {
 /// The prompt's caches (and the MTP head's), its last row's logits in e.last_logits.
 pub fn prefillCaches(e: *Engine, prompt: []const u32, use_mtp: bool) !void {
     if (prompt.len == 0) return error.EmptyPrompt;
-    const d: usize = e.w.cfg.hidden;
     try e.reset();
     var start: usize = 0;
     while (start < prompt.len) : (start += Engine.prefill_rows) {
-        const chunk = prompt[start..@min(prompt.len, start + Engine.prefill_rows)];
-        const rows = chunk.len;
-        _ = try e.stage(&e.pbuf, chunk);
-        try e.compute(&e.pbuf, rows);
-        try e.copyDev(e.last_logits, e.pbuf.logits, e.w.head.n * bf); // `last = compute(..).clone()`
-        try e.copyDev(e.last_hidden, e.pbuf.fnormed + (rows - 1) * d * bf, d * bf);
-        if (use_mtp and e.w.mtp != null) {
-            const nxt = prompt[start + 1 .. @min(prompt.len, start + rows + 1)];
-            if (nxt.len > 0) {
-                try e.mtp(&e.pbuf, nxt, e.pbuf.fnormed);
-                try e.setMtpLen(e.st.mtp_len + nxt.len);
-            }
-        }
-        try e.commitChunk(rows);
+        try prefillChunk(e, prompt, start, @min(prompt.len - start, Engine.prefill_rows), use_mtp);
     }
+}
+
+/// One prompt chunk, `rows` rows of `prompt` from `start` (the state's position): its caches, the MTP head's rows
+/// (each with its following token, the next chunk's first included), its last row's logits and hidden kept.
+pub fn prefillChunk(e: *Engine, prompt: []const u32, start: usize, rows: usize, use_mtp: bool) !void {
+    const d: usize = e.w.cfg.hidden;
+    if (rows == 0 or rows > Engine.prefill_rows or start + rows > prompt.len) return error.BadChunk;
+    if (e.st.pos != start) return error.ChunkOutOfStep;
+    const chunk = prompt[start..][0..rows];
+    _ = try e.stage(&e.pbuf, chunk);
+    try e.compute(&e.pbuf, rows);
+    try e.copyDev(e.last_logits, e.pbuf.logits, e.w.head.n * bf); // `last = compute(..).clone()`
+    try e.copyDev(e.last_hidden, e.pbuf.fnormed + (rows - 1) * d * bf, d * bf);
+    if (use_mtp and e.w.mtp != null) {
+        const nxt = prompt[start + 1 .. @min(prompt.len, start + rows + 1)];
+        if (nxt.len > 0) {
+            try e.mtp(&e.pbuf, nxt, e.pbuf.fnormed);
+            try e.setMtpLen(e.st.mtp_len + nxt.len);
+        }
+    }
+    try e.commitChunk(rows);
 }
 
 /// decode.serial_decode, greedy: one token a step until `count` tokens (the first included) or an end token.

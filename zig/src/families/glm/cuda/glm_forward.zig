@@ -719,6 +719,34 @@ pub const Engine = struct {
         try e.setPos(e.st.pos + rows);
     }
 
+    // -- kept prompt states ----------------------------------------------------------------------------------
+    /// A kept prompt state's bytes: every KDA layer's recurrent state (the half in use) and conv window. The
+    /// attention caches (DSA, indexer, MTP) are not copied: they are positional, and the caller only restores a
+    /// state while their rows below its position still hold its tokens.
+    pub fn snapshotBytes(e: *const Engine) usize {
+        const ll: usize = e.w.cfg.kda_heads / wt.world;
+        return e.st.kda_layers * (ll * 128 * 128 * f4 + 3 * 3 * ll * 128 * bf);
+    }
+
+    /// The live state between prompt chunks into `dst` (snapshotBytes bytes).
+    pub fn saveState(e: *Engine, dst: u64) !void {
+        const ll: usize = e.w.cfg.kda_heads / wt.world;
+        const rec = e.st.kda_layers * ll * 128 * 128 * f4;
+        try e.copyDev(dst, e.st.rec + e.st.cur * rec, rec);
+        try e.copyDev(dst + rec, e.st.conv, e.st.kda_layers * 3 * 3 * ll * 128 * bf);
+    }
+
+    /// The state `src` saved after `at` prompt tokens made live: the next prompt chunk starts at `at`.
+    pub fn restoreState(e: *Engine, src: u64, at: usize) !void {
+        const ll: usize = e.w.cfg.kda_heads / wt.world;
+        const rec = e.st.kda_layers * ll * 128 * 128 * f4;
+        try e.copyDev(e.st.rec + e.st.cur * rec, src, rec);
+        try e.copyDev(e.st.conv, src + rec, e.st.kda_layers * 3 * 3 * ll * 128 * bf);
+        try e.setPos(at);
+        try e.setMtpLen(at);
+        e.st.mtp_drafted = 0;
+    }
+
     // -- MTP ----------------------------------------------------------------------------------------------------
     /// mtp_stage + mtp_compute: the head on rows (next token, hidden), cache slots mtp_len.. onward; the last row's
     /// draft-head logits in b.logits. The caller advances mtp_len.

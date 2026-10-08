@@ -55,6 +55,13 @@ const Glm = struct {
     costs: [max_rows]lanes.config.Cost = undefined,
     mtp_ms: f64 = 1.0,
     vtable: be.Backend.VTable = undefined,
+    /// The tokens whose attention-cache rows are committed, from position 0: a kept state resumes only while the
+    /// rows below its position still hold its tokens (the caches are positional; only KDA's state is copied).
+    live: std.ArrayList(u32) = .empty,
+    window: [max_rows]u32 = undefined, // the last verify's rows, the tokens a commit makes live
+    pass: []const u32 = &.{}, // the prompt a prompt pass is running, and where it stands between chunks
+    pass_at: ?u32 = null,
+    next_snap: u32 = 0,
 
     fn of(p: *anyopaque) *Glm {
         return @ptrCast(@alignCast(p));
@@ -77,7 +84,14 @@ const Glm = struct {
     fn commit(g: *Glm, keep: usize) !void {
         if (g.pending_rows == 0) return;
         try g.n.keep(g.pending_rows, keep);
+        try g.live.appendSlice(g.gpa, g.window[0..keep]);
         g.pending_rows = 0;
+    }
+
+    /// Whether the attention caches' rows still hold kept state `sn`'s tokens: the `at` before it and the one its
+    /// MTP rows read past it.
+    fn liveHolds(g: *const Glm, sn: *const Snap) bool {
+        return g.live.items.len > sn.at and std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(g.live.items[0 .. sn.at + 1])) == sn.key;
     }
 
     /// Each row's draw over the whole vocabulary (Node.whole_vocabulary): nucleus_rows for top_k off, else
@@ -135,7 +149,37 @@ const Glm = struct {
         g.stream = s;
         g.pending_rows = 0;
         g.held_n = 0;
-        const first = try g.n.prefill(ids, g.drafts, k);
+        s.cached = 0;
+        var at: usize = 0;
+        var snap = node.no_snapshot;
+        if (s.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
+            const sn: *const Snap = @ptrCast(@alignCast(saved));
+            if (sn.at < ids.len and g.liveHolds(sn)) {
+                snap = sn.id;
+                at = sn.at;
+            } else s.reuse_failed = true;
+        }
+        g.live.shrinkRetainingCapacity(@min(g.live.items.len, at));
+        try g.n.begin(ids, g.drafts, snap, at);
+        s.cached = @intCast(at);
+        g.pass = ids;
+        defer {
+            g.pass = &.{};
+            g.pass_at = null;
+        }
+        var next: usize = 0; // the planned chunk starts: a resumed pass cuts where a fresh one does
+        while (at < ids.len) {
+            if (s.isCancelled()) return error.Cancelled;
+            while (next < s.chunks.len and s.chunks[next] <= at) next += 1;
+            const end: usize = if (next < s.chunks.len) s.chunks[next] else ids.len;
+            const rows = @min(end - at, fwd.Engine.prefill_rows);
+            try g.n.chunk(at, rows);
+            try g.live.appendSlice(g.gpa, ids[at..][0..rows]);
+            at += rows;
+            g.pass_at = @intCast(at);
+            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
+        }
+        const first = try g.n.first(k);
         var one: [1]u32 = .{first};
         if (k > 0) try g.choose(s, k, 1, ids.len, &one);
         _ = g.take(one[0]);
@@ -181,6 +225,7 @@ const Glm = struct {
         try g.n.verify(ids[0..rows], k, out[0].sampled[0..rows]);
         if (k > 0) try g.choose(w.stream, k, rows, w.positions[0], out[0].sampled[0..rows]);
         @memcpy(out[0].drafts[0 .. rows - 1], ids[1..rows]);
+        @memcpy(g.window[0..rows], ids[0..rows]);
         g.pending_rows = rows;
         g.held_n = 0;
     }
@@ -430,8 +475,52 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     };
 }
 
+// -- kept prompt states (prompt_cache.Snapshots, wired by native/cuda.zig) ------------------------------------------
+/// A kept state: KDA's state after `at` prompt tokens on both ranks under `id`, and the hash of the `at + 1` tokens
+/// the attention caches must still hold for it (Glm.liveHolds).
+const Snap = struct { id: u32, at: u32, key: u64 };
+
+/// prompt_cache.Rules: the MTP head's row at-1 reads token at; prompt kernels change bits with a chunk's rows, so
+/// states are kept and resumed at the request's planned chunk starts only.
+pub const cache_lookahead: u32 = 1;
+pub const cache_planned = true;
+
+pub fn snapBytes(p: *anyopaque, at: u32) u64 {
+    _ = at;
+    return Glm.of(p).n.e.snapshotBytes();
+}
+
+pub fn snapSave(p: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+    _ = owner;
+    const g = Glm.of(p);
+    if (g.pass_at != at) return error.SnapshotOutOfStep;
+    if (at >= g.pass.len) return error.NoLookaheadToken;
+    const sn = try g.gpa.create(Snap);
+    errdefer g.gpa.destroy(sn);
+    sn.* = .{ .id = g.next_snap, .at = at, .key = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(g.pass[0 .. at + 1])) };
+    g.next_snap = if (g.next_snap + 1 == node.no_snapshot) 0 else g.next_snap + 1;
+    try g.n.save(sn.id);
+    return sn;
+}
+
+/// The prompt pass restores a kept state itself (prefillFn), at its first chunk.
+pub fn snapRestore(p: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
+    _ = p;
+    _ = owner;
+    _ = saved;
+    return error.RestoredByThePromptPass;
+}
+
+pub fn snapDrop(p: *anyopaque, saved: *anyopaque) void {
+    const g = Glm.of(p);
+    const sn: *Snap = @ptrCast(@alignCast(saved));
+    g.n.drop(sn.id);
+    g.gpa.destroy(sn);
+}
+
 fn release(p: *anyopaque) void {
     const g = Glm.of(p);
+    g.live.deinit(g.gpa);
     g.n.quit();
     g.n.deinit();
     g.gpa.destroy(g);

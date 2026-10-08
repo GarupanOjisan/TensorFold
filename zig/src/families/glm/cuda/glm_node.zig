@@ -12,7 +12,10 @@ const dec = @import("glm_decode.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { prefill = 1, verify = 2, keep = 3, draft = 4, quit = 5 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9 };
+
+/// `begin` without a kept state: the pass starts at 0.
+pub const no_snapshot: u32 = 0xFFFF_FFFF;
 
 /// Where a draft's hidden rows come from: the prompt's last row, or the last verify's first rows.
 pub const From = enum(u32) { prompt = 0, verify = 1 };
@@ -29,6 +32,9 @@ pub const Node = struct {
     k: kern.Kernels,
     e: Engine,
     words: std.ArrayList(u32) = .empty,
+    prompt: std.ArrayList(u32) = .empty, // the prompt `begin` started, which `chunk` reads
+    mtp: bool = false,
+    snaps: std.AutoHashMapUnmanaged(u32, cuda.DeviceBuffer) = .empty, // kept prompt states by id, this rank's half
 
     /// Both ranks: the TCP pair (rank 0 listens on `port`), NCCL, the rank's weights, kernels and engine state.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, context: usize, rank: u32, master: []const u8, port: u16) !*Node {
@@ -38,6 +44,9 @@ pub const Node = struct {
         n.gpa = gpa;
         n.rank = rank;
         n.words = .empty;
+        n.prompt = .empty;
+        n.mtp = false;
+        n.snaps = .empty;
         n.stream = try cuda.Stream.init(d, true);
         errdefer n.stream.deinit();
         n.lib = try cuda.nccl.Library.open();
@@ -84,6 +93,10 @@ pub const Node = struct {
     }
 
     pub fn deinit(n: *Node) void {
+        var it = n.snaps.valueIterator();
+        while (it.next()) |b| b.free();
+        n.snaps.deinit(n.gpa);
+        n.prompt.deinit(n.gpa);
         n.e.deinit();
         n.k.deinit();
         n.set.deinit();
@@ -105,15 +118,63 @@ pub const Node = struct {
     }
 
     // -- the commands (rank 0 sends, both run) ------------------------------------------------------------------
-    /// The prompt's caches and its first token (the MTP head absorbs the prompt too when `mtp`).
-    /// k 0: greedy, the first token returned; else the last row's k candidates a rank gathered (Engine.cand_host).
+    /// The prompt's caches in chunks of up to Engine.prefill_rows from 0, then its first token (`first`).
     pub fn prefill(n: *Node, prompt: []const u32, mtp: bool, k: usize) !u32 {
+        try n.begin(prompt, mtp, no_snapshot, 0);
+        var at: usize = 0;
+        while (at < prompt.len) {
+            const rows = @min(prompt.len - at, Engine.prefill_rows);
+            try n.chunk(at, rows);
+            at += rows;
+        }
+        return n.first(k);
+    }
+
+    /// A prompt pass starts: from 0, or from kept state `snap` after `at` tokens (the attention caches' rows below
+    /// `at` must still hold the prompt's tokens; the caller checks). The MTP head absorbs the prompt too when `mtp`.
+    pub fn begin(n: *Node, prompt: []const u32, mtp: bool, snap: u32, at: usize) !void {
         n.words.clearRetainingCapacity();
-        try n.words.appendSlice(n.gpa, &.{ @intFromBool(mtp), @intCast(k) });
+        try n.words.appendSlice(n.gpa, &.{ @intFromBool(mtp), snap, @intCast(at) });
         try n.words.appendSlice(n.gpa, prompt);
-        try n.send(.prefill, n.words.items);
-        try dec.prefillCaches(&n.e, prompt, mtp);
+        try n.send(.begin, n.words.items);
+        n.prompt.clearRetainingCapacity();
+        try n.prompt.appendSlice(n.gpa, prompt);
+        n.mtp = mtp;
+        if (snap == no_snapshot) return n.e.reset();
+        const b = n.snaps.get(snap) orelse return error.NoSuchSnapshot;
+        try n.e.restoreState(b.ptr, at);
+    }
+
+    /// The begun prompt's rows at .. at + rows, at the state's position.
+    pub fn chunk(n: *Node, at: usize, rows: usize) !void {
+        try n.send(.chunk, &.{ @intCast(at), @intCast(rows) });
+        try dec.prefillChunk(&n.e, n.prompt.items, at, rows, n.mtp);
+    }
+
+    /// The first token after the prompt's last chunk. k 0: greedy, the token returned; else the last row's k
+    /// candidates a rank gathered (Engine.cand_host), or both ranks' whole rows (whole_vocabulary).
+    pub fn first(n: *Node, k: usize) !u32 {
+        try n.send(.first, &.{@intCast(k)});
         return n.pick(n.e.last_logits, 1, k, null);
+    }
+
+    /// Keep the state between prompt chunks as `id` (each rank its half).
+    pub fn save(n: *Node, id: u32) !void {
+        try n.send(.save, &.{id});
+        errdefer n.drop(id); // rank 0 failed: rank 1 frees its half too
+        var b = try cuda.DeviceBuffer.alloc(n.e.d, n.e.snapshotBytes());
+        errdefer b.free();
+        try n.e.saveState(b.ptr);
+        try n.stream.synchronize(); // the copy is whole before a later chunk changes the state
+        try n.snaps.put(n.gpa, id, b);
+    }
+
+    pub fn drop(n: *Node, id: u32) void {
+        n.send(.drop, &.{id}) catch {};
+        if (n.snaps.fetchRemove(id)) |kv| {
+            var b = kv.value;
+            b.free();
+        }
     }
 
     /// A window's forward: each row's greedy token into `out` (k 0), or each row's k candidates a rank gathered.
@@ -182,7 +243,11 @@ pub const Node = struct {
             try n.pair.recv(std.mem.sliceAsBytes(buf.items));
             const w = buf.items;
             switch (@as(Kind, @fromBackingInt(@intCast(head[0])))) {
-                .prefill => _ = try n.prefill(w[2..], w[0] != 0, w[1]),
+                .begin => try n.begin(w[3..], w[0] != 0, w[1], w[2]),
+                .chunk => try n.chunk(w[0], w[1]),
+                .first => _ = try n.first(w[0]),
+                .save => try n.save(w[0]),
+                .drop => n.drop(w[0]),
                 .verify => try n.verify(w[1..], w[0], scratch[0 .. w.len - 1]),
                 .keep => try n.keep(w[0], w[1]),
                 .draft => try n.draft(@fromBackingInt(@intCast(w[0])), w[2..], scratch[0..w[1]]),
