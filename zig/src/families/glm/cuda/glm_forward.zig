@@ -114,6 +114,17 @@ pub const Buffers = struct {
 
 pub const KdaScratch = struct { out: u64, k: u64, v: u64, g: u64, b: u64 };
 
+/// A captured graph's key: which head, window rows, the KDA state half it reads (main only), pool bucket (0: dense).
+const GraphKey = struct {
+    head: Head,
+    rows: u8,
+    cur: u8,
+    np: u32,
+
+    const Head = enum(u8) { main, mtp };
+};
+const GraphEntry = struct { key: GraphKey, exec: cuda.graph.Exec };
+
 /// Sizes every buffer for `rows`, then carves them out of `a` (a.size 0: count only).
 fn carve(a: *Arena, w: *const Weights, rows: usize, capacity: usize, prefill: bool, np_max: usize) Buffers {
     const c = w.cfg;
@@ -268,8 +279,15 @@ pub const Engine = struct {
     last_hidden: u64, // and its final-normed hidden row, the first draft's input
     /// The last `candidates` call's gathered pairs: [rank][row][k] of (fp32 value bits, token).
     cand_host: [wt.world * max_rows * 2 * max_k]u32 = undefined,
+    /// Captured decode windows and MTP steps (graphs.py), found by key; TF_GLM_GRAPHS=0 runs everything eagerly.
+    graphs: [max_graphs]GraphEntry = undefined,
+    n_graphs: usize = 0,
+    use_graphs: bool = true,
+    capturing: bool = false,
 
     pub const max_rows = 8; // engine.MAX_ROWS
+    /// Windows of 1..8 rows x 2 KDA parities and MTP steps of 1..8 rows, each dense or at one of ~10 pool buckets.
+    pub const max_graphs = 320;
     /// The most candidates a rank gives a sampled row (top_k + exact_sampling.MARGIN).
     pub const max_k = 1024;
     pub const prefill_rows = 2048; // geometry.PREFILL_ROWS
@@ -332,6 +350,9 @@ pub const Engine = struct {
         e.comm = comm;
         e.width = width;
         e.np_max = np_max;
+        e.n_graphs = 0;
+        e.capturing = false;
+        e.use_graphs = if (std.c.getenv("TF_GLM_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         return e;
     }
 
@@ -346,7 +367,46 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
+        for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
         e.mem.free();
+    }
+
+    // -- CUDA graphs (graphs.py) --------------------------------------------------------------------------------
+    /// A window wholly below the dense limit, or wholly past it at one pool bucket, replays one graph per key; one
+    /// across the limit runs eagerly (decode.py's same rule). Positions live on the device, so a graph serves every
+    /// position of its key.
+    fn graphKey(e: *const Engine, head: GraphKey.Head, rows: usize, pos: usize) ?GraphKey {
+        if (!e.use_graphs) return null;
+        const dl = denseLimit(e.w);
+        var np: usize = 0;
+        if (e.st.long_context and pos + rows - 1 >= dl) {
+            if (pos < dl) return null;
+            np = tri.poolBucket(pos, rows, e.np_max);
+        }
+        return .{ .head = head, .rows = @intCast(rows), .cur = if (head == .main) @intCast(e.st.cur) else 0, .np = @intCast(np) };
+    }
+
+    /// Launches key's graph, capturing `body(args)` into it the first time.
+    fn replay(e: *Engine, key: GraphKey, comptime body: anytype, args: anytype) !void {
+        for (e.graphs[0..e.n_graphs]) |g| if (std.meta.eql(g.key, key)) return g.exec.launchOn(e.s);
+        if (e.n_graphs == max_graphs) return @call(.auto, body, args); // ponytail: past the table, eager
+        try cuda.graph.beginCapture(e.s, .thread_local);
+        e.capturing = true;
+        @call(.auto, body, args) catch |err| {
+            e.capturing = false;
+            if (cuda.graph.endCapture(e.s)) |g| {
+                var x = g;
+                x.deinit();
+            } else |_| {}
+            return err;
+        };
+        e.capturing = false;
+        var g = try cuda.graph.endCapture(e.s);
+        defer g.deinit();
+        const exec = try g.instantiate();
+        e.graphs[e.n_graphs] = .{ .key = key, .exec = exec };
+        e.n_graphs += 1;
+        try exec.launchOn(e.s);
     }
 
     fn upload(e: *Engine, dst: u64, bytes: []const u8) !void {
@@ -498,7 +558,8 @@ pub const Engine = struct {
         if (!all_sparse) {
             const s = b.lat_s;
             const lat_nch = tri.chunksFor(@min(e.st.capacity, 2560) + b.rows);
-            const nch = @min(tri.chunksFor(host_pos + rows), lat_nch);
+            // a captured window serves every dense position: all chunks, as Python's graphs (pos unknown) run
+            const nch = if (e.capturing) lat_nch else @min(tri.chunksFor(host_pos + rows), lat_nch);
             const blocks = (rows + s.part_rows - 1) / s.part_rows;
             var at: [Buffers.pos_slots]u64 = undefined;
             try e.blockPositions(b, pos_dev, host_pos, s.part_rows, blocks, &at);
@@ -612,6 +673,7 @@ pub const Engine = struct {
     /// A decode window's forward: logits [R, V/2] in buf.logits.
     pub fn forward(e: *Engine, tokens_in: []const u32) !void {
         const rows = try e.stage(&e.buf, tokens_in);
+        if (e.graphKey(.main, rows, e.st.pos)) |key| return e.replay(key, compute, .{ e, &e.buf, rows });
         try e.compute(&e.buf, rows);
     }
 
@@ -644,7 +706,7 @@ pub const Engine = struct {
     pub fn mtp(e: *Engine, b: *Buffers, next: []const u32, hidden: u64) !void {
         const c = e.w.cfg;
         const d: usize = c.hidden;
-        const m = e.w.mtp orelse return error.NoMtpHead;
+        if (e.w.mtp == null) return error.NoMtpHead;
         const n = next.len;
         if (n > b.rows) return error.WindowTooWide;
         b.zero_first = e.st.mtp_len == 0;
@@ -653,6 +715,17 @@ pub const Engine = struct {
         if (hidden != b.hin) try e.copyDev(b.hin, hidden, n * d * bf);
         try e.t.embed(b.ids, e.w.embed, b.me, n, d, 1);
         if (b.zero_first) try e.zero(b.me, d * bf);
+        if (!b.prefill and !b.zero_first) {
+            if (e.graphKey(.mtp, n, e.st.mtp_len)) |key| return e.replay(key, mtpBody, .{ e, b, n });
+        }
+        try e.mtpBody(b, n);
+    }
+
+    /// The MTP step after its inputs are staged and embedded (b.me, b.hin).
+    fn mtpBody(e: *Engine, b: *Buffers, n: usize) !void {
+        const c = e.w.cfg;
+        const d: usize = c.hidden;
+        const m = e.w.mtp.?;
         try e.t.rmsnorm(b.me, d, m.enorm, b.mcat, 2 * d, null, n, d, c.eps);
         try e.t.rmsnorm(b.hin, d, m.hnorm, b.mcat + d * bf, 2 * d, null, n, d, c.eps);
         if (!b.prefill) try e.t.groupSums(b.mcat, 2 * d, b.mxs, n, 2 * d);
