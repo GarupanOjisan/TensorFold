@@ -598,3 +598,266 @@ pub const Drafter = struct {
         return self.chain(d, pending, self.context_end + 1, sampling, policy, out);
     }
 };
+
+/// Block passes of several lanes' drafters in one launch sequence (v1.10 dflash2_multi.MultiDrafter.candidates): the rows of
+/// every lane's block [pending, mask x (block - 1)] back to back. The row-independent work (embedding, norms, the 4-bit
+/// projections in pieces of 16 rows, the o and down projections' gathers, the head, its top-k and the selector's rows) runs on
+/// all of them; each lane's rotary, `_prep`, cache writes and attention read its own drafter's ring and position, and the
+/// dynamic convolutions run a block at a time (a block's first row mixes no row before it). Each drafter is then left with its
+/// merged candidates as its own `block(read)` leaves them, so its `chain` is unchanged. Eager; drafts only propose.
+pub const Batch = struct {
+    gpa: std.mem.Allocator,
+    dr: *const wt.Draft,
+    w: *const wt.Weights,
+    lanes: usize, // blocks a pass holds at most
+    mem: cuda.DeviceBuffer,
+    ids: u64,
+    x: u64,
+    normed: u64,
+    xs: u64,
+    dyn: u64,
+    cv: u64,
+    cv_xs: u64,
+    qkv: u64,
+    qq: u64,
+    kk: u64,
+    vv: u64,
+    cos: u64,
+    sin: u64,
+    att: u64,
+    att_xs: u64,
+    part: u64,
+    gath: u64,
+    rowb: u64,
+    gu: u64,
+    act: u64,
+    act_xs: u64,
+    hh: u64,
+    hh_xs: u64,
+    logits: u64,
+    cand_loc: u64,
+    cand_all: u64,
+    proj: u64,
+    cand_host: []u32,
+    proj_host: []f32,
+
+    /// The 4-bit projections' widest piece (kern.qmmDecode, kern.q4Matmul).
+    const piece = 16;
+
+    pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const wt.Weights, lanes: usize) !Batch {
+        const dr = &(w.draft orelse return error.NoDraftModel);
+        const R = lanes * dr.block;
+        const nb = dr.block - 1;
+        const M = lanes * nb;
+        const D = dr.d;
+        const hd = dr.hd;
+        const vl = w.cfg.vocab / wt.world;
+        const cand_n = M * 2 * dr.top_k;
+        var b: Batch = undefined;
+        b.gpa = gpa;
+        b.dr = dr;
+        b.w = w;
+        b.lanes = lanes;
+        const sizes = [_]usize{
+            R * 4, // ids
+            R * D * bf, // x
+            R * D * bf, // normed
+            R * (D / 64) * f4, // xs
+            R * (4 * D / dr.gs) * bf, // dyn
+            R * D * bf, // cv
+            R * (D / 64) * f4, // cv_xs
+            R * (dr.heads + 2 * dr.kvh) * hd * bf, // qkv
+            dr.heads * R * hd * bf, // qq
+            dr.kvh * R * hd * bf, // kk
+            dr.kvh * R * hd * bf, // vv
+            R * (hd / 2) * f4, // cos
+            R * (hd / 2) * f4, // sin
+            R * dr.heads * hd * bf, // att
+            R * (dr.heads * hd / 64) * f4, // att_xs
+            R * D * f4, // part
+            wt.world * R * D * f4, // gath
+            R * D * bf, // rowb
+            R * 2 * dr.inter * bf, // gu
+            R * dr.inter * bf, // act
+            R * (dr.inter / 64) * f4, // act_xs
+            M * D * bf, // hh
+            M * (D / 64) * f4, // hh_xs
+            M * vl * bf, // logits
+            cand_n * 4, // cand_loc
+            wt.world * cand_n * 4, // cand_all
+            M * dr.sel_rank * f4, // proj
+        };
+        var at: [sizes.len]usize = undefined;
+        var off: usize = 0;
+        for (sizes, 0..) |s, i| {
+            off = std.mem.alignForward(usize, off, 256);
+            at[i] = off;
+            off += s;
+        }
+        b.mem = try cuda.DeviceBuffer.alloc(d, off + 256);
+        errdefer b.mem.free();
+        try b.mem.fill8(0, null);
+        inline for (.{ "ids", "x", "normed", "xs", "dyn", "cv", "cv_xs", "qkv", "qq", "kk", "vv", "cos", "sin", "att", "att_xs", "part", "gath", "rowb", "gu", "act", "act_xs", "hh", "hh_xs", "logits", "cand_loc", "cand_all", "proj" }, 0..) |name, i| {
+            @field(b, name) = b.mem.ptr + at[i];
+        }
+        b.cand_host = try gpa.alloc(u32, wt.world * cand_n);
+        errdefer gpa.free(b.cand_host);
+        b.proj_host = try gpa.alloc(f32, M * dr.sel_rank);
+        return b;
+    }
+
+    pub fn deinit(b: *Batch) void {
+        b.gpa.free(b.cand_host);
+        b.gpa.free(b.proj_host);
+        b.mem.free();
+    }
+
+    /// A 4-bit projection of `rows` rows (x rows q.k apart) in pieces of up to 16.
+    fn mm(e: *Engine, x: u64, xs: u64, q: kern.Q4, out: u64, rows: usize, fp32: bool) !void {
+        var r: usize = 0;
+        while (r < rows) : (r += piece) {
+            const n = @min(piece, rows - r);
+            try kern.qmmDecode(e.k, e.s, x + r * q.k * bf, q.k, xs + r * (q.k / 64) * f4, q, out + r * q.n * @as(usize, if (fp32) f4 else bf), n, fp32);
+        }
+    }
+
+    fn norm(b: *const Batch, e: *Engine, x: u64, weight: u64, out: u64, xs: u64, rows: usize) !void {
+        try e.t.rmsnorm(x, b.dr.d, weight, out, b.dr.d, xs, rows, b.dr.d, b.dr.eps);
+    }
+
+    /// Drafter.row over every row: the fp32 partials gathered once and added in rank order into rowb.
+    fn row(b: *const Batch, e: *Engine, x: u64, xs: u64, q: kern.Q4, rows: usize) !void {
+        try mm(e, x, xs, q, b.part, rows, true);
+        const n = rows * b.dr.d;
+        try e.comm.allGather(e.s, b.part, b.gath, n);
+        var a: cuda.Args = .{};
+        a.add(b.gath);
+        a.add(int(wt.world));
+        a.add(int(n));
+        a.add(b.rowb);
+        try cuda.launch.launch(e.k.df_rowsum, .{ .grid = .{ .x = @intCast((n + 255) / 256) }, .block = .{ .x = 256 } }, e.s, &a);
+    }
+
+    /// `_dconv` a block at a time: block s's rows of x, dyn, the residual and out.
+    fn dconv(b: *const Batch, e: *Engine, x: u64, base: u64, res: ?u64, out: u64, S: usize, branch: usize) !void {
+        const dr = b.dr;
+        const n = dr.block;
+        const D = dr.d;
+        for (0..S) |s| {
+            const o = s * n * D * bf;
+            try e.t.dconv(x + o, b.dyn + s * n * (4 * D / dr.gs) * bf, base, if (res) |r| r + o else null, out + o, n, D, dr.gs, branch);
+        }
+    }
+
+    fn layer(b: *const Batch, e: *Engine, ds: []const *Drafter, i: usize) !void {
+        const dr = b.dr;
+        const L = dr.layers[i];
+        const D = dr.d;
+        const n = dr.block;
+        const hd = dr.hd;
+        const S = ds.len;
+        const R = S * n;
+        const qkv_w = (dr.heads + 2 * dr.kvh) * hd;
+        try b.norm(e, b.x, L.in_norm, b.normed, b.xs, R);
+        try mm(e, b.normed, b.xs, L.a_kp, b.dyn, R, false);
+        try b.dconv(e, b.normed, L.a_base, null, b.cv, S, 0);
+        try e.t.groupSums(b.cv, D, b.cv_xs, R, D);
+        try mm(e, b.cv, b.cv_xs, L.qkv, b.qkv, R, false);
+        for (ds, 0..) |dft, s| {
+            const qq = b.qq + s * dr.heads * n * hd * bf;
+            const kk = b.kk + s * dr.kvh * n * hd * bf;
+            const vv = b.vv + s * dr.kvh * n * hd * bf;
+            const rope = s * n * (hd / 2) * f4;
+            try e.t.draftPrep(b.qkv + s * n * qkv_w * bf, L.q_norm, L.k_norm, b.cos + rope, b.sin + rope, qq, kk, vv, n, qkv_w, dr.eps, dr.heads, dr.kvh, hd);
+            try dft.scatter(e, kk, dft.kc[i], n);
+            try dft.scatter(e, vv, dft.vc[i], n);
+            try e.t.draftAttention(qq, dft.kc[i], dft.vc[i], b.att + s * n * dr.heads * hd * bf, dft.pos_dev, dr.window, n, dr.heads, dr.kvh, hd, dft.cap, dr.causal, dft.ring != 0);
+        }
+        try e.t.groupSums(b.att, dr.heads * hd, b.att_xs, R, dr.heads * hd);
+        try b.row(e, b.att, b.att_xs, L.o, R);
+        try b.dconv(e, b.rowb, L.a_base, b.x, b.x, S, 1);
+        try b.norm(e, b.x, L.post_norm, b.normed, b.xs, R);
+        try mm(e, b.normed, b.xs, L.m_kp, b.dyn, R, false);
+        try b.dconv(e, b.normed, L.m_base, null, b.cv, S, 0);
+        try e.t.groupSums(b.cv, D, b.cv_xs, R, D);
+        try mm(e, b.cv, b.cv_xs, L.gu, b.gu, R, false);
+        try e.t.swiglu(b.gu, b.act, b.act_xs, R, dr.inter, 1e30);
+        try b.row(e, b.act, b.act_xs, L.down, R);
+        try b.dconv(e, b.rowb, L.m_base, b.x, b.x, S, 1);
+    }
+
+    /// Drafter.block for every drafter of `ds` (each at its context's end, `pend` its pending token), in one pass. `read`:
+    /// also bring each one's merged candidates to the host (rank 0 alone), as its own `block(read)` would.
+    pub fn blocks(b: *Batch, e: *Engine, ds: []const *Drafter, pend: []const u32, read: bool) !void {
+        const dr = b.dr;
+        const S = ds.len;
+        if (S == 0 or S > b.lanes or pend.len != S) return error.BadDraftBatch;
+        const n = dr.block;
+        const nb = n - 1;
+        const D = dr.d;
+        const k = dr.top_k;
+        const R = S * n;
+        const M = S * nb;
+        var ids: [8 * max_block]i32 = undefined;
+        for (0..S) |s| {
+            @memset(ids[s * n ..][0..n], @intCast(dr.mask_id));
+            ids[s * n] = @intCast(pend[s]);
+        }
+        try e.upload(b.ids, std.mem.sliceAsBytes(ids[0..R]));
+        try e.t.embed(b.ids, b.w.embed, b.x, R, D, 1);
+        for (ds, 0..) |dft, s| {
+            var a: cuda.Args = .{};
+            a.add(dft.pos_dev);
+            a.add(dr.inv_freq);
+            a.add(int(n));
+            a.add(int(dr.hd / 2));
+            a.add(b.cos + s * n * (dr.hd / 2) * f4);
+            a.add(b.sin + s * n * (dr.hd / 2) * f4);
+            try cuda.launch.launch(e.k.df_rope, .{ .grid = .{ .x = @intCast((n * dr.hd / 2 + 127) / 128) }, .block = .{ .x = 128 } }, e.s, &a);
+        }
+        for (0..dr.layers.len) |i| try b.layer(e, ds, i);
+        for (0..S) |s| try b.norm(e, b.x + (s * n + 1) * D * bf, dr.norm, b.hh + s * nb * D * bf, b.hh_xs + s * nb * (D / 64) * f4, nb);
+        const vl = b.w.head.n;
+        var r: usize = 0;
+        while (r < M) : (r += piece) {
+            const m = @min(piece, M - r);
+            try kern.q4Matmul(e.k, e.s, b.hh + r * D * bf, b.hh_xs + r * (D / 64) * f4, b.w.draft_head, b.logits + r * vl * bf, m);
+        }
+        var a: cuda.Args = .{};
+        a.add(b.logits);
+        a.add(int(vl));
+        a.add(int(vl));
+        a.add(int(k));
+        a.add(int(e.w.rank * vl));
+        a.add(b.cand_loc);
+        try cuda.launch.launch(e.k.topk, .{ .grid = .{ .x = @intCast(M) }, .block = .{ .x = 1024 } }, e.s, &a);
+        try e.comm.allGather(e.s, b.cand_loc, b.cand_all, M * 2 * k);
+        var p: cuda.Args = .{};
+        p.add(b.hh);
+        p.add(dr.hproj);
+        p.add(b.proj);
+        p.add(int(dr.sel_rank));
+        p.add(int(D));
+        try cuda.launch.launch(e.k.df_proj, .{ .grid = .{ .x = @intCast((dr.sel_rank + 7) / 8), .y = @intCast(M) }, .block = .{ .x = 256 } }, e.s, &p);
+        if (!read) return;
+        // v1.10 patch 0092 as Drafter.block: a bad id is a copy read early; copy again once the device is idle
+        for (0..2) |attempt| {
+            try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(b.cand_host.ptr, b.cand_all, wt.world * M * 2 * k * 4, e.s.handle), "cuMemcpyDtoHAsync");
+            try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(b.proj_host.ptr, b.proj, M * dr.sel_rank * f4, e.s.handle), "cuMemcpyDtoHAsync");
+            try e.s.synchronize();
+            var good = true;
+            for (ds, 0..) |dft, s| {
+                // drafter s's rows in its own block's layout: [rank][row][2k], then its selector rows
+                for (0..wt.world) |rank| for (0..nb) |row_i| {
+                    @memcpy(dft.cand_host[(rank * nb + row_i) * 2 * k ..][0 .. 2 * k], b.cand_host[(rank * M + s * nb + row_i) * 2 * k ..][0 .. 2 * k]);
+                };
+                @memcpy(dft.proj_host[0 .. nb * dr.sel_rank], b.proj_host[s * nb * dr.sel_rank ..][0 .. nb * dr.sel_rank]);
+                if (!dft.merge(nb)) good = false;
+            }
+            if (good) return;
+            if (attempt == 1) return error.BadDrafterCandidates;
+            std.log.warn("drafter: a candidate id outside the vocabulary ({d} lanes); copying the rows again once the device is idle", .{S});
+            try e.d.check(e.d.api.cuCtxSynchronize(), "cuCtxSynchronize");
+        }
+    }
+};

@@ -501,6 +501,15 @@ const Glm = struct {
     /// TF_GLM_DFLASH_POLICY's most) give the next window's drafts as host tokens (`treeFn`). The first round after a prompt
     /// is taken as `r.depth` held drafts (the core does not ask for the chain there), filled up with the pending token.
     fn draftDflash(g: *Glm, ln: *Lane, r: be.DraftRequest) !void {
+        const t = try g.dflashTaps(ln, r, true);
+        g.dflashChain(ln, r, t, if (t.want > 0) &g.n.dflash.? else null);
+    }
+
+    /// A DFlash2 turn's first half: the kept rows committed and joined to the lane's context, and how many drafts it wants.
+    const Turn = struct { want: usize, pending: u32 };
+
+    /// The bound lane's DFlash2 turn up to its chain: commit, the context update and, with `block`, its own block pass.
+    fn dflashTaps(g: *Glm, ln: *Lane, r: be.DraftRequest, block: bool) !Turn {
         const s = r.stream;
         var from: node.From = .prompt;
         var keep: usize = 0;
@@ -524,12 +533,46 @@ const Glm = struct {
             const found = pr.propose(s.context.items, width) catch @as([]const u32, &.{});
             if (found.len >= 2 and pr.lastMatch() >= 8) want = 0; // the core's own copy test
         };
-        try g.n.dflashTurn(from, keep, pending, want > 0);
-        ln.dn = if (want > 0) g.n.dflash.?.chain(want, pending, r.position, if (s.sampling) |sm| .{ .seed = sm.seed, .temperature = sm.temperature } else null, g.policy, &ln.dtoks) else 0;
+        try g.n.dflashTurn(from, keep, pending, block and want > 0);
+        return .{ .want = want, .pending = pending };
+    }
+
+    /// A DFlash2 turn's second half: the chain from `dft`'s candidates (null: no block pass ran, no drafts), held.
+    fn dflashChain(g: *Glm, ln: *Lane, r: be.DraftRequest, t: Turn, dft: ?*const dflash.Drafter) void {
+        const s = r.stream;
+        ln.dn = if (dft) |d| d.chain(t.want, t.pending, r.position, if (s.sampling) |sm| .{ .seed = sm.seed, .temperature = sm.temperature } else null, g.policy, &ln.dtoks) else 0;
         const held = @max(ln.dn, r.depth);
         @memcpy(ln.held[0..ln.dn], ln.dtoks[0..ln.dn]);
-        for (ln.dn..held) |i| ln.held[i] = pending;
+        for (ln.dn..held) |i| ln.held[i] = t.pending;
         ln.held_n = held;
+    }
+
+    /// A shared round's DFlash2 turns (facts.draft_streams): each lane's context update on its own, then the block passes of
+    /// every lane that wants drafts in one (Node.dflashBlocks; one lane alone takes its own captured pass), then the chains.
+    fn draftDflashLanes(g: *Glm, requests: []const be.DraftRequest) !void {
+        if (requests.len > max_lanes) return error.TooManyWindows;
+        var turns: [max_lanes]Turn = undefined;
+        var idx: [max_lanes]usize = undefined;
+        var blocked: [max_lanes]bool = @splat(false);
+        var ls: [max_lanes]usize = undefined;
+        var pend: [max_lanes]u32 = undefined;
+        var m: usize = 0;
+        for (requests, 0..) |r, i| {
+            const ln = try g.enter(r.stream);
+            idx[i] = g.n.e.lane;
+            turns[i] = try g.dflashTaps(ln, r, false);
+            if (turns[i].want > 0 and (try g.n.drafterOf(idx[i])).context_end > 0) {
+                blocked[i] = true;
+                ls[m] = idx[i];
+                pend[m] = turns[i].pending;
+                m += 1;
+            }
+        }
+        if (m == 1) {
+            try g.n.bind(ls[0]);
+            try g.n.dflashTurn(.prompt, 0, pend[0], true);
+        } else if (m > 1) try g.n.dflashBlocks(ls[0..m], pend[0..m]);
+        for (requests, 0..) |r, i| g.dflashChain(&g.lanes[idx[i]], r, turns[i], if (blocked[i]) try g.n.drafterOf(idx[i]) else null);
     }
 
     fn treeFn(p: *anyopaque, s: *lanes.Stream, gpa: std.mem.Allocator) anyerror!?lanes.stream.Held {
@@ -542,6 +585,7 @@ const Glm = struct {
     /// Absorb the kept rows with their following tokens, then hold `depth` drafts for the next window.
     fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const g = of(p);
+        if (g.dflash and requests.len > 1 and g.n.batch != null) return g.draftDflashLanes(requests);
         for (requests) |r| {
             const ln = try g.enter(r.stream);
             if (g.dflash) {
@@ -593,6 +637,7 @@ const Glm = struct {
             // several live streams share a forward (verifyShared), up to a window's rows; the lanes `grow` allocated cap
             // how many streams are live, so one lane never shares
             .hidden_rows = true,
+            .draft_streams = true, // a shared round's drafts in one call: DFlash2's block passes share one (draftDflashLanes)
             .streams_exact = true,
             .batch_rows = max_rows,
             .max_streams = max_lanes,

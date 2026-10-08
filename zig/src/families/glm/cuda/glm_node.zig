@@ -14,7 +14,7 @@ const roce_mod = @import("glm_roce.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17 };
 
 /// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 pub fn drafterDir() ?[]const u8 {
@@ -46,6 +46,7 @@ pub const Node = struct {
     roce: ?*roce_mod.Roce = null,
     dflash: ?dflash.Drafter = null, // the bound lane's DFlash2 context (bind swaps it with `drafters`)
     drafters: [Engine.max_lanes]?dflash.Drafter = @splat(null), // every other lane's
+    batch: ?dflash.Batch = null, // several lanes' block passes at once (dflashBlocks), with two lanes or more
     snaps: std.AutoHashMapUnmanaged(u32, cuda.DeviceBuffer) = .empty, // kept prompt states by id, this rank's half
 
     /// Both ranks: the TCP pair (rank 0 listens on `port`), NCCL, the rank's weights, kernels and engine state.
@@ -60,6 +61,7 @@ pub const Node = struct {
         n.mtp = false;
         n.snaps = .empty;
         n.drafters = @splat(null);
+        n.batch = null;
         n.stream = try cuda.Stream.init(d, true);
         errdefer n.stream.deinit();
         n.lib = try cuda.nccl.Library.open();
@@ -128,6 +130,7 @@ pub const Node = struct {
         n.prompt.deinit(n.gpa);
         if (n.dflash) |*dr| dr.deinit();
         for (&n.drafters) |*slot| if (slot.*) |*dr| dr.deinit();
+        if (n.batch) |*b| b.deinit();
         n.e.deinit();
         if (n.roce) |r| r.deinit();
         n.k.deinit();
@@ -217,6 +220,27 @@ pub const Node = struct {
     pub fn dflashTurn(n: *Node, from: From, kept: usize, pending: u32, block: bool) !void {
         try n.send(.dflash, &.{ @backingInt(from), @intCast(kept), pending, @intFromBool(block) });
         try n.dflashRun(from, kept, pending, block);
+    }
+
+    /// Lane `lane`'s DFlash2 drafter (the bound lane's is `dflash`).
+    pub fn drafterOf(n: *Node, lane: usize) !*dflash.Drafter {
+        if (lane == n.e.lane) return &(n.dflash orelse return error.NoDraftModel);
+        return &(n.drafters[lane] orelse return error.NoDraftModel);
+    }
+
+    /// The block passes of `lanes` (each at its context's end, `pend` its pending token) in one pass (dflash.Batch.blocks;
+    /// rank 0 sends it, both run it, rank 0 reads the candidates back into each lane's drafter).
+    pub fn dflashBlocks(n: *Node, lanes: []const usize, pend: []const u32) !void {
+        n.words.clearRetainingCapacity();
+        try n.words.append(n.gpa, @intCast(lanes.len));
+        for (lanes) |l| try n.words.append(n.gpa, @intCast(l));
+        try n.words.appendSlice(n.gpa, pend);
+        try n.send(.dflash_blocks, n.words.items);
+        var ds: [Engine.max_lanes]*dflash.Drafter = undefined;
+        if (lanes.len > Engine.max_lanes) return error.BadDraftBatch;
+        for (lanes, 0..) |l, i| ds[i] = try n.drafterOf(l);
+        const b = &(n.batch orelse return error.NoDraftBatch);
+        try b.blocks(&n.e, ds[0..lanes.len], pend, n.rank == 0);
     }
 
     fn dflashRun(n: *Node, from: From, kept: usize, pending: u32, block: bool) !void {
@@ -354,6 +378,7 @@ pub const Node = struct {
                 break;
             };
         };
+        if (n.dflash != null and mine > 1) n.batch = try dflash.Batch.init(n.gpa, n.e.d, &n.w, mine);
         var word = [1]u32{@intCast(mine)};
         if (n.rank != 0) {
             try n.pair.send(std.mem.sliceAsBytes(&word));
@@ -407,6 +432,13 @@ pub const Node = struct {
                     try n.verifyShared(segs[0..m], w[1 + 2 * m ..]);
                 },
                 .segment => try n.pickSegment(.{ .lane = w[0], .rows = w[1] }, w[2], scratch[0..w[1]]),
+                .dflash_blocks => {
+                    const m = w[0];
+                    if (m > Engine.max_lanes) return error.BadDraftBatch;
+                    var ls: [Engine.max_lanes]usize = undefined;
+                    for (0..m) |i| ls[i] = w[1 + i];
+                    try n.dflashBlocks(ls[0..m], w[1 + m ..][0..m]);
+                },
                 .bind => try n.bind(w[0]),
                 .grow => _ = try n.grow(w[0]),
                 .copy => try n.copy(w[0], w[1], w[2]),
