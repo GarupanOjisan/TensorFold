@@ -133,6 +133,10 @@ const Glm = struct {
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     costs: [max_rows]lanes.config.Cost = undefined,
+    /// Shared windows' ms by total rows: the lone windows' until `grow` times them over two lanes (the facts point here,
+    /// and the lane core reads them after `grow`).
+    shared: [max_rows]lanes.config.Cost = undefined,
+    io: std.Io = undefined,
     mtp_ms: f64 = 1.0,
     vtable: be.Backend.VTable = undefined,
     pass: []const u32 = &.{}, // the prompt a prompt pass is running, and where it stands between chunks
@@ -584,6 +588,7 @@ const Glm = struct {
             .speculate_early = false,
             .drafts = head_drafts,
             .window_costs = &g.costs,
+            .shared_costs = &g.shared,
             .mtp_step_ms = if (g.dflash) 0.1 else g.mtp_ms, // DFlash2's block pass costs the same at any depth
             // several live streams share a forward (verifyShared), up to a window's rows; the lanes `grow` allocated cap
             // how many streams are live, so one lane never shares
@@ -592,6 +597,27 @@ const Glm = struct {
             .batch_rows = max_rows,
             .max_streams = max_lanes,
         };
+    }
+
+    /// Shared windows of 2 to max_rows rows over lanes 0 and 1 (half each), timed on whatever their caches hold (both
+    /// ranks run them; no commit, so the lanes stay where they were). Serving overwrites the rows they wrote.
+    fn measureShared(g: *Glm) !void {
+        var ids: [max_rows]u32 = undefined;
+        for (&ids, 0..) |*t, i| t.* = @intCast(3000 + 37 * i);
+        var out: [max_rows]u32 = undefined;
+        g.shared[0] = g.costs[0];
+        for (2..max_rows + 1) |total| {
+            const segs = [2]fwd.Engine.Seg{ .{ .lane = 0, .rows = (total + 1) / 2 }, .{ .lane = 1, .rows = total / 2 } };
+            var best: f64 = std.math.inf(f64);
+            for (0..3) |_| {
+                const t0 = now(g.io);
+                try g.n.verifyShared(&segs, ids[0..total]);
+                for (segs) |sg| try g.n.pickSegment(sg, 0, out[0..sg.rows]);
+                best = @min(best, ms(g.io, t0));
+            }
+            g.shared[total - 1] = .{ .width = @intCast(total), .ms = best };
+        }
+        std.log.info("GLM shared window ms by rows (two lanes): 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}", .{ g.shared[1].ms, g.shared[3].ms, g.shared[7].ms, g.shared[max_rows - 1].ms });
     }
 
     /// Each window width's forward and one chained MTP step, timed on a short dummy prompt (both ranks run it).
@@ -810,7 +836,9 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     for (&g.lanes) |*ln| ln.* = .{ .copy = .{ .cfg = g.copy_cfg } };
     if (g.dflash and g.drafts) std.log.info("GLM drafts: DFlash2 (block {d}, up to {d} drafts a round, stop at {d:.2} of the noisy chain, beta {d:.1}); the MTP head is not loaded", .{ n.w.draft.?.block, g.policy.most, g.policy.confidence, g.policy.beta });
     if (g.drafts and g.copy_cfg.on) std.log.info("GLM copy drafts: up to {d} a round, match {d} tokens, {d} inside the reply, windows of 9 to 15 rows padded to {d}", .{ g.copy_cfg.most, g.copy_cfg.match, g.copy_cfg.reply_match, g.copy_cfg.pad });
+    g.io = io;
     try g.measure(io);
+    g.shared = g.costs;
     return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = n.laneBytes(), .ctx = g, .deinit = release };
 }
 
@@ -819,6 +847,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 pub fn grow(p: *anyopaque, total: u32) !u32 {
     const g = Glm.of(p);
     g.n_lanes = try g.n.grow(total);
+    if (g.n_lanes > 1 and g.drafts) try g.measureShared();
     return @intCast(g.n_lanes);
 }
 
