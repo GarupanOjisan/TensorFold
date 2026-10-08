@@ -1,9 +1,11 @@
 //! `tf-glm`: GLM-5.3-Flash on two CUDA ranks without Python, and its check against the Python engine's replies.
 //!   tf-glm check MODEL --rank R --master HOST [--port P] --prompts prompts.json --want tokens.json
-//!          [--max-tokens N] [--context N] [--depth D] [--only NAME,...] [--kernels DIR]
+//!          [--max-tokens N] [--context N] [--depth D] [--copy 0|1] [--only NAME,...] [--kernels DIR]
 //!   tf-glm qdump MODEL --rank R --out DIR [--only NAME,...]   (TF_GLM_DENSE=q4's quantization of a few tensors, as bytes)
 //! Run once on each Spark (rank 0 on HOST). Each prompt is prefilled and decoded serially, then with MTP drafts;
-//! rank 0 prints whether both equal the capture's serial reply.
+//! rank 0 prints whether both equal the capture's serial reply. `--copy 1` drafts by v1.8's prompt lookup where the
+//! context repeats (glm_copy.zig; TF_GLM_COPY_MAX, _MATCH, _REPLY_MATCH and TF_GLM_WIDE_GRAPHS as in Python) and the MTP
+//! head elsewhere.
 const std = @import("std");
 const cuda = @import("cuda");
 const glm_config = @import("glm_config");
@@ -13,6 +15,7 @@ const kern = @import("glm_kernels.zig");
 const fwd = @import("glm_forward.zig");
 const dec = @import("glm_decode.zig");
 const node = @import("glm_node.zig");
+const copy = @import("glm_copy.zig");
 
 const Opts = struct {
     model: []const u8 = "",
@@ -24,6 +27,7 @@ const Opts = struct {
     max_tokens: usize = 128,
     context: usize = 1048576,
     depth: usize = 3,
+    copy: bool = false,
     only: []const u8 = "",
     kernels: ?[]const u8 = null,
     out: []const u8 = "",
@@ -53,6 +57,7 @@ pub fn main(init: std.process.Init) !u8 {
         else if (std.mem.eql(u8, a, "--max-tokens")) o.max_tokens = try std.fmt.parseInt(usize, v, 10)
         else if (std.mem.eql(u8, a, "--context")) o.context = try std.fmt.parseInt(usize, v, 10)
         else if (std.mem.eql(u8, a, "--depth")) o.depth = try std.fmt.parseInt(usize, v, 10)
+        else if (std.mem.eql(u8, a, "--copy")) o.copy = !std.mem.eql(u8, v, "0")
         else if (std.mem.eql(u8, a, "--only")) o.only = v
         else if (std.mem.eql(u8, a, "--kernels")) o.kernels = v
         else if (std.mem.eql(u8, a, "--out")) o.out = v
@@ -139,9 +144,16 @@ pub fn main(init: std.process.Init) !u8 {
             const pre_s = secs(io, t0);
             t0 = now(io);
             var rounds: usize = 0;
+            var detail: []const u8 = "";
             if (drafted) {
-                const r = try dec.mtpDecode(&e, first, count, o.depth, true, &out, gpa);
+                const settings: ?copy.Settings = if (o.copy) try copy.Settings.fromEnv(e.wide_graph) else null;
+                const r = try dec.mtpDecode(&e, first, count, o.depth, true, &out, gpa, settings, ids);
                 rounds = r.rounds;
+                if (settings != null) {
+                    var hist: std.ArrayList(u8) = .empty;
+                    for (r.windows, 0..) |n, rows| if (n > 0) try hist.print(arena, " {d}x{d}", .{ n, rows });
+                    detail = try std.fmt.allocPrint(arena, ", copies {d} rounds {d} drafts {d} kept, windows (n x rows){s}", .{ r.copy_rounds, r.copy_drafted, r.copy_accepted, hist.items });
+                }
             } else try dec.serial(&e, first, count, true, &out, gpa);
             const dec_s = secs(io, t0);
             var same = out.items.len == count;
@@ -156,7 +168,7 @@ pub fn main(init: std.process.Init) !u8 {
             if (!same) failed += 1;
             if (o.rank == 0) std.debug.print("{s} {s}: {d} prompt tokens in {d:.2} s, {d} tokens in {d:.2} s ({d:.1} tok/s{s}), {s}{s}\n", .{
                 if (same) "PASS" else "FAIL", name, ids.len, pre_s, out.items.len, dec_s,
-                @as(f64, @floatFromInt(out.items.len)) / @max(dec_s, 1e-9), if (drafted) try std.fmt.allocPrint(arena, ", {d} rounds, MTP", .{rounds}) else "",
+                @as(f64, @floatFromInt(out.items.len)) / @max(dec_s, 1e-9), if (drafted) try std.fmt.allocPrint(arena, ", {d} rounds{s}, MTP", .{ rounds, detail }) else "",
                 if (same) "equal to Python" else try std.fmt.allocPrint(arena, "first difference at {d}", .{at}),
                 if (same) "" else try std.fmt.allocPrint(arena, " (got {any})", .{out.items[0..@min(out.items.len, at + 4)]}),
             });

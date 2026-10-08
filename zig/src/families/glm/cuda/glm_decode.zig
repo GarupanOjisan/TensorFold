@@ -2,6 +2,7 @@
 //! run the same calls, and every choice comes from the gathered greedy picks, so they agree without messages.
 const std = @import("std");
 const fwd = @import("glm_forward.zig");
+const copy = @import("glm_copy.zig");
 const Engine = fwd.Engine;
 
 const bf = 2;
@@ -94,16 +95,48 @@ pub fn draft(e: *Engine, hidden: u64, next: []const u32, count: usize, out: []u3
     }
 }
 
+/// What a drafted decode did: rounds, drafts kept, the rounds that verified copied drafts (and their drafts and kept ones),
+/// and how many windows ran at each row count.
+pub const Run = struct {
+    rounds: usize = 0,
+    accepted: usize = 0,
+    copy_rounds: usize = 0,
+    copy_drafted: usize = 0,
+    copy_accepted: usize = 0,
+    windows: [Engine.max_rows + 1]usize = @splat(0),
+};
+
 /// decode.mtp_decode, greedy, `depth` drafts a round: verify the pending token and the drafts, keep through the
-/// first mismatch, draft again from the kept rows.
-pub fn mtpDecode(e: *Engine, pending: u32, count: usize, depth: usize, stop_eos: bool, out: *std.ArrayList(u32), gpa: std.mem.Allocator) !struct { rounds: usize, accepted: usize } {
+/// first mismatch, draft again from the kept rows. With `copies` (v1.8's COPY_DRAFTS, glm_copy.zig; `prompt` is the
+/// prompt the pending token follows) a round whose context repeats earlier text verifies the copied continuation
+/// instead, and the MTP head only absorbs the kept rows.
+pub fn mtpDecode(e: *Engine, pending: u32, count: usize, depth: usize, stop_eos: bool, out: *std.ArrayList(u32), gpa: std.mem.Allocator, copies: ?copy.Settings, prompt: []const u32) !Run {
     if (depth + 1 > Engine.max_rows) return error.DepthPastWindow;
     try out.append(gpa, pending);
+    var run: Run = .{};
+    var ctx: std.ArrayList(u32) = .empty;
+    defer ctx.deinit(gpa);
+    if (copies != null) {
+        try ctx.appendSlice(gpa, prompt);
+        try ctx.append(gpa, pending);
+    }
+    var copy_buf: [copy.max_drafts]u32 = undefined;
     var drafts: [Engine.max_rows]u32 = undefined;
-    var n_drafts = @min(depth, count - out.items.len);
-    if (n_drafts > 0) try draft(e, e.last_hidden, &.{pending}, n_drafts, drafts[0..n_drafts]);
-    var rounds: usize = 0;
-    var accepted: usize = 0;
+    var n_drafts: usize = 0;
+    var copied = false;
+    if (copies) |c| {
+        const found = c.propose(ctx.items, prompt.len, count -| out.items.len -| 1, &copy_buf);
+        copied = found.len > 0;
+        if (copied) {
+            n_drafts = found.len;
+            @memcpy(drafts[0..n_drafts], found);
+            try absorb(e, e.last_hidden, &.{pending});
+        }
+    }
+    if (!copied) {
+        n_drafts = @min(depth, count - out.items.len);
+        if (n_drafts > 0) try draft(e, e.last_hidden, &.{pending}, n_drafts, drafts[0..n_drafts]);
+    }
     while (out.items.len < count and !(stop_eos and isEos(e, out.items[out.items.len - 1]))) {
         var window: [Engine.max_rows]u32 = undefined;
         window[0] = out.items[out.items.len - 1];
@@ -118,13 +151,32 @@ pub fn mtpDecode(e: *Engine, pending: u32, count: usize, depth: usize, stop_eos:
             keep += 1;
         }
         try e.commit(rows, keep);
-        rounds += 1;
-        accepted += keep - 1;
+        run.rounds += 1;
+        run.accepted += keep - 1;
+        run.windows[rows] += 1;
+        if (copied) {
+            run.copy_rounds += 1;
+            run.copy_drafted += n_drafts;
+            run.copy_accepted += keep - 1;
+        }
         try out.appendSlice(gpa, sampled[0..keep]);
+        if (copies != null) try ctx.appendSlice(gpa, sampled[0..keep]);
         if (out.items.len >= count or (stop_eos and isEos(e, out.items[out.items.len - 1]))) break;
-        n_drafts = @min(depth, count - out.items.len);
-        if (n_drafts > 0) try draft(e, e.buf.fnormed, sampled[0..keep], n_drafts, drafts[0..n_drafts]);
+        copied = false;
+        if (copies) |c| {
+            const found = c.propose(ctx.items, prompt.len, count -| out.items.len -| 1, &copy_buf);
+            copied = found.len > 0;
+            if (copied) {
+                n_drafts = found.len;
+                @memcpy(drafts[0..n_drafts], found);
+                try absorb(e, e.buf.fnormed, sampled[0..keep]);
+            }
+        }
+        if (!copied) {
+            n_drafts = @min(depth, count - out.items.len);
+            if (n_drafts > 0) try draft(e, e.buf.fnormed, sampled[0..keep], n_drafts, drafts[0..n_drafts]);
+        }
     }
     if (out.items.len > count) out.shrinkRetainingCapacity(count);
-    return .{ .rounds = rounds, .accepted = accepted };
+    return run;
 }

@@ -58,6 +58,75 @@ def lengths(model: Path, sizes: list[int]) -> dict[str, list[int]]:
     return {f"len{n}": body[:n] for n in sizes}
 
 
+def copy_prompts(model: Path) -> dict[str, list[int]]:
+    """Prompts whose replies repeat the prompt (copy drafts fire): a code edit, a JSON edit, a JSON reformat, a quote."""
+
+    from tokenizers import Tokenizer
+    import heapq
+    import json
+    import json.encoder
+    import textwrap
+
+    tok = Tokenizer.from_file(str(model / "tokenizer.json"))
+
+    def head(path: str, size: int) -> str:
+        text = Path(path).read_text()
+        cut = tok.encode(text, add_special_tokens=False)
+        end = cut.offsets[min(size, len(cut.ids)) - 1][1]
+        return text[:text.rfind("\n", 0, end) + 1]
+
+    records = [{"id": i, "name": f"item-{i}", "tags": ["alpha", "beta"], "price": round(3.5 + i * 1.25, 2), "active": True}
+               for i in range(1, 25)]
+    texts = {
+        "cedit": "Add type annotations to every function in this file and output the complete updated file:\n\n"
+                 + head(textwrap.__file__, 1100),
+        "cenc": "Rename the class JSONEncoder to Encoder everywhere in this file and output the whole file:\n\n"
+                + head(json.encoder.__file__, 1000),
+        "jfmt": "Pretty-print this JSON with two-space indentation and change nothing else:\n\n"
+                + json.dumps(records, separators=(",", ":")),
+        "jedit": "Set active to false for every item with an even id and output the whole JSON unchanged otherwise:\n\n"
+                 + json.dumps(records, indent=2),
+        "clong": "Add type annotations to every function in this file and output the complete updated file:\n\n"
+                 + head(textwrap.__file__, 3200),
+        "chuge": "Rename the class ArgumentParser to Parser everywhere in this file and output the whole file:\n\n"
+                 + head(argparse.__file__, 5200),
+        "quote": "Repeat the following text exactly, with no changes:\n\n" + head(heapq.__file__, 700),
+    }
+    return {name: tok.encode(chat(text), add_special_tokens=False).ids for name, text in texts.items()}
+
+
+def window_ms(eng, rank: int, out: Path) -> None:
+    """Engine._calibrate's way (fastest of seven after two warm-up turns, the larger of the two ranks) for every window width."""
+
+    import numpy as np
+    import torch
+
+    from tensorfold.families.glm5_next.cuda.decode import prefill
+    from tensorfold.families.glm5_next.cuda.engine import MAX_ROWS
+
+    e = eng.e
+    rng = np.random.default_rng(0)
+    vocab = eng.w.cfg.vocab
+    prefill(e, [int(t) for t in rng.integers(0, vocab, 64)], None, mtp=True, drafter=None)
+    windows = {r: [int(t) for t in rng.integers(0, vocab, r)] for r in range(1, MAX_ROWS + 1)}
+    best = {r: float("inf") for r in windows}
+    for turn in range(9):
+        for r, w in windows.items():
+            torch.cuda.synchronize()
+            t = time.perf_counter()
+            e.forward(w)
+            torch.cuda.synchronize()
+            if turn >= 2:
+                best[r] = min(best[r], (time.perf_counter() - t) * 1e3)
+    mine = torch.tensor([best[r] for r in windows], dtype=torch.float32, device="cuda")
+    got = torch.empty((eng.world * mine.numel(),), dtype=torch.float32, device="cuda")
+    eng.comm.all_gather(mine, got)
+    both = got.view(eng.world, -1).max(dim=0).values.tolist()
+    if rank == 0:
+        (out / "window_ms.json").write_text(json.dumps(dict(zip(map(str, windows), both))) + "\n")
+        print("[capture] window ms by width: " + " ".join(f"{v:.1f}" for v in both), flush=True)
+
+
 def specialization() -> dict:
     """Each launched JIT function's parameter names and which ones Triton never specializes."""
 
@@ -85,6 +154,8 @@ def main() -> int:
     ap.add_argument("--context", type=int, default=65536, help="explicit, so the indexer and sparse attention run")
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--only", default="", help="comma-separated prompt names (default: all)")
+    ap.add_argument("--window-ms", action="store_true", help="time verify windows of 1 to MAX_ROWS rows on both ranks, then stop")
+    ap.add_argument("--set", default="", help="copy: prompts whose replies repeat the prompt, instead of the prompt set")
     ap.add_argument("--lengths", default="", help="comma-separated prompt lengths in tokens, instead of the prompt set")
     a = ap.parse_args()
     out = Path(a.out)
@@ -101,10 +172,14 @@ def main() -> int:
     eng = GlmEngine(Path(a.model), rank=a.rank, master=a.master, port=a.port, drafter=None, context=a.context,
                     context_explicit=True)
     print(f"[capture] rank {a.rank} ready in {time.perf_counter() - t0:.1f} s, window {eng.limit}", flush=True)
+    if a.window_ms:
+        window_ms(eng, a.rank, out)
+        os._exit(0)
     if a.rank == 1:
         eng.follow()
         return 0
-    ids = lengths(Path(a.model), [int(n) for n in a.lengths.split(",")]) if a.lengths else prompts(Path(a.model))
+    ids = (lengths(Path(a.model), [int(n) for n in a.lengths.split(",")]) if a.lengths
+           else copy_prompts(Path(a.model)) if a.set == "copy" else prompts(Path(a.model)))
     if a.only:
         ids = {k: v for k, v in ids.items() if k in a.only.split(",")}
     (out / "prompts.json").write_text(json.dumps(ids) + "\n")

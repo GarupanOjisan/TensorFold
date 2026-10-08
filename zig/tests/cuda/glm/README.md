@@ -110,8 +110,7 @@ The reference sets `k1`, `k2`, `k3` are `m1`, `m2`, `m3` with `-e TF_GLM_KDA_CHU
   of `l2pf.cu`) prefetch the next kernels' weights into L2 from a side stream at the sites a / f / o of decode windows of up
   to 64 rows, forked and joined with events so that it also runs inside the captured graphs; the MoE then runs its shared
   expert before the routed experts, as v1.8 does under it.
-- Not ported, because the Zig engine does not use them: windows of 9 to 16 rows (`TF_GLM_MAX_ROWS`, `TF_GLM_WIDE_GRAPHS`: v1.8 runs
-  them for copy drafts, which are off here; its MTP depth is at most 7, 8 rows), copy drafts (`TF_GLM_COPY_*`), DFlash2
+- Not ported, because the Zig engine does not use them: DFlash2
   (`TF_GLM_DFLASH_POLICY`), multi-stream serving (`TF_GLM_MULTI_*`, `FILL_*`, `PREFILL_OVERLAP`, `HC_SPLIT`, `HC_EXCHANGE`), the
   reply-shaping and pacing settings of the Python server (`ASSISTANT_ENDS`, `CLEAR_THINKING`, `KEEP_REASONING*`,
   `STREAM_SMOOTH*`, `SHARED_PREFIX`, `CACHE_*`, `DISPLAY_KV_*`). `LOADS=0`, `FUSE`, `PASS=128`, `Q4_TILE`, `SEQ_ROWS`, `L2PF_BLOCKS/KB/THREADS`,
@@ -119,3 +118,28 @@ The reference sets `k1`, `k2`, `k3` are `m1`, `m2`, `m3` with `-e TF_GLM_KDA_CHU
 
 Acceptance: `tf-glm check` against the production-setting captures `v18a` (6 prompts), `v18b` (42 lengths, 8k, 32k) and `p4` (one
 123k-token prompt), `aot/p18b` = `aot/v18` plus their kernels, at depth 3 and 7.
+
+## 9. Copy drafts and windows of up to 16 rows (v1.8 patches 0007, 0013, 0032)
+
+- `glm_copy.zig` is `copy_drafts.py` with the production settings (`TF_GLM_COPY_DRAFTS=1`, `_MAX=15`, `_MATCH=8`, and COPY_CODE's
+  `_REPLY_MATCH=16` and `TF_GLM_WIDE_GRAPHS=16`; the same variables, `TF_GLM_COPY_DRAFTS=0` turns every copy off): when the context's last 8
+  tokens (the pending one included) occurred before, the tokens after the latest earlier occurrence that has that many tokens
+  after it (else the earliest) are verified in place of the MTP head's drafts; an occurrence that starts in the reply needs 16
+  matching tokens; a window of 9 to 15 rows is padded to 16 by repeating its last draft when `room` allows, so it replays the
+  16-row graph. `zig test zig/src/families/glm/cuda/glm_copy.zig` runs its unit tests; a generated cross-check of 1,500 random
+  contexts (964 with a copy) against v1.8's `CopyDrafts.propose` gives the same drafts in every case.
+- The lane core's own `SuffixLookup` (3-gram index, longest match, silent after four misses) is not v1.8's rule, so
+  `glm_native.zig` puts `CopyRule` (the same rule as a `lanes.proposer`) on each stream at its prompt pass, or none with
+  `TF_GLM_COPY_DRAFTS=0`. The core still takes no copy of one token (`copyProposal` wants two) and asks for the head's one draft
+  behind a copy, where v1.8 only absorbs the kept rows.
+- The engine: `Engine.max_rows` 16 (`mtp_rows` 8, so the MTP head absorbs a kept backlog in steps of 8 as v1.8 does), CUDA graphs
+  for 1..8 and `wide_graph` (`TF_GLM_WIDE_GRAPHS`, 16) rows, eager launches for the others. Everything else was already generic in
+  the rows: KDA replay up to `keep` 16, the decode matmuls (`rows <= 16`), the router and expert plans.
+- `tf-glm check ... --copy 1` runs `mtpDecode` with copy drafts and prints the copied rounds and a histogram of the windows' rows.
+- Reference sets (v1.8 with `-e TF_GLM_COPY_DRAFTS=1 -e TF_GLM_COPY_MAX=15 -e TF_GLM_COPY_REPLY_MATCH=16` on top of `pycap18.sh`'s
+  production settings; `capture_glm.py --set copy` for the first): `cp1` seven prompts whose replies repeat the prompt (a code edit, a rename, a JSON reformat and
+  edit, 3.2k and 5.2k-token module edits, a quote; 320 tokens), `cp2` = v18a's prompts, `cp3` = v18b's lengths, `cp4` = p4's
+  123k-token prompt. Their serial replies equal v18a / v18b / p4's, and v1.8's own drafted replies equal its serial ones.
+  `aot/p18c` is `aot/p18b` plus the kernels of `cp1`..`cp4`.
+- `capture_glm.py --window-ms` times v1.8's verify windows of 1 to 16 rows (`window_ms.json`), the Python side of the server's
+  `GLM window ms by width` line.

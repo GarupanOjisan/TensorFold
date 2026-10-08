@@ -298,6 +298,9 @@ pub const Engine = struct {
     graphs: [max_graphs]GraphEntry = undefined,
     n_graphs: usize = 0,
     use_graphs: bool = true,
+    /// TF_GLM_WIDE_GRAPHS (v1.8 production: 16; 0: off): the one verify-window width past 8 rows that replays a CUDA graph
+    /// (copy drafts pad their windows up to it, glm_copy.zig); the others of 9..15 rows run eagerly.
+    wide_graph: usize = 16,
     /// TF_GLM_EXL3_DEC (default on): v1.8's routed-expert kernels, plan and direct shared-expert combine; 0: the generic
     /// grouped kernel of v0.6.6 (the A/B path).
     exl3_v18: bool = true,
@@ -326,8 +329,10 @@ pub const Engine = struct {
     combine_sy: bool = true,
     capturing: bool = false,
 
-    pub const max_rows = 8; // engine.MAX_ROWS
-    /// Windows of 1..8 rows x 2 KDA parities and MTP steps of 1..8 rows, each dense or at one of ~10 pool buckets.
+    pub const max_rows = 16; // engine.MAX_ROWS: a pending token and up to 15 copied drafts
+    pub const mtp_rows = 8; // engine.MTP_ROWS: rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
+    /// Windows of 1..8 and `wide_graph` rows x 2 KDA parities and MTP steps of 1..8 rows, each dense or at one of ~10 pool
+    /// buckets (9 widths x 2 x 11 + 8 x 11 = 286).
     pub const max_graphs = 320;
     /// The most candidates a rank gives a sampled row (top_k + exact_sampling.MARGIN).
     pub const max_k = 1024;
@@ -360,7 +365,7 @@ pub const Engine = struct {
         var count: Arena = .{ .base = 0, .size = 0 };
         _ = carve(&count, w, max_rows, capacity, false, np_max);
         _ = carve(&count, w, prefill_rows, capacity, true, np_max);
-        _ = carve(&count, w, max_rows, capacity, false, np_max);
+        _ = carve(&count, w, mtp_rows, capacity, false, np_max);
         const kv_fp8 = try kvFp8();
         const state_bytes = stateBytes(w, capacity, n_kda, n_dsa, width, long_context, kv_fp8);
         const total = count.used + state_bytes + 4096 + (w.head.n + c.hidden) * bf + 1024;
@@ -370,7 +375,7 @@ pub const Engine = struct {
         var a: Arena = .{ .base = e.mem.ptr, .size = total };
         e.buf = carve(&a, w, max_rows, capacity, false, np_max);
         e.pbuf = carve(&a, w, prefill_rows, capacity, true, np_max);
-        e.mbuf = carve(&a, w, max_rows, capacity, false, np_max);
+        e.mbuf = carve(&a, w, mtp_rows, capacity, false, np_max);
         const st = &e.st;
         const lat_b: usize = if (kv_fp8) c.kv_lora + 16 else c.kv_lora * bf; // a latent cache row (kv8.row_bytes)
         const pk_b: usize = if (kv_fp8) c.i_dim + 16 else c.i_dim * bf; // and a pooled key row
@@ -399,6 +404,7 @@ pub const Engine = struct {
         e.np_max = np_max;
         e.n_graphs = 0;
         e.capturing = false;
+        e.l2pf_active = false; // `e` starts undefined, so every field with a default but no assignment here is garbage
         e.draft_head = w.draft_head;
         e.full_dev = try cuda.DeviceBuffer.alloc(d, wt.world * max_rows * w.head.n * bf);
         errdefer e.full_dev.free();
@@ -414,6 +420,7 @@ pub const Engine = struct {
         e.exl3_v18 = if (std.c.getenv("TF_GLM_EXL3_DEC")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         e.combine_sy = e.exl3_v18 and (if (std.c.getenv("TF_GLM_COMBINE_SY")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true);
         e.use_graphs = if (std.c.getenv("TF_GLM_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+        e.wide_graph = try wideGraph();
         return e;
     }
 
@@ -441,6 +448,7 @@ pub const Engine = struct {
     /// position of its key.
     fn graphKey(e: *const Engine, head: GraphKey.Head, rows: usize, pos: usize) ?GraphKey {
         if (!e.use_graphs) return null;
+        if (rows > 8 and rows != e.wide_graph) return null; // engine.GRAPH_ROWS + WIDE_GRAPHS: the others run eagerly
         const dl = denseLimit(e.w);
         var np: usize = 0;
         if (e.st.long_context and pos + rows - 1 >= dl) {
@@ -947,6 +955,20 @@ pub const Engine = struct {
         }
     }
 };
+
+/// TF_GLM_WIDE_GRAPHS: the verify-window width past 8 rows that replays a CUDA graph, 9 to max_rows (default 16, v1.8's
+/// production setting; 0 or empty: none). Python takes a list of widths; one is all the copy drafts' padding uses.
+pub fn wideGraph() !usize {
+    const v = std.c.getenv("TF_GLM_WIDE_GRAPHS") orelse return 16;
+    const t = std.mem.trim(u8, std.mem.span(v), " ");
+    if (t.len == 0 or std.mem.eql(u8, t, "0")) return 0;
+    const n = std.fmt.parseInt(usize, t, 10) catch return error.BadWideGraphs;
+    if (n <= 8 or n > Engine.max_rows) {
+        std.log.err("TF_GLM_WIDE_GRAPHS is 0 or a width from 9 to {d}, not {s}", .{ Engine.max_rows, t });
+        return error.BadWideGraphs;
+    }
+    return n;
+}
 
 /// TF_GLM_KDA_CHUNKED: on unless "0".
 pub fn kdaChunked() bool {

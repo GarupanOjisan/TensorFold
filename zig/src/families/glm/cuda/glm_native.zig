@@ -1,15 +1,18 @@
 //! GLM-5.3-Flash on two CUDA ranks behind the native family interface (native/cuda.zig): this process is rank 0
-//! and serves; rank 1 runs `tf-glm follow` on the other Spark. One stream at a time, windows of up to 8 rows,
-//! MTP drafts. TF_GLM_PORT (default 29660) is the port rank 0 listens on for rank 1.
+//! and serves; rank 1 runs `tf-glm follow` on the other Spark. One stream at a time, windows of up to 16 rows, MTP
+//! drafts and v1.8's prompt-lookup (copy) drafts (glm_copy.zig). TF_GLM_PORT (default 29660) is the port rank 0 listens on for rank 1.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
 const node = @import("glm_node.zig");
 const fwd = @import("glm_forward.zig");
+const copy = @import("glm_copy.zig");
 
 const be = lanes.backend;
 const Node = node.Node;
 const max_rows = fwd.Engine.max_rows;
+/// Drafts the MTP head chains at most: the 8-row window of earlier builds (the rows past it serve copies).
+const head_drafts = 7;
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{"exl3-mcg-4bit"};
@@ -43,10 +46,51 @@ pub fn weightBytes(total: u64) u64 {
 
 const ring = 64;
 
+/// glm_copy.zig as the lane core's proposer (lanes/proposer.zig): one stream at a time, so one instance, reset by each
+/// prompt pass. The core asks twice a round with the same context (the head's depth rule, then the next plan): the second
+/// answer is the first.
+const CopyRule = struct {
+    cfg: copy.Settings,
+    prompt: usize = 0,
+    buf: [copy.max_drafts]u32 = undefined,
+    memo_len: usize = std.math.maxInt(usize),
+    memo_room: i64 = 0,
+    memo_n: usize = 0,
+
+    const vtable: lanes.proposer.Proposer.VTable = .{ .propose = proposeFn, .last_match = lastMatchFn };
+
+    fn reset(r: *CopyRule, prompt: usize) void {
+        r.prompt = prompt;
+        r.memo_len = std.math.maxInt(usize);
+    }
+
+    fn proposer(r: *CopyRule) lanes.proposer.Proposer {
+        return .{ .ptr = r, .vtable = &vtable };
+    }
+
+    fn proposeFn(ptr: *anyopaque, context: []const u32, max_draft: i64) anyerror![]const u32 {
+        const r: *CopyRule = @ptrCast(@alignCast(ptr));
+        if (max_draft <= 0) return &.{};
+        if (r.memo_len != context.len or r.memo_room != max_draft) {
+            r.memo_n = r.cfg.propose(context, r.prompt, @intCast(max_draft), &r.buf).len;
+            r.memo_len = context.len;
+            r.memo_room = max_draft;
+        }
+        return r.buf[0..r.memo_n];
+    }
+
+    /// Any copy matched the settings' `match` tokens, which the core's enter_match (8) must not second-guess.
+    fn lastMatchFn(ptr: *anyopaque) i64 {
+        const r: *CopyRule = @ptrCast(@alignCast(ptr));
+        return if (r.memo_n > 0) 64 else 0;
+    }
+};
+
 const Glm = struct {
     gpa: std.mem.Allocator,
     n: *Node,
     drafts: bool,
+    copy: CopyRule,
     stream: ?*lanes.Stream = null,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
@@ -148,6 +192,12 @@ const Glm = struct {
         if (ids.len == 0 or ids.len + s.max_new + max_rows > e.st.capacity) return error.PromptTooLong;
         const k = try candidateCount(s);
         g.stream = s;
+        // v1.8's copy rule in place of the core's suffix lookup (which TF_GLM_COPY_DRAFTS=0 turns off as well)
+        s.proposer = null;
+        if (s.drafts and g.copy.cfg.on) {
+            g.copy.reset(s.prompt_len);
+            s.proposer = g.copy.proposer();
+        }
         g.pending_rows = 0;
         g.held_n = 0;
         s.cached = 0;
@@ -276,10 +326,11 @@ const Glm = struct {
         if (!g.drafts) return .{ .exact_width = 1, .max_streams = 1 };
         return .{
             .exact_width = max_rows,
+            .first_copy_rows = if (g.copy.cfg.on) @intCast(@min(g.copy.cfg.most + 1, max_rows)) else 0,
             .mtp = true,
             .speculate = true,
             .speculate_early = false,
-            .drafts = max_rows - 1,
+            .drafts = head_drafts,
             .window_costs = &g.costs,
             .mtp_step_ms = g.mtp_ms,
             .max_streams = 1,
@@ -315,7 +366,10 @@ const Glm = struct {
             three = @min(three, ms(io, t0));
         }
         g.mtp_ms = @max(0.1, (three - one) / 2);
-        std.log.info("GLM window ms by width: {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {d:.1} {d:.1}; MTP step {d:.2} ms", .{ g.costs[0].ms, g.costs[1].ms, g.costs[2].ms, g.costs[3].ms, g.costs[4].ms, g.costs[5].ms, g.costs[6].ms, g.costs[7].ms, g.mtp_ms });
+        var line: [max_rows * 8]u8 = undefined;
+        var w = std.Io.Writer.fixed(&line);
+        for (g.costs) |c| w.print(" {d:.1}", .{c.ms}) catch {};
+        std.log.info("GLM window ms by width:{s}; MTP step {d:.2} ms", .{ w.buffered(), g.mtp_ms });
     }
 };
 
@@ -463,7 +517,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer n.deinit();
     const g = try gpa.create(Glm);
     errdefer gpa.destroy(g);
-    g.* = .{ .gpa = gpa, .n = n, .drafts = o.drafts and n.w.mtp != null };
+    g.* = .{ .gpa = gpa, .n = n, .drafts = o.drafts and n.w.mtp != null, .copy = .{ .cfg = try copy.Settings.fromEnv(n.e.wide_graph) } };
+    if (g.drafts and g.copy.cfg.on) std.log.info("GLM copy drafts: up to {d} a round, match {d} tokens, {d} inside the reply, windows of 9 to 15 rows padded to {d}", .{ g.copy.cfg.most, g.copy.cfg.match, g.copy.cfg.reply_match, g.copy.cfg.pad });
     try g.measure(io);
     return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = 0, .ctx = g, .deinit = release };
 }
