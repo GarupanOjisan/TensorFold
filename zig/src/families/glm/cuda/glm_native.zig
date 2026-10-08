@@ -419,6 +419,7 @@ const Glm = struct {
     /// One window: the pending token, the drafts held here, then host drafts; every row's greedy token.
     fn verifyFn(p: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
         const g = of(p);
+        if (windows.len > 1) return g.verifyShared(windows, out);
         if (windows.len != 1) return error.OneStreamAtATime;
         const w = windows[0];
         if (w.parents != null) return error.TreesNotBuilt;
@@ -440,6 +441,45 @@ const Glm = struct {
         @memcpy(ln.window[0..rows], ids[0..rows]);
         ln.pending_rows = rows;
         ln.held_n = 0;
+    }
+
+    /// Several streams' windows (a shared round) in one forward, each lane's rows back to back in the windows' order.
+    fn verifyShared(g: *Glm, windows: []const be.Window, out: []be.Verified) !void {
+        if (windows.len > max_lanes) return error.TooManyWindows;
+        var segs: [max_lanes]fwd.Engine.Seg = undefined;
+        var ks: [max_lanes]usize = undefined;
+        var ids: [max_rows]u32 = undefined;
+        var total: usize = 0;
+        for (windows, 0..) |w, i| {
+            if (w.parents != null) return error.TreesNotBuilt;
+            const ln = try g.enter(w.stream);
+            try g.commit(ln, ln.pending_rows); // no keep since its last window: all of its rows stay
+            const rows = w.rows();
+            if (total + rows > max_rows) return error.WindowTooWide;
+            if (w.held > ln.held_n) return error.NoHeldDrafts;
+            for (w.positions, 0..) |pos, r| if (pos != g.n.e.st.pos + 1 + r) return error.PositionMismatch;
+            ids[total] = w.pending;
+            @memcpy(ids[total + 1 ..][0..w.held], ln.held[0..w.held]);
+            @memcpy(ids[total + 1 + w.held ..][0..w.tokens.len], w.tokens);
+            segs[i] = .{ .lane = g.n.e.lane, .rows = rows };
+            ks[i] = try candidateCount(w.stream);
+            total += rows;
+        }
+        const n = windows.len;
+        try g.n.verifyShared(segs[0..n], ids[0..total]);
+        var at: usize = 0;
+        for (windows, out, segs[0..n], ks[0..n]) |w, *o, sg, k| {
+            const rows = sg.rows;
+            try g.n.bind(sg.lane); // a draw's `nucleus` reads the bound lane's rows
+            try g.n.pickSegment(sg, k, o.sampled[0..rows]);
+            if (k > 0) try g.choose(w.stream, .window, k, rows, w.positions[0], o.sampled[0..rows]);
+            @memcpy(o.drafts[0 .. rows - 1], ids[at + 1 ..][0 .. rows - 1]);
+            const ln = &g.lanes[sg.lane];
+            @memcpy(ln.window[0..rows], ids[at..][0..rows]);
+            ln.pending_rows = rows;
+            ln.held_n = 0;
+            at += rows;
+        }
     }
 
     fn keepFn(p: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
@@ -545,7 +585,12 @@ const Glm = struct {
             .drafts = head_drafts,
             .window_costs = &g.costs,
             .mtp_step_ms = if (g.dflash) 0.1 else g.mtp_ms, // DFlash2's block pass costs the same at any depth
-            .max_streams = 1,
+            // several live streams share a forward (verifyShared), up to a window's rows; the lanes `grow` allocated cap
+            // how many streams are live, so one lane never shares
+            .hidden_rows = true,
+            .streams_exact = true,
+            .batch_rows = max_rows,
+            .max_streams = max_lanes,
         };
     }
 

@@ -14,7 +14,7 @@ const roce_mod = @import("glm_roce.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16 };
 
 /// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 pub fn drafterDir() ?[]const u8 {
@@ -221,7 +221,13 @@ pub const Node = struct {
 
     fn dflashRun(n: *Node, from: From, kept: usize, pending: u32, block: bool) !void {
         const dr = &(n.dflash orelse return error.NoDraftModel);
-        if (from == .verify) try dr.addTaps(&n.e, &n.e.buf, kept);
+        if (from == .verify) { // the lane's rows of the last window
+            var b = n.e.buf;
+            for (&b.taps) |*t| if (t.* != 0) {
+                t.* += n.e.st.row0 * n.e.w.cfg.hidden * 2;
+            };
+            try dr.addTaps(&n.e, &b, kept);
+        }
         if (block and dr.context_end > 0) try dr.block(&n.e, pending, n.rank == 0);
     }
 
@@ -260,7 +266,7 @@ pub const Node = struct {
 
     fn nucleusRun(n: *Node, which: Rows, rows: usize, temperature: f64, count: usize) ![]const u64 {
         const logits = switch (which) {
-            .window => n.e.buf.logits,
+            .window => n.e.buf.logits + n.e.st.row0 * n.e.w.head.n * 2, // the bound lane's rows of the window
             .last => n.e.st.last_logits,
         };
         if (count == 0) {
@@ -296,9 +302,28 @@ pub const Node = struct {
         try n.send(.draft, n.words.items);
         const hidden = switch (from) {
             .prompt => n.e.st.last_hidden,
-            .verify => n.e.buf.fnormed,
+            .verify => n.e.buf.fnormed + n.e.st.row0 * n.e.w.cfg.hidden * 2, // the lane's rows of the window
         };
         try dec.draft(&n.e, hidden, next, out.len, out);
+    }
+
+    /// Several lanes' windows in one forward (Engine.forwardShared): `segs` in order, `ids` their rows back to back. Each
+    /// segment's tokens are then picked with `pickSegment` (and drawn with `nucleus` after binding its lane), in order.
+    pub fn verifyShared(n: *Node, segs: []const Engine.Seg, ids: []const u32) !void {
+        n.words.clearRetainingCapacity();
+        try n.words.append(n.gpa, @intCast(segs.len));
+        for (segs) |g| try n.words.appendSlice(n.gpa, &.{ @intCast(g.lane), @intCast(g.rows) });
+        try n.words.appendSlice(n.gpa, ids);
+        try n.send(.shared, n.words.items);
+        try n.e.forwardShared(segs, ids);
+    }
+
+    /// Segment `g`'s rows of the last shared window (rank 0 sends it, both run it): each row's greedy token into `out`
+    /// (k 0), or its k candidates a rank gathered (Engine.cand_host), as `verify`.
+    pub fn pickSegment(n: *Node, g: Engine.Seg, k: usize, out: []u32) !void {
+        try n.send(.segment, &.{ @intCast(g.lane), @intCast(g.rows), @intCast(k) });
+        const row0 = n.e.laneState(g.lane).row0;
+        _ = try n.pick(n.e.buf.logits + row0 * n.e.w.head.n * 2, g.rows, k, out);
     }
 
     /// Later commands act on lane `lane`'s state and DFlash2 context (sent only when the lane changes).
@@ -374,6 +399,14 @@ pub const Node = struct {
                 .draft => try n.draft(@fromBackingInt(@intCast(w[0])), w[2..], scratch[0..w[1]]),
                 .dflash => try n.dflashRun(@fromBackingInt(@intCast(w[0])), w[1], w[2], w[3] != 0),
                 .nucleus => _ = try n.nucleusRun(@fromBackingInt(@intCast(w[0])), w[1], @bitCast(@as(u64, w[3]) | (@as(u64, w[4]) << 32)), w[2]),
+                .shared => {
+                    const m = w[0];
+                    var segs: [Engine.max_lanes]Engine.Seg = undefined;
+                    if (m > Engine.max_lanes) return error.TooManySegments;
+                    for (0..m) |i| segs[i] = .{ .lane = w[1 + 2 * i], .rows = w[2 + 2 * i] };
+                    try n.verifyShared(segs[0..m], w[1 + 2 * m ..]);
+                },
+                .segment => try n.pickSegment(.{ .lane = w[0], .rows = w[1] }, w[2], scratch[0..w[1]]),
                 .bind => try n.bind(w[0]),
                 .grow => _ = try n.grow(w[0]),
                 .copy => try n.copy(w[0], w[1], w[2]),

@@ -402,6 +402,7 @@ pub const State = struct {
     kv_fp8: bool, // the latent caches and pooled keys as e4m3 rows with a scale each (Engine.kv_fp8)
     last_logits: u64 = 0, // a prompt's last row's logits, kept past the MTP absorb that reuses pbuf
     last_hidden: u64 = 0, // and its final-normed hidden row, the first draft's input
+    row0: usize = 0, // the lane's first row in the last verify window (a shared window's segment), which drafts read
 
     pub fn recBytes(st: *const State, ll: usize) usize {
         return st.kda_layers * ll * 128 * 128 * f4;
@@ -494,6 +495,9 @@ pub const Engine = struct {
     wide_graph: usize = 16,
     /// DFlash2's tap layers (the target layers whose stream means `Buffers.taps` take); none when taps are off.
     tap_layers: [5]u32 = @splat(std.math.maxInt(u32)),
+    /// A shared window's KDA projections and chain outputs, every lane's rows back to back (forwardShared).
+    sproj: u64 = 0,
+    sout: u64 = 0,
     /// TF_GLM_EXL3_DEC (default on): v1.8's routed-expert kernels, plan and direct shared-expert combine; 0: the generic
     /// grouped kernel of v0.6.6 (the A/B path).
     exl3_v18: bool = true,
@@ -560,7 +564,8 @@ pub const Engine = struct {
         _ = carve(&count, w, prefill_rows, capacity, true, np_max, tap_n);
         _ = carve(&count, w, mtp_rows, capacity, false, np_max, 0);
         const kv_fp8 = try kvFp8();
-        const total = count.used + State.bytes(w, capacity, long_context, kv_fp8) + 4096;
+        const shared_bytes = max_rows * width * bf + max_rows * ll * 128 * bf + 512;
+        const total = count.used + State.bytes(w, capacity, long_context, kv_fp8) + shared_bytes + 4096;
         e.mem = try cuda.DeviceBuffer.alloc(d, total);
         errdefer e.mem.free();
         try e.mem.fill8(0, null);
@@ -570,6 +575,8 @@ pub const Engine = struct {
         e.mbuf = carve(&a, w, mtp_rows, capacity, false, np_max, 0);
         e.tap_layers = taps orelse @splat(std.math.maxInt(u32));
         e.st = State.carveIn(&a, w, capacity, long_context, kv_fp8);
+        e.sproj = a.take(max_rows * width * bf);
+        e.sout = a.take(max_rows * ll * 128 * bf);
         e.n_lanes = 1;
         e.lane = 0;
         e.w = w;
@@ -648,7 +655,7 @@ pub const Engine = struct {
         e.lane = @intCast(i);
     }
 
-    fn laneState(e: *Engine, i: usize) *State {
+    pub fn laneState(e: *Engine, i: usize) *State {
         return if (i == e.lane) &e.st else &e.lanes[i];
     }
 
@@ -1305,8 +1312,179 @@ pub const Engine = struct {
     /// A decode window's forward: logits [R, V/2] in buf.logits.
     pub fn forward(e: *Engine, tokens_in: []const u32) !void {
         const rows = try e.stage(&e.buf, tokens_in);
+        e.st.row0 = 0;
         if (e.graphKey(.main, rows, e.st.pos)) |key| return e.replay(key, compute, .{ e, &e.buf, rows });
         try e.compute(&e.buf, rows);
+    }
+
+    // -- shared windows (verify.BatchedVerify) ---------------------------------------------------------------------
+    /// A lane's rows of a shared window, in order.
+    pub const Seg = struct { lane: usize, rows: usize };
+
+    /// One forward over several lanes' windows back to back (`tokens`: each segment's rows in turn), logits [R, V/2] in
+    /// buf.logits: the row-independent parts on the whole window, each lane's KDA and DSA on its own state with the
+    /// kernels its window alone would take (its row count). Eager; each lane then commits on its own (bind, commit).
+    pub fn forwardShared(e: *Engine, segs: []const Seg, tokens: []const u32) !void {
+        var rows: usize = 0;
+        for (segs) |g| {
+            const st = e.laneState(g.lane);
+            if (st.pos + g.rows > denseLimit(e.w) and !st.long_context) return error.PastDenseLimit;
+            if (st.pos + g.rows > st.capacity) return error.PastCacheCapacity;
+            st.row0 = rows;
+            rows += g.rows;
+        }
+        if (rows != tokens.len or rows > e.buf.rows) return error.WindowTooWide;
+        try e.upload(e.buf.ids, std.mem.sliceAsBytes(tokens));
+        const b = &e.buf;
+        const prefetch = !e.l2pf_active and if (e.l2pf) |p| rows <= p.s.rows else false;
+        if (prefetch) e.l2pf_active = true;
+        defer e.l2pf_active = false;
+        const c = e.w.cfg;
+        const d: usize = c.hidden;
+        try e.t.embed(b.ids, e.w.embed, b.x, rows, d, c.hc);
+        for (e.w.layers) |*l| {
+            const h = l.attn_hc.?;
+            try e.hcPre(b, h, l.in_norm, rows);
+            const g = switch (l.kind) {
+                .kda => try e.kdaShared(l, b, segs, rows),
+                .mla => try e.dsaShared(l, b, segs, rows),
+            };
+            try e.t.hcPost(b.x, b.x, g, b.post, b.comb, wt.world, rows, d, c.hc);
+            const f = l.ffn_hc.?;
+            try e.hcPre(b, f, l.post_norm, rows);
+            const g2 = if (l.mlp) |m| try e.mlpBlock(m, b, rows, l.index) else try e.moeBlock(l.moe.?, b, rows, l.index);
+            try e.t.hcPost(b.x, b.x, g2, b.post, b.comb, wt.world, rows, d, c.hc);
+            for (e.tap_layers, 0..) |tl, slot| if (tl == l.index and b.taps[slot] != 0) try e.t.streamMean(b.x, b.taps[slot], rows, d, c.hc);
+        }
+        try e.t.streamMean(b.x, b.hidden, rows, d, c.hc);
+        try e.t.rmsnorm(b.hidden, d, e.w.norm, b.fnormed, d, b.fxs, rows, d, c.eps);
+        try e.mm(b, b.fnormed, d, b.fxs, e.w.head, b.logits, rows, false);
+        if (prefetch) try e.l2pf.?.join(e.s);
+    }
+
+    /// kdaBlock over a shared window: the projections on every row, then each lane's chain on its state; its rows of the
+    /// projection go to its `proj` (its commit's conv shift reads them there) and the chain's saves to its `scr`.
+    fn kdaShared(e: *Engine, l: *const wt.Layer, b: *const Buffers, segs: []const Seg, rows: usize) !u64 {
+        const c = e.w.cfg;
+        const kw = l.kda.?;
+        const li = e.st.kda_index[l.index];
+        const ll: usize = c.kda_heads / wt.world;
+        const p = e.sproj;
+        try e.mm(b, b.normed, c.hidden, b.xs, kw.proj, p, rows, false);
+        const fa = p + kw.fa_off * bf;
+        const ga = p + kw.ga_off * bf;
+        try e.t.groupSums(fa, e.width, b.xs_fa, rows, 128);
+        try e.mm(b, fa, e.width, b.xs_fa, kw.fb, b.ka, rows, false);
+        try e.t.groupSums(ga, e.width, b.xs_ga, rows, 128);
+        try e.mm(b, ga, e.width, b.xs_ga, kw.gb, b.kg, rows, false);
+        try e.pfSite(l.index, 2);
+        const rec_layer = ll * 128 * 128 * f4;
+        const conv_layer = 3 * 3 * ll * 128 * bf;
+        const out_row = ll * 128 * bf;
+        for (segs) |g| {
+            const st = e.laneState(g.lane);
+            const lp = st.proj + li * max_rows * e.width * bf;
+            try e.copyDev(lp, p + st.row0 * e.width * bf, g.rows * e.width * bf);
+            const rec_half = st.kda_layers * rec_layer;
+            try kern.chain(e.k, e.s, .{
+                .heads = ll,
+                .p = lp,
+                .p_stride = e.width,
+                .b_off = kw.b_off,
+                .a = b.ka + st.row0 * ll * 128 * bf,
+                .a_stride = ll * 128,
+                .g = b.kg + st.row0 * ll * 128 * bf,
+                .g_stride = ll * 128,
+                .conv_state = st.conv + li * conv_layer,
+                .conv_w = kw.conv,
+                .state_in = st.rec + st.cur * rec_half + li * rec_layer,
+                .a_log = kw.a_log,
+                .dt_bias = kw.dt_bias,
+                .norm_w = kw.norm,
+                .eps = c.eps,
+                .lower = c.lower_bound,
+                .rows = g.rows,
+                .out = e.sout + st.row0 * out_row,
+                .state_out = st.rec + (1 - st.cur) * rec_half + li * rec_layer,
+                .k_save = st.scr.k + li * max_rows * ll * 128 * f4,
+                .v_save = st.scr.v + li * max_rows * ll * 128 * bf,
+                .g_save = st.scr.g + li * max_rows * ll * 128 * f4,
+                .b_save = st.scr.b + li * max_rows * ll * f4,
+                .q_tmp = b.q_tmp,
+                .y_tmp = b.y_tmp,
+            });
+        }
+        try e.t.groupSums(e.sout, ll * 128, b.kxs, rows, ll * 128);
+        return e.outProj(b, e.sout, b.kxs, kw.o, rows, .{ l.index, 0 });
+    }
+
+    /// dsaBlock over a shared window: the projections, norms and the latent absorb on every row; each lane's latent and
+    /// indexer writes, token selection and attention on its own caches, positions and row count.
+    fn dsaShared(e: *Engine, l: *const wt.Layer, b: *Buffers, segs: []const Seg, rows: usize) !u64 {
+        const c = e.w.cfg;
+        const a = l.dsa.?;
+        const hl: usize = c.mla_heads / wt.world;
+        const qk: usize = c.nope;
+        const lw: usize = c.kv_lora;
+        const dense_limit = denseLimit(e.w);
+        const di = e.st.dsa_index[l.index];
+        try e.mm(b, b.normed, c.hidden, b.xs, a.proj, b.dp, rows, false);
+        const qkv = c.q_lora + c.kv_lora;
+        try e.t.rmsnorm(b.dp, qkv, a.q_norm, b.qr, c.q_lora, b.xs_qr, rows, c.q_lora, c.eps);
+        try e.t.rmsnorm(b.dp + c.q_lora * bf, qkv, a.kv_norm, b.lat, c.kv_lora, b.xs_lat, rows, c.kv_lora, c.eps);
+        try e.mm(b, b.qr, c.q_lora, b.xs_qr, a.q_b, b.q, rows, false);
+        var any_sparse = false;
+        for (segs) |g| {
+            const st = e.laneState(g.lane);
+            if (st.long_context and st.pos + g.rows - 1 >= dense_limit) any_sparse = true;
+        }
+        const ix = a.index;
+        const iw = c.i_dim + c.i_heads;
+        if (e.st.long_context) {
+            try e.mm(b, b.normed, c.hidden, b.xs, ix.kw, b.ikr, rows, false);
+            try e.t.router(b.normed, c.hidden, ix.gate, b.rpart, b.igr, rows, c.hidden, c.i_dim);
+        }
+        for (segs) |g| {
+            const st = e.laneState(g.lane);
+            try e.t.latentWrite(b.lat + st.row0 * lw * bf, c.kv_lora, st.kc[di], st.pos_dev, g.rows, lw);
+            if (st.long_context) {
+                const ix3 = st.index[di];
+                try e.t.indexUpdate(b.ikr + st.row0 * iw * bf, iw, b.igr + st.row0 * c.i_dim * f4, ix.ln_w, ix.ln_b, ix.ape, ix3[0], ix3[1], ix3[2], st.pos_dev, g.rows, e.index_ring);
+            }
+        }
+        try e.t.absorbQ(b.q, a.wk, b.qa, rows, hl, qk, lw);
+        try e.pfSite(l.index, 2);
+        if (any_sparse) try e.mm(b, b.qr, c.q_lora, b.xs_qr, ix.qb, b.qi, rows, false);
+        const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(qk), -0.5));
+        const qa_row = hl * lw * bf;
+        for (segs) |g| {
+            const st = e.laneState(g.lane);
+            const host_pos = st.pos;
+            const r = g.rows;
+            const r0 = st.row0;
+            const all_sparse = host_pos >= dense_limit;
+            const sparse_rows = st.long_context and (all_sparse or host_pos + r - 1 >= dense_limit);
+            if (!all_sparse) {
+                const sc = b.lat_s;
+                const lat_nch = tri.chunksFor(@min(st.capacity, 2560) + b.rows);
+                const nch = lat_nch; // every chunk, as the lane's own captured windows run (dsaBlock under `capturing`)
+                const dense = if (sparse_rows and host_pos < dense_limit) @min(r, dense_limit - host_pos) else r;
+                const blocks = (dense + sc.part_rows - 1) / sc.part_rows;
+                var at: [Buffers.pos_slots]u64 = undefined;
+                try e.blockPositions(b, st.pos_dev, host_pos, sc.part_rows, blocks, &at);
+                try e.t.denseAttention(b.qa + r0 * qa_row, st.kc[di], at[0..blocks], sc, b.ol + r0 * qa_row, dense, r, hl, lw, nch, scale);
+            }
+            if (sparse_rows) {
+                const np = tri.poolBucket(host_pos, r, e.np_max);
+                const tok = b.tokens + r0 * tri.select_width * 4;
+                const cnt = b.counts + r0 * 4;
+                try e.t.selectDecode(b.qi + r0 * c.i_heads * c.i_dim * bf, b.ikr + r0 * iw * bf + c.i_dim * bf, iw, st.index[di][2], st.pos_dev, b.scores, b.pools, b.split, tok, cnt, r, np, c.i_heads, c.i_dim);
+                try e.t.sparseAttention(b.qa + r0 * qa_row, st.kc[di], tok, cnt, b.ol + r0 * qa_row, b.spo, b.spm, b.spl, r, hl, lw, tri.select_width, scale);
+            }
+        }
+        try e.t.expandV(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw);
+        try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
+        return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
     }
 
     /// forward.commit: keep the last decode window's first `keep` rows.
