@@ -80,9 +80,35 @@ const Glm = struct {
         g.pending_rows = 0;
     }
 
+    /// Each row's draw over the whole vocabulary (Node.whole_vocabulary): nucleus_rows for top_k off, else
+    /// choose_rows over every token (top_k past the candidates a rank gives). Row r keyed at position0 + r.
+    fn chooseWhole(g: *Glm, sm: lanes.sampling.Sampling, rows: usize, position0: u64, out: []u32) !void {
+        const host = g.n.e.full_host;
+        const n = g.n.e.w.head.n;
+        const row = try g.gpa.alloc(u16, 2 * n);
+        defer g.gpa.free(row);
+        for (0..rows) |r| {
+            for (0..2) |rank| @memcpy(row[rank * n ..][0..n], host[(rank * rows + r) * n ..][0..n]);
+            if (sm.top_k == 0) {
+                out[r] = try nucleus(g.gpa, row, position0 + r, sm);
+                continue;
+            }
+            const values = try g.gpa.alloc(f64, 2 * n);
+            defer g.gpa.free(values);
+            const ids = try g.gpa.alloc(u64, 2 * n);
+            defer g.gpa.free(ids);
+            for (row, values, ids, 0..) |b, *v, *id, i| {
+                v.* = bf16Value(b);
+                id.* = i;
+            }
+            out[r] = @intCast(try lanes.sampling.choose(g.gpa, values, ids, position0 + r, sm));
+        }
+    }
+
     /// Each row's draw among the gathered candidates (exact_sampling.choose_rows), row r keyed at position0 + r.
     fn choose(g: *Glm, s: *lanes.Stream, k: usize, rows: usize, position0: u64, out: []u32) !void {
         const sm = s.sampling.?;
+        if (k == Node.whole_vocabulary) return g.chooseWhole(sm, rows, position0, out);
         const host = &g.n.e.cand_host;
         var values: [2 * fwd.Engine.max_k]f64 = undefined;
         var ids: [2 * fwd.Engine.max_k]u64 = undefined;
@@ -248,11 +274,98 @@ const Glm = struct {
 };
 
 /// A stream's candidates a rank (top_k + MARGIN); 0 for greedy. top_k 0 (the full-vocabulary nucleus) is not ported.
+/// k candidates a rank (top_k + exact_sampling.MARGIN), 0 for greedy, or the whole vocabulary: top_k off
+/// (sampling.nucleus_rows) or past the candidates a rank gives.
 fn candidateCount(s: *const lanes.Stream) !usize {
     const sm = s.sampling orelse return 0;
     if (sm.temperature <= 0) return 0;
-    if (sm.top_k == 0) return error.SamplingNotPorted;
-    return @min(@as(usize, sm.top_k) + 8, fwd.Engine.max_k);
+    const k = @as(usize, sm.top_k) + 8;
+    if (sm.top_k == 0 or k > fwd.Engine.max_k) return Node.whole_vocabulary;
+    return k;
+}
+
+/// sampling.nucleus_rows for one row over the whole vocabulary `row` (bf16 bits by token id). Python reads each
+/// rank's top 1,024 first and every whole shard when a row's nucleus runs past them, so its draw is this one: tokens
+/// by (value desc, id asc) with v = logit / T in float64, mass floor(exp(v - top) 2^40); keep through the first whose
+/// cumulative mass reaches ceil(top_p total) (top_p in (0, 1)), then v >= top + ln(min_p); the Gumbel race
+/// v - ln(-ln u(seed, position, id)) among them, first maximum. Tokens 42 or more below the top are left out: their
+/// mass is 0 (below 2^-40) and their race score stays under the top token's (the race's noise spans 41.1).
+fn nucleus(gpa: std.mem.Allocator, row: []const u16, position: u64, s: lanes.sampling.Sampling) !u32 {
+    const t = @max(s.temperature, 1e-6);
+    var top = -std.math.inf(f64);
+    for (row) |b| top = @max(top, bf16Value(b) / t);
+    const C = struct { v: f64, id: u32, mass: u64 };
+    var cands: std.ArrayList(C) = .empty;
+    defer cands.deinit(gpa);
+    var total: u64 = 0;
+    for (row, 0..) |b, i| {
+        const v = bf16Value(b) / t;
+        const mass: u64 = @intFromFloat(@floor(libm_exp(v - top) * 0x1p40));
+        total += mass;
+        if (v >= top - 42.0) try cands.append(gpa, .{ .v = v, .id = @intCast(i), .mass = mass });
+    }
+    std.mem.sort(C, cands.items, {}, struct {
+        fn lt(_: void, a: C, b: C) bool {
+            return a.v > b.v or (a.v == b.v and a.id < b.id);
+        }
+    }.lt);
+    var keep = cands.items.len;
+    if (s.top_p > 0.0 and s.top_p < 1.0) {
+        const need = ceilShare(s.top_p, total);
+        var cum: u64 = 0;
+        var below: usize = 0;
+        for (cands.items) |c| {
+            cum += c.mass;
+            if (cum < need) below += 1 else break;
+        }
+        keep = @min(keep, below + 1);
+    }
+    if (s.min_p > 0.0) {
+        const floor = top + s.minLog();
+        var n: usize = 0;
+        for (cands.items) |c| {
+            if (c.v >= floor) n += 1;
+        }
+        keep = @min(keep, n);
+    }
+    var best: usize = 0;
+    var best_score = -std.math.inf(f64);
+    for (cands.items[0..keep], 0..) |c, j| {
+        const score = c.v - libm_log(-libm_log(lanes.sampling.uniform(s.seed, position, c.id)));
+        if (j == 0 or score > best_score) {
+            best = j;
+            best_score = score;
+        }
+    }
+    return cands.items[best].id;
+}
+
+extern "c" fn exp(x: f64) f64;
+extern "c" fn log(x: f64) f64;
+const libm_exp = exp;
+const libm_log = log;
+
+fn bf16Value(b: u16) f64 {
+    return @as(f32, @bitCast(@as(u32, b) << 16));
+}
+
+/// ceil(Fraction(p) * total) exactly: p's double as m 2^-s.
+fn ceilShare(p: f64, total: u64) u64 {
+    const f = std.math.frexp(p); // p = f.significand 2^f.exponent, significand in [0.5, 1)
+    const m: u128 = @intFromFloat(std.math.ldexp(f.significand, 53));
+    const shift: i32 = 53 - f.exponent;
+    const prod = m * total;
+    if (shift <= 0) return @intCast(prod << @intCast(-shift));
+    if (shift >= 128) return @intFromBool(prod > 0);
+    const sh: u7 = @intCast(shift);
+    return @intCast((prod + ((@as(u128, 1) << sh) - 1)) >> sh);
+}
+
+test "ceilShare is ceil(p * total) over the double's exact value" {
+    try std.testing.expectEqual(@as(u64, 95), ceilShare(0.95, 100)); // 0.95's double sits just below 0.95
+    try std.testing.expectEqual(@as(u64, 50), ceilShare(0.5, 100));
+    try std.testing.expectEqual(@as(u64, 1), ceilShare(0.5, 1));
+    try std.testing.expectEqual(@as(u64, 0), ceilShare(0.5, 0));
 }
 
 fn now(io: std.Io) i96 {
@@ -282,7 +395,6 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
-        error.SamplingNotPorted => "this build of the GLM CUDA engine samples with top_k 1 to 1016 only: send top_k (or temperature 0)",
         error.OneStreamAtATime => "this build of the GLM CUDA engine serves one request at a time",
         else => null,
     };

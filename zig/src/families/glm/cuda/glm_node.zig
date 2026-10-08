@@ -99,7 +99,7 @@ pub const Node = struct {
     /// Rank 0: the command's words to rank 1 (kind, count, then the words).
     fn send(n: *Node, kind: Kind, words: []const u32) !void {
         if (n.rank != 0) return;
-        const head = [2]u32{ @intFromEnum(kind), @intCast(words.len) };
+        const head = [2]u32{ @backingInt(kind), @intCast(words.len) };
         try n.pair.send(std.mem.sliceAsBytes(&head));
         try n.pair.send(std.mem.sliceAsBytes(words));
     }
@@ -126,7 +126,14 @@ pub const Node = struct {
         _ = try n.pick(n.e.buf.logits, rows.len, k, out);
     }
 
+    /// A `k` asking for every rank's whole logits rows (Engine.fullRows) instead of k candidates a rank.
+    pub const whole_vocabulary: usize = Engine.max_k + 1;
+
     fn pick(n: *Node, logits: u64, rows: usize, k: usize, out: ?[]u32) !u32 {
+        if (k == whole_vocabulary) {
+            _ = try n.e.fullRows(logits, rows);
+            return 0;
+        }
         if (k > 0) {
             try n.e.candidates(&n.e.buf, logits, rows, k);
             return 0;
@@ -146,7 +153,7 @@ pub const Node = struct {
     /// Absorb (hidden row, following token) pairs and draft `out.len` tokens.
     pub fn draft(n: *Node, from: From, next: []const u32, out: []u32) !void {
         n.words.clearRetainingCapacity();
-        try n.words.appendSlice(n.gpa, &.{ @intFromEnum(from), @intCast(out.len) });
+        try n.words.appendSlice(n.gpa, &.{ @backingInt(from), @intCast(out.len) });
         try n.words.appendSlice(n.gpa, next);
         try n.send(.draft, n.words.items);
         const hidden = switch (from) {
@@ -174,11 +181,11 @@ pub const Node = struct {
             try buf.resize(n.gpa, head[1]);
             try n.pair.recv(std.mem.sliceAsBytes(buf.items));
             const w = buf.items;
-            switch (@as(Kind, @enumFromInt(head[0]))) {
+            switch (@as(Kind, @fromBackingInt(@intCast(head[0])))) {
                 .prefill => _ = try n.prefill(w[2..], w[0] != 0, w[1]),
                 .verify => try n.verify(w[1..], w[0], scratch[0 .. w.len - 1]),
                 .keep => try n.keep(w[0], w[1]),
-                .draft => try n.draft(@enumFromInt(w[0]), w[2..], scratch[0..w[1]]),
+                .draft => try n.draft(@fromBackingInt(@intCast(w[0])), w[2..], scratch[0..w[1]]),
                 .quit => return,
             }
         }

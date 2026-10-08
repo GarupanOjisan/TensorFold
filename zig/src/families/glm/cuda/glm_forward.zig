@@ -279,6 +279,9 @@ pub const Engine = struct {
     last_hidden: u64, // and its final-normed hidden row, the first draft's input
     draft_head: kern.Q4, // weights.draft_head: the head quantized to 4 bits, read by draft steps only
     draft_mem: cuda.DeviceBuffer,
+    /// Both ranks' logits rows for a draw over the whole vocabulary: [rank][row][head.n] bf16, on the device and here.
+    full_dev: cuda.DeviceBuffer,
+    full_host: []u16,
     /// The last `candidates` call's gathered pairs: [rank][row][k] of (fp32 value bits, token).
     cand_host: [wt.world * max_rows * 2 * max_k]u32 = undefined,
     /// Captured decode windows and MTP steps (graphs.py), found by key; TF_GLM_GRAPHS=0 runs everything eagerly.
@@ -362,6 +365,9 @@ pub const Engine = struct {
             e.draft_head = try kern.quantize4(k, s, w.head.ptr, w.head.n, w.head.k, e.draft_mem.ptr, tmp.ptr);
             try s.synchronize();
         }
+        e.full_dev = try cuda.DeviceBuffer.alloc(d, wt.world * max_rows * w.head.n * bf);
+        errdefer e.full_dev.free();
+        e.full_host = try std.heap.page_allocator.alloc(u16, wt.world * max_rows * w.head.n);
         e.use_graphs = if (std.c.getenv("TF_GLM_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         return e;
     }
@@ -379,6 +385,8 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
         e.draft_mem.free();
+        e.full_dev.free();
+        std.heap.page_allocator.free(e.full_host);
         e.mem.free();
     }
 
@@ -777,6 +785,16 @@ pub const Engine = struct {
         try e.comm.lib.check(e.comm.lib.api.ncclAllGather(b.cand, b.cand_all, n, .u32, e.comm.comm, e.s.handle), "ncclAllGather");
         try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(&e.cand_host, b.cand_all, wt.world * n * 4, e.s.handle), "cuMemcpyDtoHAsync");
         try e.s.synchronize();
+    }
+
+    /// nucleus_rows' gather of whole shards: every rank's `rows` logits rows into full_host, [rank][row][head.n].
+    pub fn fullRows(e: *Engine, logits: u64, rows: usize) ![]const u16 {
+        if (rows > max_rows) return error.WindowTooWide;
+        const n = rows * e.w.head.n;
+        try e.comm.lib.check(e.comm.lib.api.ncclAllGather(logits, e.full_dev.ptr, n, .bf16, e.comm.comm, e.s.handle), "ncclAllGather");
+        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.full_host.ptr, e.full_dev.ptr, wt.world * n * bf, e.s.handle), "cuMemcpyDtoHAsync");
+        try e.s.synchronize();
+        return e.full_host[0 .. wt.world * n];
     }
 
     /// sample_rows, greedy: each rank's row maximum (first column on ties), gathered; the larger value wins, the
