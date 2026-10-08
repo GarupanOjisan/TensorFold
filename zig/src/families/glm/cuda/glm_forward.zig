@@ -7,6 +7,7 @@ const wt = @import("glm_weights.zig");
 const tri = @import("glm_triton.zig");
 const kern = @import("glm_kernels.zig");
 const l2pf = @import("glm_l2pf.zig");
+const roce_mod = @import("glm_roce.zig");
 
 const Weights = wt.Weights;
 const Mat = wt.Mat;
@@ -18,8 +19,12 @@ const f4 = 4;
 pub const Comm = struct {
     lib: *const cuda.nccl.Library,
     comm: cuda.nccl.Comm,
+    roce: ?*roce_mod.Roce = null,
 
+    /// Small gathers (up to TF_ROCE_MAX_KB a rank, a multiple of 16 bytes) over RoCE when it is up, the rest through NCCL; the
+    /// choice is by byte count alone, which both ranks' matching calls share.
     pub fn allGather(c: Comm, s: cuda.Stream, send: u64, recv: u64, count: usize) !void {
+        if (c.roce) |r| if (r.fits(count * 4) and send % 16 == 0 and recv % 16 == 0) return r.gather(s, send, recv, count * 4);
         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, .f32, c.comm, s.handle), "ncclAllGather");
     }
 };
@@ -1024,11 +1029,12 @@ pub const Engine = struct {
         a.add(@as(i32, @intCast(e.w.rank * e.w.head.n)));
         a.add(b.greedy);
         try cuda.launch.launch(e.k.greedy, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.s, &a);
-        try e.comm.lib.check(e.comm.lib.api.ncclAllGather(b.greedy, b.greedy_all, rows * 2, .u32, e.comm.comm, e.s.handle), "ncclAllGather");
+        try e.comm.allGather(e.s, b.greedy, b.greedy_all, rows * 2);
         var host: [wt.world * max_rows * 2]u32 = undefined;
         const n = wt.world * rows * 2;
         try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(&host, b.greedy_all, n * 4, e.s.handle), "cuMemcpyDtoHAsync");
         try e.s.synchronize();
+        if (e.comm.roce) |r| try r.check();
         for (0..rows) |r| {
             var best_v: f32 = -std.math.inf(f32);
             var best_t: u32 = std.math.maxInt(u32);

@@ -189,3 +189,20 @@ Acceptance: `tf-glm check` against the production-setting captures `v18a` (6 pro
 - Sampled replies (temperature 1, top_p 0.95, seed 11) of the 13 benchmark prompts equal v1.10's, with top_k 20 (default) and with `top_k: 0`, and with the union rule off.
   Native, top_k 0, tok/s: union on / off: story 42.4 / 33.0, code 59.9 / 45.7, facts 48.0 / 37.0, cenc 125.3 / 82.8; v1.10: 42.9, 59.2, 48.9, 120.8.
 
+## 12. RoCE all-gathers (v1.8 patch 0006, ABI 5 of v1.10; TF_GLM_COMM, TF_ROCE_MAX_KB)
+
+- `glm_roce.zig` + `glm_roce.cu` + `roce_proxy.c`: a gather of up to `TF_ROCE_MAX_KB` (512) KiB a rank whose size is a multiple of 16 bytes is one kernel that writes the rank's shard into
+  pinned host memory, which the ConnectX-7 RDMA-writes to the peer (the proxy thread of b12x's "RoCEnante", `roce_proxy.c` as v1.10 ships it, Apache-2.0), then spins on
+  the peer's flags and copies the shards out in rank order; larger gathers go through NCCL. The device-side epoch lets CUDA graphs replay it. Same layout, same bits.
+- libibverbs is opened by dlopen: `roce_dl.c` defines the 17 `ibv_*` entry points the proxy calls and resolves each from `libibverbs.so.1` at its first call, so the
+  binaries link nothing new (`ldd` shows libc only) and a machine without rdma-core runs on NCCL. The rest of the transport is Zig: the region (`HostBuffer.allocMapped`),
+  the HCAs (`TF_ROCE_HCA`, else `NCCL_IB_HCA`, the first two), the GID index (`TF_ROCE_GID_INDEX`, else `NCCL_IB_GID_INDEX`, 3), the connection blobs and verdicts swapped over the
+  ranks' TCP pair, the GPU wait limit `TF_ROCE_WAIT_S` (default 300 s, since the ranks load weights on their own).
+- `TF_GLM_COMM`: unset or `auto` (the server): RoCE when it sets up on both ranks, else NCCL with a warning; `roce`: required; `nccl`: off. `tf-glm check` runs on NCCL unless
+  `TF_GLM_COMM=roce`. `Comm.allGather` decides by byte count, which the matching call on the other rank shares; the row maxima's gather of `greedy` goes this way too.
+- `tf-glm check` against the v1.10 references with `TF_GLM_COMM=roce` (DFlash2, copies): w1 12, w2 14, w3 2, w4 88 PASS; w1 with the MTP head 12 PASS.
+- Native, DFlash2 + copies, greedy, one session (tok/s, NCCL / RoCE; two runs each): cedit 101.7, 101.3 / 105.1, 105.8; quote 135.4, 132.8 / 137.9, 138.2; story 43.0, 43.1 / 46.1, 46.6;
+  code 85.5, 86.6 / 87.4, 88.0; facts 56.1, 56.8 / 59.1, 59.5; json 83.0, 83.7 / 87.0, 86.5; long 52.0, 52.7 / 54.6, 54.6; huge 65.1, 66.1 / 68.3, 68.1.
+  The eager block pass (`TF_GLM_DF_PROF=1`) goes from 5.9 to 3.2 ms (the o and down projections' gathers 1.83 + 1.64 -> 0.36 + 0.58); the captured block's startup
+  timing from 3.8-4.1 to 3.5-3.8 ms (v1.10: 3.0), a graph having hidden most of NCCL's launch cost already.
+

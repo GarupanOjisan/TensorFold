@@ -18,6 +18,7 @@ const dec = @import("glm_decode.zig");
 const node = @import("glm_node.zig");
 const copy = @import("glm_copy.zig");
 const dflash = @import("glm_dflash.zig");
+const roce_mod = @import("glm_roce.zig");
 
 const Opts = struct {
     model: []const u8 = "",
@@ -116,6 +117,9 @@ pub fn main(init: std.process.Init) !u8 {
     var k = try kern.Kernels.load(&driver);
     defer k.deinit();
     var t0 = now(io);
+    const comm_mode = try roce_mod.mode(.nccl); // the check runs on NCCL unless TF_GLM_COMM asks for RoCE
+    const roce: ?*roce_mod.Roce = if (comm_mode == .nccl) null else roce_mod.Roce.init(gpa, &driver, &k, pair, o.rank, roce_mod.maxBytes()) catch |err| if (comm_mode == .roce) return err else null;
+    defer if (roce) |r| r.deinit();
     var w = try wt.load(gpa, io, &driver, .{ .d = &driver, .s = stream }, &k, o.model, cfg, o.rank, o.drafter == null);
     defer w.deinit(gpa);
     if (o.drafter) |dd| try wt.loadDraft(gpa, io, &driver, .{ .d = &driver, .s = stream }, &k, &w, dd, o.rank, true);
@@ -124,7 +128,7 @@ pub fn main(init: std.process.Init) !u8 {
     var set = try cuda.aot.Set.load(gpa, io, &driver, ctx.device, kernels_dir);
     defer set.deinit();
     const long_context = o.context > fwd.denseLimit(&w);
-    var e = try fwd.Engine.init(&w, &driver, stream, .{ .set = &set, .s = stream }, &k, .{ .lib = &lib, .comm = comm }, o.context + fwd.Engine.max_rows, long_context, if (w.draft) |dr| dr.taps else null);
+    var e = try fwd.Engine.init(&w, &driver, stream, .{ .set = &set, .s = stream }, &k, .{ .lib = &lib, .comm = comm, .roce = roce }, o.context + fwd.Engine.max_rows, long_context, if (w.draft) |dr| dr.taps else null);
     defer e.deinit();
     var drafter: ?dflash.Drafter = if (w.draft != null) try dflash.Drafter.init(gpa, &driver, &w, o.context + fwd.Engine.max_rows) else null;
     defer if (drafter) |*dr| dr.deinit();

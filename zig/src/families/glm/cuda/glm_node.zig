@@ -10,6 +10,7 @@ const kern = @import("glm_kernels.zig");
 const fwd = @import("glm_forward.zig");
 const dec = @import("glm_decode.zig");
 const dflash = @import("glm_dflash.zig");
+const roce_mod = @import("glm_roce.zig");
 
 const Engine = fwd.Engine;
 
@@ -42,6 +43,7 @@ pub const Node = struct {
     words: std.ArrayList(u32) = .empty,
     prompt: std.ArrayList(u32) = .empty, // the prompt `begin` started, which `chunk` reads
     mtp: bool = false,
+    roce: ?*roce_mod.Roce = null,
     dflash: ?dflash.Drafter = null,
     snaps: std.AutoHashMapUnmanaged(u32, cuda.DeviceBuffer) = .empty, // kept prompt states by id, this rank's half
 
@@ -93,6 +95,15 @@ pub const Node = struct {
         const cfg = try glm_config.parse(gpa, cfg_text);
         n.k = try kern.Kernels.load(d);
         errdefer n.k.deinit();
+        n.roce = null;
+        const comm_mode = try roce_mod.mode(.auto);
+        if (comm_mode != .nccl) n.roce = roce_mod.Roce.init(gpa, d, &n.k, n.pair, rank, roce_mod.maxBytes()) catch |err| blk: {
+            if (comm_mode == .roce) return err;
+            std.log.warn("RoCE all-gather unavailable ({t}); NCCL carries every gather (TF_GLM_COMM=nccl silences this)", .{err});
+            break :blk null;
+        };
+        errdefer if (n.roce) |r| r.deinit();
+        if (n.roce != null) std.log.info("RoCE all-gathers up to {d} KiB a rank; larger ones over NCCL (TF_GLM_COMM, TF_ROCE_MAX_KB)", .{roce_mod.maxBytes() >> 10});
         const draft_dir = drafterDir();
         n.w = try wt.load(gpa, io, d, .{ .d = d, .s = n.stream }, &n.k, dir, cfg, rank, draft_dir == null); // DFlash2 and the MTP head are not loaded together (TF_GLM_MTP=auto)
         errdefer n.w.deinit(gpa);
@@ -101,7 +112,7 @@ pub const Node = struct {
         n.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, kernels);
         errdefer n.set.deinit();
         const long_context = context > fwd.denseLimit(&n.w);
-        n.e = try Engine.init(&n.w, d, n.stream, .{ .set = &n.set, .s = n.stream }, &n.k, .{ .lib = &n.lib, .comm = n.comm }, context + Engine.max_rows, long_context, if (n.w.draft) |dr| dr.taps else null);
+        n.e = try Engine.init(&n.w, d, n.stream, .{ .set = &n.set, .s = n.stream }, &n.k, .{ .lib = &n.lib, .comm = n.comm, .roce = n.roce }, context + Engine.max_rows, long_context, if (n.w.draft) |dr| dr.taps else null);
         errdefer n.e.deinit();
         if (n.w.draft != null) n.dflash = try dflash.Drafter.init(gpa, d, &n.w, context + Engine.max_rows);
         return n;
@@ -114,6 +125,7 @@ pub const Node = struct {
         n.prompt.deinit(n.gpa);
         if (n.dflash) |*dr| dr.deinit();
         n.e.deinit();
+        if (n.roce) |r| r.deinit();
         n.k.deinit();
         n.set.deinit();
         n.w.deinit(n.gpa);

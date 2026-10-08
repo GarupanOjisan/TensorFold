@@ -13,7 +13,7 @@ fn int(x: usize) i32 {
 }
 
 pub const Kernels = struct {
-    mods: [12]cuda.Module,
+    mods: [13]cuda.Module,
     chain: cuda.Function,
     prep: cuda.Function,
     step: cuda.Function,
@@ -55,6 +55,7 @@ pub const Kernels = struct {
     plan_scatter: cuda.Function,
     kda_chunk: cuda.Function,
     hc_partial: cuda.Function,
+    roce_gather: cuda.Function, // TF_GLM_COMM=roce (glm_roce.zig)
     l2pf: cuda.Function,
     nuc_stats: cuda.Function, // the top_p nucleus draw's device side (glm_glue.cu)
     nuc_pack: cuda.Function,
@@ -95,6 +96,9 @@ pub const Kernels = struct {
         k.mods[10] = try cuda.Module.load(d, cuda.kernels.glm_hc);
         errdefer k.mods[10].unload();
         k.hc_partial = try k.mods[10].function("_ZN9tf_glm_hc17hc_partial_kernelEPK13__nv_bfloat16S2_Pfi");
+        k.mods[12] = try cuda.Module.load(d, cuda.kernels.glm_roce);
+        errdefer k.mods[12].unload();
+        k.roce_gather = try k.mods[12].function("tf_glm_roce_gather");
         k.mods[11] = try cuda.Module.load(d, cuda.kernels.glm_l2pf);
         errdefer k.mods[11].unload();
         k.l2pf = try k.mods[11].function("_ZN7tf_l2pf11l2pf_kernelEPKxiiPj");

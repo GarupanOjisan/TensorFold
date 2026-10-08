@@ -24,6 +24,7 @@ const kernels = [_]Kernel{
     .{ .name = "glm_kda", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
     .{ .name = "glm_kda_chunk", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda_chunked.py, tensorfold_glm_kda_chunk
     .{ .name = "glm_hc", .flags = &.{"-O3"} }, // glm5_next/cuda/hc.cu, tensorfold_glm_hc_v2
+    .{ .name = "glm_roce", .flags = &.{"-O3"} }, // cuda/roce.cu, the one-shot RoCE all-gather (TF_GLM_COMM=roce)
     .{ .name = "glm_l2pf", .flags = &.{"-O3"} }, // glm5_next/cuda/l2pf.cu, tensorfold_glm_l2pf_v2
     .{ .name = "glm_exl3", .flags = &.{ "-O3", "-lineinfo" } }, // cuda/exl3/experts.py, tensorfold_exl3_experts_v1
     .{ .name = "glm_exl3d", .flags = &.{"-O3"} }, // glm5_next/cuda/exl3.cu [v1.8], tensorfold_glm_exl3_v20
@@ -208,6 +209,7 @@ fn glmCheck(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
     main.addImport("cuda", cuda);
     main.addImport("core", core);
     main.addImport("glm_config", config);
+    roceSources(b, main);
     return b.addExecutable(.{ .name = "tf-glm", .root_module = main });
 }
 
@@ -219,5 +221,12 @@ fn glmNative(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     m.addImport("core", core);
     m.addImport("lanes", lanes);
     m.addImport("glm_config", config);
+    roceSources(b, m);
     return m;
+}
+
+/// The RoCE proxy thread (b12x's roce_proxy.c, as TensorFold v1.10 ships it) and its libibverbs-by-dlopen entry points.
+fn roceSources(b: *std.Build, m: *std.Build.Module) void {
+    m.addCSourceFile(.{ .file = b.path("zig/src/families/glm/cuda/roce_proxy.c"), .flags = &.{ "-O2", "-std=gnu11" } });
+    m.addCSourceFile(.{ .file = b.path("zig/src/families/glm/cuda/roce_dl.c"), .flags = &.{ "-O2", "-std=gnu11" } });
 }

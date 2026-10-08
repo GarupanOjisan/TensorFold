@@ -34,6 +34,7 @@ pub const torch_nemotron_constants: []const u8 = if (available) &Blob("fatbin_to
 pub const glm_kda: []const u8 = if (available) &Blob("fatbin_glm_kda").bytes else &.{};
 pub const glm_kda_chunk: []const u8 = if (available) &Blob("fatbin_glm_kda_chunk").bytes else &.{};
 pub const glm_hc: []const u8 = if (available) &Blob("fatbin_glm_hc").bytes else &.{};
+pub const glm_roce: []const u8 = if (available) &Blob("fatbin_glm_roce").bytes else &.{};
 pub const glm_l2pf: []const u8 = if (available) &Blob("fatbin_glm_l2pf").bytes else &.{};
 pub const glm_exl3: []const u8 = if (available) &Blob("fatbin_glm_exl3").bytes else &.{};
 pub const glm_exl3d: []const u8 = if (available) &Blob("fatbin_glm_exl3d").bytes else &.{};
