@@ -300,9 +300,11 @@ fn nucleus(gpa: std.mem.Allocator, row: []const u16, position: u64, s: lanes.sam
     var total: u64 = 0;
     for (row, 0..) |b, i| {
         const v = bf16Value(b) / t;
-        const mass: u64 = @intFromFloat(@floor(libm_exp(v - top) * 0x1p40));
+        if (v < top - 42.0) continue;
+        // floor(exp(d) 2^40) is 0 below d = -40 ln 2 (-27.7): no exp for those
+        const mass: u64 = if (v - top < -28.0) 0 else @intFromFloat(@floor(libm_exp(v - top) * 0x1p40));
         total += mass;
-        if (v >= top - 42.0) try cands.append(gpa, .{ .v = v, .id = @intCast(i), .mass = mass });
+        try cands.append(gpa, .{ .v = v, .id = @intCast(i), .mass = mass });
     }
     std.mem.sort(C, cands.items, {}, struct {
         fn lt(_: void, a: C, b: C) bool {
