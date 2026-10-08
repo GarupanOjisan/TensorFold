@@ -249,6 +249,7 @@ pub const KdaScratch = struct { out: u64, k: u64, v: u64, g: u64, b: u64 };
 
 /// A captured graph's key: which head, window rows, the KDA state half it reads (main only), pool bucket (0: dense).
 pub const GraphKey = struct {
+    lane: u8,
     head: Head,
     rows: u8,
     cur: u8,
@@ -398,9 +399,63 @@ pub const State = struct {
     mtp_kc: u64,
     index: [16][3]u64 = undefined, // ik, ig [capacity, 128], pk [capacity/4 + 2, 128] bf16; the MTP layer's last
     long_context: bool,
+    kv_fp8: bool, // the latent caches and pooled keys as e4m3 rows with a scale each (Engine.kv_fp8)
+    last_logits: u64 = 0, // a prompt's last row's logits, kept past the MTP absorb that reuses pbuf
+    last_hidden: u64 = 0, // and its final-normed hidden row, the first draft's input
 
     pub fn recBytes(st: *const State, ll: usize) usize {
         return st.kda_layers * ll * 128 * 128 * f4;
+    }
+
+    /// One sequence's state for `w`'s layers, carved out of `a` (a.size 0: count only).
+    fn carveIn(a: *Arena, w: *const Weights, capacity: usize, long_context: bool, kv_fp8: bool) State {
+        const c = w.cfg;
+        const ll: usize = c.kda_heads / wt.world;
+        const width = 3 * ll * 128 + 2 * 128 + ll;
+        var st: State = .{ .capacity = capacity, .pos_dev = 0, .mtp_pos_dev = 0, .kda_layers = 0, .dsa_layers = 0, .conv = 0, .rec = 0, .proj = 0, .scr = undefined, .scr_rows = Engine.max_rows, .mtp_kc = 0, .long_context = long_context, .kv_fp8 = kv_fp8 };
+        for (w.layers) |l| switch (l.kind) {
+            .kda => {
+                st.kda_index[l.index] = @intCast(st.kda_layers);
+                st.kda_layers += 1;
+            },
+            .mla => {
+                st.dsa_index[l.index] = @intCast(st.dsa_layers);
+                st.dsa_layers += 1;
+            },
+        };
+        const n_kda = st.kda_layers;
+        const mr = Engine.max_rows;
+        st.pos_dev = a.take(16);
+        st.mtp_pos_dev = a.take(16);
+        st.conv = a.take(n_kda * 3 * 3 * ll * 128 * bf);
+        st.rec = a.take(2 * n_kda * ll * 128 * 128 * f4);
+        st.proj = a.take(n_kda * mr * width * bf);
+        st.scr = .{ .out = a.take(n_kda * mr * ll * 128 * bf), .k = a.take(n_kda * mr * ll * 128 * f4), .v = a.take(n_kda * mr * ll * 128 * bf), .g = a.take(n_kda * mr * ll * 128 * f4), .b = a.take(n_kda * mr * ll * f4) };
+        for (0..st.dsa_layers) |i| st.kc[i] = a.take(capacity * st.latentRow(c));
+        st.mtp_kc = a.take(capacity * st.latentRow(c));
+        st.last_logits = a.take(w.head.n * bf);
+        st.last_hidden = a.take(c.hidden * bf);
+        if (long_context) for (0..st.dsa_layers + 1) |i| {
+            st.index[i] = .{ a.take(capacity * c.i_dim * bf), a.take(capacity * c.i_dim * bf), a.take((capacity / 4 + 2) * st.pooledRow(c)) };
+        };
+        return st;
+    }
+
+    /// A latent cache row's bytes (kv8.row_bytes with fp8).
+    fn latentRow(st: *const State, c: anytype) usize {
+        return if (st.kv_fp8) c.kv_lora + 16 else c.kv_lora * bf;
+    }
+
+    /// A pooled key row's bytes.
+    fn pooledRow(st: *const State, c: anytype) usize {
+        return if (st.kv_fp8) c.i_dim + 16 else c.i_dim * bf;
+    }
+
+    /// carveIn's bytes, its alignment included.
+    fn bytes(w: *const Weights, capacity: usize, long_context: bool, kv_fp8: bool) usize {
+        var count: Arena = .{ .base = 0, .size = 0 };
+        _ = carveIn(&count, w, capacity, long_context, kv_fp8);
+        return count.used + 256;
     }
 };
 
@@ -418,8 +473,12 @@ pub const Engine = struct {
     mem: cuda.DeviceBuffer,
     width: usize,
     np_max: usize,
-    last_logits: u64, // a prompt's last row's logits, kept past the MTP absorb that reuses pbuf
-    last_hidden: u64, // and its final-normed hidden row, the first draft's input
+    /// Every lane's state but the bound one's, which `st` holds (bind swaps them); lane 0 lives in `mem`, the others
+    /// in `lane_mem` from `addLanes`.
+    lanes: [max_lanes]State = undefined,
+    lane_mem: [max_lanes]cuda.DeviceBuffer = undefined,
+    n_lanes: usize = 1,
+    lane: u8 = 0,
     draft_head: kern.Q4, // weights.draft_head: the head quantized to 4 bits, read by draft steps only
     /// Both ranks' logits rows for a draw over the whole vocabulary: [rank][row][head.n] bf16, on the device and here.
     full_dev: cuda.DeviceBuffer,
@@ -472,7 +531,9 @@ pub const Engine = struct {
     pub const mtp_rows = 8; // engine.MTP_ROWS: rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
     /// Windows of 1..8 and `wide_graph` rows x 2 KDA parities and MTP steps of 1..8 rows, each dense or at one of ~10 pool
     /// buckets (9 widths x 2 x 11 + 8 x 11 = 286).
-    pub const max_graphs = 352;
+    pub const max_graphs = 352 * max_lanes; // a lane's each (graphs bake in its state's addresses)
+    /// Sequences whose caches are allocated at once (one a stream, idle ones keeping their rows for a later turn).
+    pub const max_lanes = 8;
     /// The most candidates a rank gives a sampled row (top_k + exact_sampling.MARGIN).
     pub const max_k = 1024;
     pub const prefill_rows = 2048; // geometry.PREFILL_ROWS
@@ -491,22 +552,7 @@ pub const Engine = struct {
         const ll: usize = c.kda_heads / wt.world;
         const width = 3 * ll * 128 + 2 * 128 + ll;
         const np_max = capacity / 4;
-        var n_kda: usize = 0;
-        var n_dsa: usize = 0;
         var e: Engine = undefined;
-        e.st = .{ .capacity = capacity, .pos_dev = 0, .mtp_pos_dev = 0, .kda_layers = 0, .dsa_layers = 0, .conv = 0, .rec = 0, .proj = 0, .scr = undefined, .scr_rows = max_rows, .mtp_kc = 0, .long_context = long_context };
-        for (w.layers) |l| switch (l.kind) {
-            .kda => {
-                e.st.kda_index[l.index] = @intCast(n_kda);
-                n_kda += 1;
-            },
-            .mla => {
-                e.st.dsa_index[l.index] = @intCast(n_dsa);
-                n_dsa += 1;
-            },
-        };
-        e.st.kda_layers = n_kda;
-        e.st.dsa_layers = n_dsa;
         // count, then allocate once and carve
         var count: Arena = .{ .base = 0, .size = 0 };
         const tap_n: usize = if (taps != null) 5 else 0;
@@ -514,8 +560,7 @@ pub const Engine = struct {
         _ = carve(&count, w, prefill_rows, capacity, true, np_max, tap_n);
         _ = carve(&count, w, mtp_rows, capacity, false, np_max, 0);
         const kv_fp8 = try kvFp8();
-        const state_bytes = stateBytes(w, capacity, n_kda, n_dsa, width, long_context, kv_fp8);
-        const total = count.used + state_bytes + 4096 + (w.head.n + c.hidden) * bf + 1024;
+        const total = count.used + State.bytes(w, capacity, long_context, kv_fp8) + 4096;
         e.mem = try cuda.DeviceBuffer.alloc(d, total);
         errdefer e.mem.free();
         try e.mem.fill8(0, null);
@@ -524,22 +569,9 @@ pub const Engine = struct {
         e.pbuf = carve(&a, w, prefill_rows, capacity, true, np_max, tap_n);
         e.mbuf = carve(&a, w, mtp_rows, capacity, false, np_max, 0);
         e.tap_layers = taps orelse @splat(std.math.maxInt(u32));
-        const st = &e.st;
-        const lat_b: usize = if (kv_fp8) c.kv_lora + 16 else c.kv_lora * bf; // a latent cache row (kv8.row_bytes)
-        const pk_b: usize = if (kv_fp8) c.i_dim + 16 else c.i_dim * bf; // and a pooled key row
-        st.pos_dev = a.take(16);
-        st.mtp_pos_dev = a.take(16);
-        st.conv = a.take(n_kda * 3 * 3 * ll * 128 * bf);
-        st.rec = a.take(2 * n_kda * ll * 128 * 128 * f4);
-        st.proj = a.take(n_kda * max_rows * width * bf);
-        st.scr = .{ .out = a.take(n_kda * max_rows * ll * 128 * bf), .k = a.take(n_kda * max_rows * ll * 128 * f4), .v = a.take(n_kda * max_rows * ll * 128 * bf), .g = a.take(n_kda * max_rows * ll * 128 * f4), .b = a.take(n_kda * max_rows * ll * f4) };
-        for (0..n_dsa) |i| st.kc[i] = a.take(capacity * lat_b);
-        st.mtp_kc = a.take(capacity * lat_b);
-        e.last_logits = a.take(w.head.n * bf);
-        e.last_hidden = a.take(c.hidden * bf);
-        if (long_context) for (0..n_dsa + 1) |i| {
-            st.index[i] = .{ a.take(capacity * c.i_dim * bf), a.take(capacity * c.i_dim * bf), a.take((capacity / 4 + 2) * pk_b) };
-        };
+        e.st = State.carveIn(&a, w, capacity, long_context, kv_fp8);
+        e.n_lanes = 1;
+        e.lane = 0;
         e.w = w;
         e.s = s;
         e.d = d;
@@ -582,17 +614,63 @@ pub const Engine = struct {
         return e;
     }
 
-    fn stateBytes(w: *const Weights, capacity: usize, n_kda: usize, n_dsa: usize, width: usize, long_context: bool, kv_fp8: bool) usize {
-        const c = w.cfg;
-        const ll: usize = c.kda_heads / wt.world;
-        var n: usize = 64 + n_kda * 3 * 3 * ll * 128 * bf + 2 * n_kda * ll * 128 * 128 * f4 + n_kda * max_rows * width * bf;
-        n += n_kda * max_rows * ll * 128 * (bf + f4 + bf + f4) + n_kda * max_rows * ll * f4;
-        n += (n_dsa + 1) * capacity * (if (kv_fp8) c.kv_lora + 16 else c.kv_lora * bf);
-        if (long_context) n += (n_dsa + 1) * (2 * capacity * c.i_dim * bf + (capacity / 4 + 2) * (if (kv_fp8) c.i_dim + 16 else c.i_dim * bf));
-        return n + 64 * 256; // alignment slack
+    // -- lanes ------------------------------------------------------------------------------------------------
+    /// One more lane's device bytes (its caches at this engine's window).
+    pub fn laneBytes(e: *const Engine) usize {
+        return State.bytes(e.w, e.st.capacity, e.st.long_context, e.st.kv_fp8);
+    }
+
+    /// Lanes up to `total` (at most max_lanes), each zeroed: how many there are now. Stops at the first allocation
+    /// that fails, so a short count is not an error.
+    pub fn addLanes(e: *Engine, total: usize) !usize {
+        const want = @min(total, max_lanes);
+        while (e.n_lanes < want) {
+            const size = e.laneBytes();
+            var m = cuda.DeviceBuffer.alloc(e.d, size) catch break;
+            m.fill8(0, null) catch {
+                m.free();
+                break;
+            };
+            var a: Arena = .{ .base = m.ptr, .size = size };
+            e.lane_mem[e.n_lanes] = m;
+            e.lanes[e.n_lanes] = State.carveIn(&a, e.w, e.st.capacity, e.st.long_context, e.st.kv_fp8);
+            e.n_lanes += 1;
+        }
+        return e.n_lanes;
+    }
+
+    /// Makes lane `i`'s state the one every call reads and writes (`st`).
+    pub fn bind(e: *Engine, i: usize) !void {
+        if (i >= e.n_lanes) return error.NoSuchLane;
+        if (i == e.lane) return;
+        e.lanes[e.lane] = e.st;
+        e.st = e.lanes[i];
+        e.lane = @intCast(i);
+    }
+
+    fn laneState(e: *Engine, i: usize) *State {
+        return if (i == e.lane) &e.st else &e.lanes[i];
+    }
+
+    /// Lane `src`'s attention-cache rows below `rows` (every DSA layer's latents, the MTP layer's, and with a long
+    /// context the indexer's keys and pooled keys) into lane `dst`: a kept prompt state then resumes in `dst`.
+    pub fn copyLaneRows(e: *Engine, src: usize, dst: usize, rows: usize) !void {
+        if (src >= e.n_lanes or dst >= e.n_lanes or src == dst) return error.NoSuchLane;
+        const c = e.w.cfg;
+        const a = e.laneState(src);
+        const b = e.laneState(dst);
+        if (rows > a.capacity) return error.PastCacheCapacity;
+        for (0..a.dsa_layers) |i| try e.copyDev(b.kc[i], a.kc[i], rows * a.latentRow(c));
+        try e.copyDev(b.mtp_kc, a.mtp_kc, rows * a.latentRow(c));
+        if (a.long_context) for (0..a.dsa_layers + 1) |i| {
+            try e.copyDev(b.index[i][0], a.index[i][0], rows * c.i_dim * bf);
+            try e.copyDev(b.index[i][1], a.index[i][1], rows * c.i_dim * bf);
+            try e.copyDev(b.index[i][2], a.index[i][2], @min(rows / 4 + 2, a.capacity / 4 + 2) * a.pooledRow(c));
+        };
     }
 
     pub fn deinit(e: *Engine) void {
+        for (e.lane_mem[1..e.n_lanes]) |*m| m.free();
         for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
         if (e.l2pf) |*p| p.deinit();
         e.full_dev.free();
@@ -616,7 +694,7 @@ pub const Engine = struct {
             if (pos < dl) return null;
             np = tri.poolBucket(pos, rows, e.np_max);
         }
-        return .{ .head = head, .rows = @intCast(rows), .cur = if (head == .main) @intCast(e.st.cur) else 0, .np = @intCast(np) };
+        return .{ .head = head, .rows = @intCast(rows), .cur = if (head == .main) @intCast(e.st.cur) else 0, .np = @intCast(np), .lane = e.lane };
     }
 
     /// Launches key's graph, capturing `body(args)` into it the first time.

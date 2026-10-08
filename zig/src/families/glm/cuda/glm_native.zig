@@ -1,6 +1,8 @@
 //! GLM-5.3-Flash on two CUDA ranks behind the native family interface (native/cuda.zig): this process is rank 0
-//! and serves; rank 1 runs `tf-glm follow` on the other Spark. One stream at a time, windows of up to 16 rows, MTP
-//! drafts or DFlash2's (TF_GLM_DRAFTER_DIR; glm_dflash.zig) and v1.8's prompt-lookup (copy) drafts (glm_copy.zig). TF_GLM_PORT (default 29660) is the port rank 0 listens on for rank 1.
+//! and serves; rank 1 runs `tf-glm follow` on the other Spark. A stream a lane (each lane one sequence's caches and
+//! DFlash2 context), the lanes' rounds taking turns; an idle lane keeps its caches' rows, so a later turn of its
+//! conversation resumes there. Windows of up to 16 rows, MTP drafts or DFlash2's (TF_GLM_DRAFTER_DIR; glm_dflash.zig)
+//! and v1.8's prompt-lookup (copy) drafts (glm_copy.zig). TF_GLM_PORT (default 29660) is the port rank 0 listens on for rank 1.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -34,8 +36,8 @@ pub const default_context: i64 = 1048576;
 pub const max_segments: u32 = 1;
 pub const prompt_rows: u32 = fwd.Engine.prefill_rows;
 pub const promptGrid = fwd.promptGrid;
-/// One sequence's caches, allocated at load: one stream at a time.
-pub const max_lanes: u32 = 1;
+/// Sequences' caches allocated at load (`grow`), a stream each.
+pub const max_lanes: u32 = fwd.Engine.max_lanes;
 pub const default_port: u16 = 29660;
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
@@ -60,8 +62,7 @@ pub fn weightBytes(total: u64) u64 {
 
 const ring = 64;
 
-/// glm_copy.zig as the lane core's proposer (lanes/proposer.zig): one stream at a time, so one instance, reset by each
-/// prompt pass. The core asks twice a round with the same context (the head's depth rule, then the next plan): the second
+/// glm_copy.zig as the lane core's proposer (lanes/proposer.zig): one a lane, reset by each prompt pass there. The core asks twice a round with the same context (the head's depth rule, then the next plan): the second
 /// answer is the first.
 const CopyRule = struct {
     cfg: copy.Settings,
@@ -100,30 +101,40 @@ const CopyRule = struct {
     }
 };
 
+/// One sequence's caches (the engine's lane of the same index) and the stream using them, if any.
+const Lane = struct {
+    stream: ?*lanes.Stream = null,
+    copy: CopyRule,
+    dtoks: [dflash_max]u32 = undefined, // the chain DFlash2 picked for the stream's next window
+    dn: usize = 0,
+    held: [max_rows]u32 = undefined,
+    held_n: usize = 0,
+    pending_rows: usize = 0, // the last verify's rows, until a keep or a draft commits them
+    window: [max_rows]u32 = undefined, // the last verify's rows, the tokens a commit makes live
+    /// The tokens whose attention-cache rows are committed, from position 0: a kept state resumes only while the
+    /// rows below its position still hold its tokens (the caches are positional; only KDA's state is copied).
+    live: std.ArrayList(u32) = .empty,
+    first: u64 = 0, // the handle of the stream's first token
+    used: u64 = 0, // when a stream last took the lane (least recently used goes first)
+};
+
 const Glm = struct {
     gpa: std.mem.Allocator,
     n: *Node,
     drafts: bool,
     dflash: bool = false, // DFlash2 drafts (the MTP head is not loaded)
     policy: dflash.Policy = .{},
-    dtoks: [dflash_max]u32 = undefined, // the chain DFlash2 picked for the stream's next window
-    dn: usize = 0,
     nucleus_first: usize = 1024, // TF_GLM_NUCLEUS: the candidates a rank sends first for a top_k-off draw (sampling.NUCLEUS)
     nucleus_union: bool = true, // TENSORFOLD_NUCLEUS_UNION
-    copy: CopyRule,
-    stream: ?*lanes.Stream = null,
+    copy_cfg: copy.Settings,
+    lanes: [max_lanes]Lane = undefined,
+    n_lanes: usize = 1,
+    clock: u64 = 0,
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
-    held: [max_rows]u32 = undefined,
-    held_n: usize = 0,
-    pending_rows: usize = 0, // the last verify's rows, until a keep or a draft commits them
     costs: [max_rows]lanes.config.Cost = undefined,
     mtp_ms: f64 = 1.0,
     vtable: be.Backend.VTable = undefined,
-    /// The tokens whose attention-cache rows are committed, from position 0: a kept state resumes only while the
-    /// rows below its position still hold its tokens (the caches are positional; only KDA's state is copied).
-    live: std.ArrayList(u32) = .empty,
-    window: [max_rows]u32 = undefined, // the last verify's rows, the tokens a commit makes live
     pass: []const u32 = &.{}, // the prompt a prompt pass is running, and where it stands between chunks
     pass_at: ?u32 = null,
     next_snap: u32 = 0,
@@ -145,18 +156,26 @@ const Glm = struct {
         };
     }
 
-    /// Commit the last verify's first `keep` rows once (keep and the next draft both name them).
-    fn commit(g: *Glm, keep: usize) !void {
-        if (g.pending_rows == 0) return;
-        try g.n.keep(g.pending_rows, keep);
-        try g.live.appendSlice(g.gpa, g.window[0..keep]);
-        g.pending_rows = 0;
+    /// The lane stream `s` uses, bound on both ranks.
+    fn enter(g: *Glm, s: *const lanes.Stream) !*Lane {
+        for (g.lanes[0..g.n_lanes], 0..) |*ln, i| if (ln.stream == s) {
+            try g.n.bind(i);
+            return ln;
+        };
+        return error.NoLane;
     }
 
-    /// Whether the attention caches' rows still hold kept state `sn`'s tokens: the `at` before it and the one its
-    /// MTP rows read past it.
-    fn liveHolds(g: *const Glm, sn: *const Snap) bool {
-        return g.live.items.len > sn.at and std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(g.live.items[0 .. sn.at + 1])) == sn.key;
+    fn laneOf(g: *Glm, s: *const lanes.Stream) ?*Lane {
+        for (g.lanes[0..g.n_lanes]) |*ln| if (ln.stream == s) return ln;
+        return null;
+    }
+
+    /// Commit the bound lane's last verify's first `keep` rows once (keep and the next draft both name them).
+    fn commit(g: *Glm, ln: *Lane, keep: usize) !void {
+        if (ln.pending_rows == 0) return;
+        try g.n.keep(ln.pending_rows, keep);
+        try ln.live.appendSlice(g.gpa, ln.window[0..keep]);
+        ln.pending_rows = 0;
     }
 
     /// Each row's draw over the vocabulary (Node.whole_vocabulary): top_k off: sampling.nucleus_rows, its candidates a rank first
@@ -312,26 +331,46 @@ const Glm = struct {
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + max_rows > e.st.capacity) return error.PromptTooLong;
         const k = try candidateCount(s);
-        g.stream = s;
+        s.cached = 0;
+        // a kept state of this prompt's prefix resumes in a lane whose rows hold it, or in a free lane they are
+        // copied to; without one the pass starts at 0 in the free lane used longest ago
+        const kept: ?*const Snap = if (s.reuse.saved) |saved| @ptrCast(@alignCast(saved)) else null;
+        var views: [max_lanes]View = undefined;
+        for (g.lanes[0..g.n_lanes], views[0..g.n_lanes]) |*l, *v| v.* = .{
+            .busy = l.stream != null,
+            .used = l.used,
+            .holds = if (kept) |sn| sn.at < ids.len and liveHolds(l, sn) else false,
+        };
+        const pick = pickLane(views[0..g.n_lanes]) orelse return error.NoFreeLane;
+        const ln = &g.lanes[pick.lane];
+        try g.n.bind(pick.lane);
+        ln.stream = s;
+        errdefer ln.stream = null;
+        g.clock += 1;
+        ln.used = g.clock;
         // v1.8's copy rule in place of the core's suffix lookup (which TF_GLM_COPY_DRAFTS=0 turns off as well)
         s.proposer = null;
-        if (s.drafts and g.copy.cfg.on) {
-            g.copy.reset(s.prompt_len);
-            s.proposer = g.copy.proposer();
+        if (s.drafts and ln.copy.cfg.on) {
+            ln.copy.reset(s.prompt_len);
+            s.proposer = ln.copy.proposer();
         }
-        g.pending_rows = 0;
-        g.held_n = 0;
-        s.cached = 0;
+        ln.pending_rows = 0;
+        ln.held_n = 0;
+        ln.dn = 0;
         var at: usize = 0;
         var snap = node.no_snapshot;
-        if (s.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
-            const sn: *const Snap = @ptrCast(@alignCast(saved));
-            if (sn.at < ids.len and g.liveHolds(sn)) {
+        if (kept) |sn| {
+            if (views[pick.lane].holds or pick.from != null) {
+                if (pick.from) |src| {
+                    try g.n.copy(src, pick.lane, sn.at);
+                    ln.live.clearRetainingCapacity();
+                    try ln.live.appendSlice(g.gpa, g.lanes[src].live.items[0..sn.at]);
+                }
                 snap = sn.id;
                 at = sn.at;
             } else s.reuse_failed = true;
         }
-        g.live.shrinkRetainingCapacity(@min(g.live.items.len, at));
+        ln.live.shrinkRetainingCapacity(@min(ln.live.items.len, at));
         try g.n.begin(ids, g.drafts and !g.dflash, snap, at);
         s.cached = @intCast(at);
         g.pass = ids;
@@ -346,7 +385,7 @@ const Glm = struct {
             const end: usize = if (next < s.chunks.len) s.chunks[next] else ids.len;
             const rows = @min(end - at, fwd.Engine.prefill_rows);
             try g.n.chunk(at, rows);
-            try g.live.appendSlice(g.gpa, ids[at..][0..rows]);
+            try ln.live.appendSlice(g.gpa, ids[at..][0..rows]);
             at += rows;
             g.pass_at = @intCast(at);
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
@@ -354,13 +393,13 @@ const Glm = struct {
         const first = try g.n.first(k);
         var one: [1]u32 = .{first};
         if (k > 0) try g.choose(s, .last, k, 1, ids.len, &one);
-        _ = g.take(one[0]);
+        ln.first = g.take(one[0]);
     }
 
     fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
         const g = of(p);
         if (position != s.prompt_len) return error.PositionMismatch;
-        return g.next - 1;
+        return (g.laneOf(s) orelse return error.NoLane).first;
     }
 
     fn queueFn(p: *anyopaque, s: *lanes.Stream, feed: be.Feed, position: u64) anyerror!u64 {
@@ -383,47 +422,48 @@ const Glm = struct {
         if (windows.len != 1) return error.OneStreamAtATime;
         const w = windows[0];
         if (w.parents != null) return error.TreesNotBuilt;
-        try g.commit(g.pending_rows); // no keep since the last window: all of its rows stay (Nemotron's bindLane)
+        const ln = try g.enter(w.stream);
+        try g.commit(ln, ln.pending_rows); // no keep since the last window: all of its rows stay (Nemotron's bindLane)
         const rows = w.rows();
         if (rows > max_rows) return error.WindowTooWide;
-        if (w.held > g.held_n) return error.NoHeldDrafts;
+        if (w.held > ln.held_n) return error.NoHeldDrafts;
         const e = &g.n.e;
         for (w.positions, 0..) |pos, r| if (pos != e.st.pos + 1 + r) return error.PositionMismatch;
         var ids: [max_rows]u32 = undefined;
         ids[0] = w.pending;
-        @memcpy(ids[1..][0..w.held], g.held[0..w.held]);
+        @memcpy(ids[1..][0..w.held], ln.held[0..w.held]);
         @memcpy(ids[1 + w.held ..][0..w.tokens.len], w.tokens);
         const k = try candidateCount(w.stream);
         try g.n.verify(ids[0..rows], k, out[0].sampled[0..rows]);
         if (k > 0) try g.choose(w.stream, .window, k, rows, w.positions[0], out[0].sampled[0..rows]);
         @memcpy(out[0].drafts[0 .. rows - 1], ids[1..rows]);
-        @memcpy(g.window[0..rows], ids[0..rows]);
-        g.pending_rows = rows;
-        g.held_n = 0;
+        @memcpy(ln.window[0..rows], ids[0..rows]);
+        ln.pending_rows = rows;
+        ln.held_n = 0;
     }
 
     fn keepFn(p: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const g = of(p);
-        for (paths) |path| {
+        if (paths.len != windows.len) return error.PathsWithoutWindows;
+        for (paths, windows) |path, w| {
             if (path.len == 0) return error.EmptyPath;
             for (path, 0..) |r, i| if (r != i) return error.TreesNotBuilt;
-            try g.commit(path.len);
+            try g.commit(try g.enter(w.stream), path.len);
         }
-        _ = windows;
     }
 
     /// DFlash2 in place of the MTP head (v1.8's dflash_decode): the kept rows' taps join its context, then, unless a copy is
     /// ahead (v1.8 takes the copy first and runs no block), its block pass and chain (its own stop rule, not `r.depth`, up to
     /// TF_GLM_DFLASH_POLICY's most) give the next window's drafts as host tokens (`treeFn`). The first round after a prompt
     /// is taken as `r.depth` held drafts (the core does not ask for the chain there), filled up with the pending token.
-    fn draftDflash(g: *Glm, r: be.DraftRequest) !void {
+    fn draftDflash(g: *Glm, ln: *Lane, r: be.DraftRequest) !void {
         const s = r.stream;
         var from: node.From = .prompt;
         var keep: usize = 0;
         var pending: u32 = undefined;
         if (r.rows) |rows| {
             for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
-            try g.commit(rows.len);
+            try g.commit(ln, rows.len);
             if (r.position != g.n.e.st.pos + 1) return error.PositionMismatch;
             from = .verify;
             keep = rows.len;
@@ -436,53 +476,57 @@ const Glm = struct {
         var want: usize = if (room > 0) @min(g.policy.most, @as(usize, @intCast(room))) else 0;
         if (r.depth == 0) want = 0; // forced rows ahead: absorb only
         if (want > 0) if (s.proposer) |pr| {
-            const width: i64 = @min(@as(i64, @intCast(g.copy.cfg.most)), room);
+            const width: i64 = @min(@as(i64, @intCast(g.copy_cfg.most)), room);
             const found = pr.propose(s.context.items, width) catch @as([]const u32, &.{});
             if (found.len >= 2 and pr.lastMatch() >= 8) want = 0; // the core's own copy test
         };
         try g.n.dflashTurn(from, keep, pending, want > 0);
-        g.dn = if (want > 0) g.n.dflash.?.chain(want, pending, r.position, if (s.sampling) |sm| .{ .seed = sm.seed, .temperature = sm.temperature } else null, g.policy, &g.dtoks) else 0;
-        const held = @max(g.dn, r.depth);
-        @memcpy(g.held[0..g.dn], g.dtoks[0..g.dn]);
-        for (g.dn..held) |i| g.held[i] = pending;
-        g.held_n = held;
+        ln.dn = if (want > 0) g.n.dflash.?.chain(want, pending, r.position, if (s.sampling) |sm| .{ .seed = sm.seed, .temperature = sm.temperature } else null, g.policy, &ln.dtoks) else 0;
+        const held = @max(ln.dn, r.depth);
+        @memcpy(ln.held[0..ln.dn], ln.dtoks[0..ln.dn]);
+        for (ln.dn..held) |i| ln.held[i] = pending;
+        ln.held_n = held;
     }
 
     fn treeFn(p: *anyopaque, s: *lanes.Stream, gpa: std.mem.Allocator) anyerror!?lanes.stream.Held {
-        _ = s;
         const g = of(p);
         if (!g.dflash) return null;
-        return .{ .count = @intCast(g.dn), .tokens = try gpa.dupe(u32, g.dtoks[0..g.dn]) };
+        const ln = g.laneOf(s) orelse return error.NoLane;
+        return .{ .count = @intCast(ln.dn), .tokens = try gpa.dupe(u32, ln.dtoks[0..ln.dn]) };
     }
 
     /// Absorb the kept rows with their following tokens, then hold `depth` drafts for the next window.
     fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const g = of(p);
         for (requests) |r| {
+            const ln = try g.enter(r.stream);
             if (g.dflash) {
-                try g.draftDflash(r);
+                try g.draftDflash(ln, r);
                 continue;
             }
             if (r.depth > max_rows - 1) return error.DepthPastWindow;
             if (r.rows) |rows| {
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
-                try g.commit(rows.len);
+                try g.commit(ln, rows.len);
                 if (r.position != g.n.e.st.pos + 1) return error.PositionMismatch;
-                try g.n.draft(.verify, r.follow[0..rows.len], g.held[0..r.depth]);
+                try g.n.draft(.verify, r.follow[0..rows.len], ln.held[0..r.depth]);
             } else {
                 if (r.position != g.n.e.st.pos + 1) return error.PositionMismatch;
                 const first = if (r.follow.len > 0) r.follow[0] else try g.value(r.first orelse return error.NoFirstToken);
-                try g.n.draft(.prompt, &.{first}, g.held[0..r.depth]);
+                try g.n.draft(.prompt, &.{first}, ln.held[0..r.depth]);
             }
-            g.held_n = r.depth;
+            ln.held_n = r.depth;
         }
     }
 
+    /// The stream leaves its lane; the lane's caches and live tokens stay for a later turn of its conversation.
     fn releaseFn(p: *anyopaque, s: *lanes.Stream) void {
         const g = of(p);
-        if (g.stream == s) g.stream = null;
-        g.pending_rows = 0;
-        g.held_n = 0;
+        const ln = g.laneOf(s) orelse return;
+        ln.stream = null;
+        ln.pending_rows = 0;
+        ln.held_n = 0;
+        ln.dn = 0;
     }
 
     fn backend(g: *Glm) be.Backend {
@@ -494,7 +538,7 @@ const Glm = struct {
         if (!g.drafts) return .{ .exact_width = 1, .max_streams = 1 };
         return .{
             .exact_width = max_rows,
-            .first_copy_rows = if (g.copy.cfg.on) @intCast(@min(g.copy.cfg.most + 1, max_rows)) else 0,
+            .first_copy_rows = if (g.copy_cfg.on) @intCast(@min(g.copy_cfg.most + 1, max_rows)) else 0,
             .mtp = true,
             .speculate = true,
             .speculate_early = false,
@@ -545,7 +589,8 @@ const Glm = struct {
                 try g.n.dflashTurn(.prompt, 0, 2000, true);
                 blk = @min(blk, ms(io, t0));
                 t0 = now(io);
-                _ = g.n.dflash.?.chain(7, 2000, 100, null, g.policy, &g.dtoks);
+                var dtoks: [dflash_max]u32 = undefined;
+                _ = g.n.dflash.?.chain(7, 2000, 100, null, g.policy, &dtoks);
                 chn = @min(chn, ms(io, t0));
                 t0 = now(io);
                 try g.n.dflashTurn(.verify, 8, 2000, false);
@@ -716,24 +761,69 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer n.deinit();
     const g = try gpa.create(Glm);
     errdefer gpa.destroy(g);
-    g.* = .{ .nucleus_union = !envOff("TENSORFOLD_NUCLEUS_UNION"), .nucleus_first = envCount("TF_GLM_NUCLEUS", 1024), .gpa = gpa, .n = n, .drafts = o.drafts and (n.w.mtp != null or n.dflash != null), .dflash = n.dflash != null, .policy = try dflash.Policy.fromEnv(), .copy = .{ .cfg = try copy.Settings.fromEnv(n.e.wide_graph) } };
+    g.* = .{ .nucleus_union = !envOff("TENSORFOLD_NUCLEUS_UNION"), .nucleus_first = envCount("TF_GLM_NUCLEUS", 1024), .gpa = gpa, .n = n, .drafts = o.drafts and (n.w.mtp != null or n.dflash != null), .dflash = n.dflash != null, .policy = try dflash.Policy.fromEnv(), .copy_cfg = try copy.Settings.fromEnv(n.e.wide_graph) };
+    for (&g.lanes) |*ln| ln.* = .{ .copy = .{ .cfg = g.copy_cfg } };
     if (g.dflash and g.drafts) std.log.info("GLM drafts: DFlash2 (block {d}, up to {d} drafts a round, stop at {d:.2} of the noisy chain, beta {d:.1}); the MTP head is not loaded", .{ n.w.draft.?.block, g.policy.most, g.policy.confidence, g.policy.beta });
-    if (g.drafts and g.copy.cfg.on) std.log.info("GLM copy drafts: up to {d} a round, match {d} tokens, {d} inside the reply, windows of 9 to 15 rows padded to {d}", .{ g.copy.cfg.most, g.copy.cfg.match, g.copy.cfg.reply_match, g.copy.cfg.pad });
+    if (g.drafts and g.copy_cfg.on) std.log.info("GLM copy drafts: up to {d} a round, match {d} tokens, {d} inside the reply, windows of 9 to 15 rows padded to {d}", .{ g.copy_cfg.most, g.copy_cfg.match, g.copy_cfg.reply_match, g.copy_cfg.pad });
     try g.measure(io);
-    return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = 0, .ctx = g, .deinit = release };
+    return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = n.laneBytes(), .ctx = g, .deinit = release };
+}
+
+/// Lanes up to `total` on both ranks, allocated now (native/cuda.zig calls this once, after the memory admission
+/// and before serving): how many there are.
+pub fn grow(p: *anyopaque, total: u32) !u32 {
+    const g = Glm.of(p);
+    g.n_lanes = try g.n.grow(total);
+    return @intCast(g.n_lanes);
+}
+
+/// A lane's state for the pick: whether a stream uses it, when one last took it, and whether its rows hold the
+/// request's kept state.
+const View = struct { busy: bool, used: u64, holds: bool };
+/// The lane a prompt pass runs in, and the lane whose rows it copies first (null: none).
+const Pick = struct { lane: usize, from: ?usize = null };
+
+/// A free lane holding the kept state; else the free lane used longest ago, copying from a busy lane holding it.
+fn pickLane(v: []const View) ?Pick {
+    var oldest: ?usize = null;
+    var holder: ?usize = null;
+    for (v, 0..) |x, i| {
+        if (x.holds) {
+            if (!x.busy) return .{ .lane = i };
+            holder = i;
+        }
+        if (!x.busy and (oldest == null or x.used < v[oldest.?].used)) oldest = i;
+    }
+    return .{ .lane = oldest orelse return null, .from = holder };
+}
+
+test "lanes: a free holder first, else the oldest free lane, copying from a busy holder" {
+    const t = std.testing;
+    try t.expectEqual(Pick{ .lane = 2 }, pickLane(&.{ .{ .busy = false, .used = 1, .holds = false }, .{ .busy = true, .used = 2, .holds = false }, .{ .busy = false, .used = 5, .holds = true } }).?);
+    try t.expectEqual(Pick{ .lane = 2, .from = 0 }, pickLane(&.{ .{ .busy = true, .used = 1, .holds = true }, .{ .busy = false, .used = 9, .holds = false }, .{ .busy = false, .used = 3, .holds = false } }).?);
+    try t.expectEqual(Pick{ .lane = 0 }, pickLane(&.{ .{ .busy = false, .used = 4, .holds = false }, .{ .busy = false, .used = 7, .holds = false } }).?);
+    try t.expectEqual(@as(?Pick, null), pickLane(&.{ .{ .busy = true, .used = 1, .holds = true }, .{ .busy = true, .used = 2, .holds = false } }));
+    try t.expectEqual(Pick{ .lane = 0 }, pickLane(&.{.{ .busy = false, .used = 0, .holds = false }}).?); // one lane: as before
+}
+
+/// Whether lane `ln`'s attention caches' rows still hold kept state `sn`'s tokens: the `at` before it and the one
+/// its MTP rows read past it.
+fn liveHolds(ln: *const Lane, sn: *const Snap) bool {
+    return ln.live.items.len > sn.at and std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ln.live.items[0 .. sn.at + 1])) == sn.key;
 }
 
 pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
     return switch (err) {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
-        error.OneStreamAtATime => "this build of the GLM CUDA engine serves one request at a time",
+        error.OneStreamAtATime => "this build of the GLM CUDA engine runs one request's window at a time",
+        error.NoFreeLane => "every lane of the GLM CUDA engine is in use: retry when a request finishes",
         else => null,
     };
 }
 
 // -- kept prompt states (prompt_cache.Snapshots, wired by native/cuda.zig) ------------------------------------------
 /// A kept state: KDA's state after `at` prompt tokens on both ranks under `id`, and the hash of the `at + 1` tokens
-/// the attention caches must still hold for it (Glm.liveHolds).
+/// the attention caches must still hold for it (liveHolds).
 const Snap = struct { id: u32, at: u32, key: u64 };
 
 /// prompt_cache.Rules: the MTP head's row at-1 reads token at; prompt kernels change bits with a chunk's rows, so
@@ -776,7 +866,7 @@ pub fn snapDrop(p: *anyopaque, saved: *anyopaque) void {
 
 fn release(p: *anyopaque) void {
     const g = Glm.of(p);
-    g.live.deinit(g.gpa);
+    for (&g.lanes) |*ln| ln.live.deinit(g.gpa);
     g.n.quit();
     g.n.deinit();
     g.gpa.destroy(g);

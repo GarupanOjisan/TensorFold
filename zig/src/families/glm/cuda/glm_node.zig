@@ -14,7 +14,7 @@ const roce_mod = @import("glm_roce.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14 };
 
 /// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 pub fn drafterDir() ?[]const u8 {
@@ -44,7 +44,8 @@ pub const Node = struct {
     prompt: std.ArrayList(u32) = .empty, // the prompt `begin` started, which `chunk` reads
     mtp: bool = false,
     roce: ?*roce_mod.Roce = null,
-    dflash: ?dflash.Drafter = null,
+    dflash: ?dflash.Drafter = null, // the bound lane's DFlash2 context (bind swaps it with `drafters`)
+    drafters: [Engine.max_lanes]?dflash.Drafter = @splat(null), // every other lane's
     snaps: std.AutoHashMapUnmanaged(u32, cuda.DeviceBuffer) = .empty, // kept prompt states by id, this rank's half
 
     /// Both ranks: the TCP pair (rank 0 listens on `port`), NCCL, the rank's weights, kernels and engine state.
@@ -58,6 +59,7 @@ pub const Node = struct {
         n.prompt = .empty;
         n.mtp = false;
         n.snaps = .empty;
+        n.drafters = @splat(null);
         n.stream = try cuda.Stream.init(d, true);
         errdefer n.stream.deinit();
         n.lib = try cuda.nccl.Library.open();
@@ -125,6 +127,7 @@ pub const Node = struct {
         n.snaps.deinit(n.gpa);
         n.prompt.deinit(n.gpa);
         if (n.dflash) |*dr| dr.deinit();
+        for (&n.drafters) |*slot| if (slot.*) |*dr| dr.deinit();
         n.e.deinit();
         if (n.roce) |r| r.deinit();
         n.k.deinit();
@@ -189,7 +192,7 @@ pub const Node = struct {
     /// candidates a rank gathered (Engine.cand_host), or both ranks' whole rows (whole_vocabulary).
     pub fn first(n: *Node, k: usize) !u32 {
         try n.send(.first, &.{@intCast(k)});
-        return n.pick(n.e.last_logits, 1, k, null);
+        return n.pick(n.e.st.last_logits, 1, k, null);
     }
 
     /// Keep the state between prompt chunks as `id` (each rank its half).
@@ -258,7 +261,7 @@ pub const Node = struct {
     fn nucleusRun(n: *Node, which: Rows, rows: usize, temperature: f64, count: usize) ![]const u64 {
         const logits = switch (which) {
             .window => n.e.buf.logits,
-            .last => n.e.last_logits,
+            .last => n.e.st.last_logits,
         };
         if (count == 0) {
             _ = try n.e.fullRows(logits, rows);
@@ -292,10 +295,54 @@ pub const Node = struct {
         try n.words.appendSlice(n.gpa, next);
         try n.send(.draft, n.words.items);
         const hidden = switch (from) {
-            .prompt => n.e.last_hidden,
+            .prompt => n.e.st.last_hidden,
             .verify => n.e.buf.fnormed,
         };
         try dec.draft(&n.e, hidden, next, out.len, out);
+    }
+
+    /// Later commands act on lane `lane`'s state and DFlash2 context (sent only when the lane changes).
+    pub fn bind(n: *Node, lane: usize) !void {
+        if (lane == n.e.lane) return;
+        try n.send(.bind, &.{@intCast(lane)});
+        const from = n.e.lane;
+        try n.e.bind(lane);
+        n.drafters[from] = n.dflash;
+        n.dflash = n.drafters[lane];
+        n.drafters[lane] = null;
+    }
+
+    /// One more lane's device bytes: its caches, and its DFlash2 context's.
+    pub fn laneBytes(n: *const Node) usize {
+        return n.e.laneBytes() + if (n.dflash) |*dr| dr.mem.len else 0;
+    }
+
+    /// Lanes up to `total` on both ranks, each with its own DFlash2 context when drafting with it: how many both have
+    /// (rank 1 answers with its count).
+    pub fn grow(n: *Node, total: usize) !usize {
+        try n.send(.grow, &.{@intCast(total)});
+        const had = n.e.n_lanes;
+        var mine = try n.e.addLanes(total);
+        if (n.dflash) |*bound| for (had..mine) |i| {
+            n.drafters[i] = dflash.Drafter.init(n.gpa, n.e.d, &n.w, bound.capacity) catch {
+                mine = i; // the lanes past it serve no stream
+                break;
+            };
+        };
+        var word = [1]u32{@intCast(mine)};
+        if (n.rank != 0) {
+            try n.pair.send(std.mem.sliceAsBytes(&word));
+            return mine;
+        }
+        try n.pair.recv(std.mem.sliceAsBytes(&word));
+        return @min(mine, word[0]);
+    }
+
+    /// Lane `src`'s attention-cache rows below `rows` into lane `dst` (Engine.copyLaneRows). DFlash2's context comes
+    /// whole with the kept state `begin` restores, so it is not copied.
+    pub fn copy(n: *Node, src: usize, dst: usize, rows: usize) !void {
+        try n.send(.copy, &.{ @intCast(src), @intCast(dst), @intCast(rows) });
+        try n.e.copyLaneRows(src, dst, rows);
     }
 
     pub fn quit(n: *Node) void {
@@ -327,6 +374,9 @@ pub const Node = struct {
                 .draft => try n.draft(@fromBackingInt(@intCast(w[0])), w[2..], scratch[0..w[1]]),
                 .dflash => try n.dflashRun(@fromBackingInt(@intCast(w[0])), w[1], w[2], w[3] != 0),
                 .nucleus => _ = try n.nucleusRun(@fromBackingInt(@intCast(w[0])), w[1], @bitCast(@as(u64, w[3]) | (@as(u64, w[4]) << 32)), w[2]),
+                .bind => try n.bind(w[0]),
+                .grow => _ = try n.grow(w[0]),
+                .copy => try n.copy(w[0], w[1], w[2]),
                 .quit => return,
             }
         }

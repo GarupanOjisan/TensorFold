@@ -9,15 +9,15 @@ const Engine = fwd.Engine;
 const bf = 2;
 
 /// decode.prefill without a resume point: the prompt in chunks, each also absorbed by the MTP head (its rows from
-/// the chunk's second token on), then the first token. The last row's hidden stays in e.last_hidden for the first draft.
+/// the chunk's second token on), then the first token. The last row's hidden stays in e.st.last_hidden for the first draft.
 pub fn prefill(e: *Engine, prompt: []const u32, use_mtp: bool, drafter: ?*dflash.Drafter) !u32 {
     try prefillCaches(e, prompt, use_mtp, drafter);
     var first: [1]u32 = undefined;
-    try e.greedy(&e.buf, e.last_logits, 1, e.w.head.n, &first);
+    try e.greedy(&e.buf, e.st.last_logits, 1, e.w.head.n, &first);
     return first[0];
 }
 
-/// The prompt's caches (and the MTP head's), its last row's logits in e.last_logits.
+/// The prompt's caches (and the MTP head's), its last row's logits in e.st.last_logits.
 pub fn prefillCaches(e: *Engine, prompt: []const u32, use_mtp: bool, drafter: ?*dflash.Drafter) !void {
     if (prompt.len == 0) return error.EmptyPrompt;
     try e.reset();
@@ -37,8 +37,8 @@ pub fn prefillChunk(e: *Engine, prompt: []const u32, start: usize, rows: usize, 
     const chunk = prompt[start..][0..rows];
     _ = try e.stage(&e.pbuf, chunk);
     try e.compute(&e.pbuf, rows);
-    try e.copyDev(e.last_logits, e.pbuf.logits, e.w.head.n * bf); // `last = compute(..).clone()`
-    try e.copyDev(e.last_hidden, e.pbuf.fnormed + (rows - 1) * d * bf, d * bf);
+    try e.copyDev(e.st.last_logits, e.pbuf.logits, e.w.head.n * bf); // `last = compute(..).clone()`
+    try e.copyDev(e.st.last_hidden, e.pbuf.fnormed + (rows - 1) * d * bf, d * bf);
     if (drafter) |dr| try dr.addTaps(e, &e.pbuf, rows); // the chunk's rows join DFlash2's context
     if (use_mtp and e.w.mtp != null) {
         const nxt = prompt[start + 1 .. @min(prompt.len, start + rows + 1)];
@@ -133,12 +133,12 @@ pub fn mtpDecode(e: *Engine, pending: u32, count: usize, depth: usize, stop_eos:
         if (copied) {
             n_drafts = found.len;
             @memcpy(drafts[0..n_drafts], found);
-            try absorb(e, e.last_hidden, &.{pending});
+            try absorb(e, e.st.last_hidden, &.{pending});
         }
     }
     if (!copied) {
         n_drafts = @min(depth, count - out.items.len);
-        if (n_drafts > 0) try draft(e, e.last_hidden, &.{pending}, n_drafts, drafts[0..n_drafts]);
+        if (n_drafts > 0) try draft(e, e.st.last_hidden, &.{pending}, n_drafts, drafts[0..n_drafts]);
     }
     while (out.items.len < count and !(stop_eos and isEos(e, out.items[out.items.len - 1]))) {
         var window: [Engine.max_rows]u32 = undefined;

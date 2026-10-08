@@ -409,7 +409,7 @@ pub const Drafter = struct {
 
     fn run(self: *Drafter, e: *Engine, head: fwd.GraphKey.Head, rows: usize, comptime body: anytype, args: anytype) !void {
         _ = self;
-        if (e.use_graphs) return e.replay(.{ .head = head, .rows = @intCast(rows), .cur = 0, .np = 0 }, body, args);
+        if (e.use_graphs) return e.replay(.{ .lane = e.lane, .head = head, .rows = @intCast(rows), .cur = 0, .np = 0 }, body, args); // the bound lane's drafter
         return @call(.auto, body, args);
     }
 

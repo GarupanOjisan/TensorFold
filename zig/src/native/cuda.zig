@@ -351,16 +351,24 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     defer if (!opened) loaded.deinit(loaded.ctx);
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
-    const room = after.room(model);
+    // a family that grows its streams after loading already holds the first one's caches in `model`; the prompt
+    // states it keeps (--prompt-cache-gib) come out of the same room
+    const grows = @hasDecl(F, "grow");
+    const cache_bytes: u64 = if (grows and @hasDecl(F, "snapSave")) @intFromFloat(@max(0, o.prompt_cache_gib orelse 2) * gib) else 0;
+    const room = (after.room(model) + if (grows) loaded.stream_bytes else 0) -| cache_bytes;
     // a family that allocates its streams at load serves at most that many
     const asked = if (@hasDecl(F, "max_lanes")) @min(o.lanes, F.max_lanes) else o.lanes;
-    const streams = budget.admit(room, loaded.stream_bytes, asked, o.lanes_fixed and asked == o.lanes) catch |e| {
+    const admitted = budget.admit(room, loaded.stream_bytes, asked, o.lanes_fixed and asked == o.lanes) catch |e| {
         problem.* = switch (e) {
             error.NoStream => try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream: one at a {d}-token window takes {d:.2} GiB, and {d:.2} GiB is left after the model's {d:.2} GiB and the {d:.1} GiB reserve; lower --context, or free device memory", .{ window, toGib(loaded.stream_bytes), toGib(room), toGib(model), toGib(after.reserve) }),
             error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, and the CUDA memory budget leaves {d:.2} GiB: serve --parallel {d}, or lower --context", .{ o.lanes, toGib(loaded.stream_bytes * o.lanes), window, toGib(room), room / loaded.stream_bytes }),
         };
         return null;
     };
+    const streams = if (grows and admitted > 1) F.grow(loaded.ctx, admitted) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot allocate {d} streams ({s})", .{ admitted, @errorName(e) });
+        return null;
+    } else admitted;
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
