@@ -137,3 +137,33 @@ extern "C" __global__ void tf_glm_topk(const unsigned short* __restrict__ logits
     }
   }
 }
+
+// qmm.quantize4 (v0.6.6 glm5_next/cuda/qmm.py:158): bf16 (n, k) -> MLX affine 4-bit groups of 64, one thread a group.
+// scale = bf16(max((hi - lo) / 15, 1e-8)), bias = bf16(lo), q = round-half-even((w - bias) / scale) in 0..15, input
+// 8 i + j of a group at bits 4 j of its word i; fp32 arithmetic as torch's, divisions correctly rounded.
+extern "C" __global__ void tf_glm_quantize4(const __nv_bfloat16* __restrict__ w, int n, int k, uint32_t* __restrict__ words,
+                                            __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ biases) {
+  const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+  const int kg = k / 64;
+  if (g >= (long long)n * kg) return;
+  const __nv_bfloat16* x = w + g * 64;   // row g / kg, group g % kg
+  float lo = __bfloat162float(x[0]), hi = lo;
+  for (int i = 1; i < 64; ++i) {
+    const float v = __bfloat162float(x[i]);
+    lo = fminf(lo, v);
+    hi = fmaxf(hi, v);
+  }
+  const __nv_bfloat16 sb = __float2bfloat16_rn(fmaxf(__fdiv_rn(hi - lo, 15.0f), 1e-8f));
+  const __nv_bfloat16 bb = __float2bfloat16_rn(lo);
+  const float s = __bfloat162float(sb), b = __bfloat162float(bb);
+  for (int wi = 0; wi < 8; ++wi) {
+    uint32_t word = 0;
+    for (int j = 0; j < 8; ++j) {
+      const float q = fminf(fmaxf(rintf(__fdiv_rn(__fsub_rn(__bfloat162float(x[wi * 8 + j]), b), s)), 0.0f), 15.0f);
+      word |= (uint32_t)q << (4 * j);
+    }
+    words[g * 8 + wi] = word;
+  }
+  scales[g] = sb;
+  biases[g] = bb;
+}

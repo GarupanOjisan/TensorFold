@@ -277,6 +277,8 @@ pub const Engine = struct {
     np_max: usize,
     last_logits: u64, // a prompt's last row's logits, kept past the MTP absorb that reuses pbuf
     last_hidden: u64, // and its final-normed hidden row, the first draft's input
+    draft_head: kern.Q4, // weights.draft_head: the head quantized to 4 bits, read by draft steps only
+    draft_mem: cuda.DeviceBuffer,
     /// The last `candidates` call's gathered pairs: [rank][row][k] of (fp32 value bits, token).
     cand_host: [wt.world * max_rows * 2 * max_k]u32 = undefined,
     /// Captured decode windows and MTP steps (graphs.py), found by key; TF_GLM_GRAPHS=0 runs everything eagerly.
@@ -352,6 +354,14 @@ pub const Engine = struct {
         e.np_max = np_max;
         e.n_graphs = 0;
         e.capturing = false;
+        e.draft_mem = try cuda.DeviceBuffer.alloc(d, kern.q4Bytes(w.head.n, w.head.k));
+        errdefer e.draft_mem.free();
+        {
+            var tmp = try cuda.DeviceBuffer.alloc(d, w.head.n * w.head.k / 2 + 4 * w.head.n * w.head.k / 64);
+            defer tmp.free();
+            e.draft_head = try kern.quantize4(k, s, w.head.ptr, w.head.n, w.head.k, e.draft_mem.ptr, tmp.ptr);
+            try s.synchronize();
+        }
         e.use_graphs = if (std.c.getenv("TF_GLM_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         return e;
     }
@@ -368,6 +378,7 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
+        e.draft_mem.free();
         e.mem.free();
     }
 
@@ -742,10 +753,11 @@ pub const Engine = struct {
         try e.draftHead(b, b.fnormed, 1);
     }
 
-    /// The MTP head's logits. ponytail: the BF16 head, not Python's 4-bit draft head (quantize4 + qmm.cu): drafts only
-    /// propose tokens, so replies are the same; port the 4-bit head when the draft step's head read shows in profiles.
+    /// The MTP head's logits from the 4-bit draft head (mtp.py: `w.draft_head`, forward.mm): a prompt chunk's on the
+    /// prefill matmul, a decode step's on qmm_group with the rows' group sums (b.fxs, from the final norm).
     fn draftHead(e: *Engine, b: *const Buffers, x: u64, rows: usize) !void {
-        try e.mm(b, x, e.w.cfg.hidden, e.w.head, b.logits, rows, false);
+        if (b.prefill) return kern.q4Prefill(e.k, e.s, x, e.draft_head, b.logits, rows);
+        try kern.q4Matmul(e.k, e.s, x, b.fxs, e.draft_head, b.logits, rows);
     }
 
     // -- sampling -----------------------------------------------------------------------------------------------
