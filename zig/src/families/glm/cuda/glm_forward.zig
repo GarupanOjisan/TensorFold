@@ -1352,7 +1352,7 @@ pub const Engine = struct {
             try e.t.hcPost(b.x, b.x, g, b.post, b.comb, wt.world, rows, d, c.hc);
             const f = l.ffn_hc.?;
             try e.hcPre(b, f, l.post_norm, rows);
-            const g2 = if (l.mlp) |m| try e.mlpBlock(m, b, rows, l.index) else try e.moeBlock(l.moe.?, b, rows, l.index);
+            const g2 = if (l.mlp) |m| try e.mlpBlock(m, b, rows, l.index, null) else try e.moeBlock(l.moe.?, b, rows, l.index, null);
             try e.t.hcPost(b.x, b.x, g2, b.post, b.comb, wt.world, rows, d, c.hc);
             for (e.tap_layers, 0..) |tl, slot| if (tl == l.index and b.taps[slot] != 0) try e.t.streamMean(b.x, b.taps[slot], rows, d, c.hc);
         }
