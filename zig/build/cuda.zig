@@ -120,6 +120,7 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
         .link_libc = true,
         .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "engine_api", .module = api }, .{ .name = "lanes", .module = lanes }, .{ .name = "nemotron", .module = nemotron } },
     });
+    mod.addImport("glm", glmNative(b, target, optimize, cuda, lanes, nemotron.import_table.get("core").?));
     return .{ .api = api, .engines = mod };
 }
 
@@ -203,4 +204,15 @@ fn glmCheck(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
     main.addImport("core", core);
     main.addImport("glm_config", config);
     return b.addExecutable(.{ .name = "tf-glm", .root_module = main });
+}
+
+/// GLM-5.3-Flash's native family (rank 0 of two CUDA ranks), for native/cuda.zig's registry.
+fn glmNative(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, core: *std.Build.Module) *std.Build.Module {
+    const config = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/config.zig"), .target = target, .optimize = optimize });
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda/glm_native.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("cuda", cuda);
+    m.addImport("core", core);
+    m.addImport("lanes", lanes);
+    m.addImport("glm_config", config);
+    return m;
 }

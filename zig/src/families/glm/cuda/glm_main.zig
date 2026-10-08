@@ -11,6 +11,7 @@ const tri = @import("glm_triton.zig");
 const kern = @import("glm_kernels.zig");
 const fwd = @import("glm_forward.zig");
 const dec = @import("glm_decode.zig");
+const node = @import("glm_node.zig");
 
 const Opts = struct {
     model: []const u8 = "",
@@ -20,7 +21,7 @@ const Opts = struct {
     prompts: []const u8 = "",
     want: []const u8 = "",
     max_tokens: usize = 128,
-    context: usize = 65536,
+    context: usize = 1048576,
     depth: usize = 3,
     only: []const u8 = "",
     kernels: ?[]const u8 = null,
@@ -31,8 +32,9 @@ pub fn main(init: std.process.Init) !u8 {
     const io = init.io;
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 3 or !std.mem.eql(u8, args[1], "check")) {
-        std.debug.print("usage: tf-glm check MODEL --rank R --master HOST --prompts P --want W [options]\n", .{});
+    if (args.len < 3 or !(std.mem.eql(u8, args[1], "check") or std.mem.eql(u8, args[1], "follow"))) {
+        std.debug.print("usage: tf-glm check MODEL --rank R --master HOST --prompts P --want W [options]\n" ++
+            "       tf-glm follow MODEL --master HOST [--port P] [--context N] [--kernels DIR]   (rank 1 of a server)\n", .{});
         return 2;
     }
     var o: Opts = .{ .model = args[2] };
@@ -56,6 +58,7 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     const kernels_dir = o.kernels orelse init.environ_map.get("TENSORFOLD_CUDA_KERNELS") orelse return error.NoKernelDir;
+    if (std.mem.eql(u8, args[1], "follow")) return follow(init, o, kernels_dir);
 
     var driver = try cuda.Driver.open();
     defer driver.close();
@@ -141,6 +144,20 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     return if (failed == 0) 0 else 1;
+}
+
+/// Rank 1 of a served GLM: load this rank, then run rank 0's commands until it stops.
+fn follow(init: std.process.Init, o: Opts, kernels_dir: []const u8) !u8 {
+    var driver = try cuda.Driver.open();
+    defer driver.close();
+    var ctx = try cuda.Context.init(&driver, 0);
+    defer ctx.deinit();
+    const n = try node.Node.init(init.gpa, init.io, &ctx, o.model, kernels_dir, o.context, 1, o.master, o.port);
+    defer n.deinit();
+    std.debug.print("[tf-glm] rank 1 ready: following rank 0 at {s}:{d}\n", .{ o.master, o.port });
+    try n.follow();
+    std.debug.print("[tf-glm] rank 0 stopped\n", .{});
+    return 0;
 }
 
 /// `name` is one of the comma-separated names in `list`.
