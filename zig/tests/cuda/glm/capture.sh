@@ -9,10 +9,10 @@ IMAGE=${IMAGE:-nvcr.io/nvidia/pytorch:26.07-py3}
 SNAP=${SNAP:?the EXL3 snapshot under ~/.cache/huggingface/hub}
 for c in $(docker ps -q --filter name=tf-) ; do echo "PREFLIGHT: containers running on spark1"; docker ps; exit 3; done
 [ -z "$(ssh "$WORKER" docker ps -q --filter name=tf-)" ] || { echo "PREFLIGHT: containers running on spark2"; exit 3; }
-rsync -a --delete ~/tf-native/py066/ "$WORKER:tf-native/py066/" --exclude .git
+rsync -a --delete ${PY066:-$HOME/tf-native/py066}/ "$WORKER:tf-native/py066/" --exclude .git
 rsync -a ~/tf-native/bin/ "$WORKER:tf-native/bin/"
-rsync -a ~/tf-native/TensorFold/tools/zig/triton_aot_manifest.py "$WORKER:tf-native/py066/tools-zig/"
-mkdir -p ~/tf-native/py066/tools-zig && cp ~/tf-native/TensorFold/tools/zig/triton_aot_manifest.py ~/tf-native/py066/tools-zig/
+rsync -a $(dirname "$0")/../../../../tools/zig/triton_aot_manifest.py "$WORKER:tf-native/py066/tools-zig/"
+mkdir -p ${PY066:-$HOME/tf-native/py066}/tools-zig && cp $(dirname "$0")/../../../../tools/zig/triton_aot_manifest.py ${PY066:-$HOME/tf-native/py066}/tools-zig/
 mkdir -p ~/tf-native/cap/$RUN/{triton,torch_ext,cuda_cache}
 more=""; (( $# )) && more=$(printf '%q ' "$@")
 ssh "$WORKER" mkdir -p tf-native/cap/$RUN/{triton,torch_ext,cuda_cache}
@@ -21,7 +21,7 @@ env_args="-e NCCL_SOCKET_IFNAME=${NCCL_SOCKET_IFNAME:?} -e NCCL_IB_HCA=${NCCL_IB
   -e PYTHONUNBUFFERED=1 -e TORCH_CUDA_ARCH_LIST=12.1 -e TRITON_CACHE_DIR=/cap/triton -e TORCH_EXTENSIONS_DIR=/cap/torch_ext \
   -e CUDA_CACHE_PATH=/cap/cuda_cache -e TENSORFOLD_NO_UPDATE_CHECK=1 ${EXTRA_ENV:-}"
 run_args="--rm --gpus all --network host --ipc host --ulimit memlock=-1 --device /dev/infiniband \
-  -v \$HOME/tf-native/py066:/py:ro -v \$HOME/tf-native/cap/$RUN:/cap -v \$HOME/.cache/huggingface/hub:/hub:ro \
+  -v \${PY066:-$HOME/tf-native/py066}:/py:ro -v \$HOME/tf-native/cap/$RUN:/cap -v \$HOME/.cache/huggingface/hub:/hub:ro \
   $env_args -w /py --entrypoint python $IMAGE -B /py/capture_glm.py --model /hub/$SNAP --out /cap --master $MASTER"
 ssh "$WORKER" "docker run --name tf-cap1 $run_args --rank 1 $more" > ~/tf-native/cap/$RUN/rank1.log 2>&1 &
 eval timeout 7200 docker run --name tf-cap0 $run_args --rank 0 --tools /py/tools-zig $more 2>&1 \
