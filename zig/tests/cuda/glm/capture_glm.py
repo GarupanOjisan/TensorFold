@@ -154,6 +154,7 @@ def main() -> int:
     ap.add_argument("--context", type=int, default=65536, help="explicit, so the indexer and sparse attention run")
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--only", default="", help="comma-separated prompt names (default: all)")
+    ap.add_argument("--drafter", default="", help="DFlash2 snapshot folder: the second mode drafts with it (TF_GLM_MTP=auto leaves the MTP head out)")
     ap.add_argument("--window-ms", action="store_true", help="time verify windows of 1 to MAX_ROWS rows on both ranks, then stop")
     ap.add_argument("--set", default="", help="copy: prompts whose replies repeat the prompt, instead of the prompt set")
     ap.add_argument("--lengths", default="", help="comma-separated prompt lengths in tokens, instead of the prompt set")
@@ -169,7 +170,7 @@ def main() -> int:
     from tensorfold.families.glm5_next.cuda.engine import GlmEngine
 
     t0 = time.perf_counter()
-    eng = GlmEngine(Path(a.model), rank=a.rank, master=a.master, port=a.port, drafter=None, context=a.context,
+    eng = GlmEngine(Path(a.model), rank=a.rank, master=a.master, port=a.port, drafter=Path(a.drafter) if a.drafter else None, context=a.context,
                     context_explicit=True)
     print(f"[capture] rank {a.rank} ready in {time.perf_counter() - t0:.1f} s, window {eng.limit}", flush=True)
     if a.window_ms:

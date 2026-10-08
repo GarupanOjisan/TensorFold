@@ -110,8 +110,7 @@ The reference sets `k1`, `k2`, `k3` are `m1`, `m2`, `m3` with `-e TF_GLM_KDA_CHU
   of `l2pf.cu`) prefetch the next kernels' weights into L2 from a side stream at the sites a / f / o of decode windows of up
   to 64 rows, forked and joined with events so that it also runs inside the captured graphs; the MoE then runs its shared
   expert before the routed experts, as v1.8 does under it.
-- Not ported, because the Zig engine does not use them: DFlash2
-  (`TF_GLM_DFLASH_POLICY`), multi-stream serving (`TF_GLM_MULTI_*`, `FILL_*`, `PREFILL_OVERLAP`, `HC_SPLIT`, `HC_EXCHANGE`), the
+- Not ported, because the Zig engine does not use them: multi-stream serving (`TF_GLM_MULTI_*`, `FILL_*`, `PREFILL_OVERLAP`, `HC_SPLIT`, `HC_EXCHANGE`), the
   reply-shaping and pacing settings of the Python server (`ASSISTANT_ENDS`, `CLEAR_THINKING`, `KEEP_REASONING*`,
   `STREAM_SMOOTH*`, `SHARED_PREFIX`, `CACHE_*`, `DISPLAY_KV_*`). `LOADS=0`, `FUSE`, `PASS=128`, `Q4_TILE`, `SEQ_ROWS`, `L2PF_BLOCKS/KB/THREADS`,
   `DRAFT_QUANT=mse`, `LATENT_STAGES`, `SCORE_RB` stay at v1.8's defaults.
@@ -143,3 +142,27 @@ Acceptance: `tf-glm check` against the production-setting captures `v18a` (6 pro
   `aot/p18c` is `aot/p18b` plus the kernels of `cp1`..`cp4`.
 - `capture_glm.py --window-ms` times v1.8's verify windows of 1 to 16 rows (`window_ms.json`), the Python side of the server's
   `GLM window ms by width` line.
+
+## 10. DFlash2 drafts (v1.8 dflash2.py, DRAFTER=dflash2)
+
+- `TF_GLM_DRAFTER_DIR` (a snapshot of incoai/GLM-5.3-Flash-DFlash2, the same on both ranks) loads the draft model and leaves the MTP head
+  out, as v1.8's `TF_GLM_MTP=auto` does beside DFlash2; `tf-glm check --drafter DIR` is the same for the check. `TF_GLM_DFLASH_POLICY`
+  (default `fnc7:0.3`, v1.8's production rule; `fcN:P` also) cuts a chain. Unset: the MTP head drafts as before.
+- `glm_weights.loadDraft`: five layers, split between the ranks as `tp.draft_parts` (16 query heads, 4 KV heads, 6,144 MLP rows each), every
+  matrix 4-bit with min/max ranges at load (`qmm.draft_quantize4`), the selector's projection in BF16, the codebooks on rank 0's host
+  (the chains are picked there; its tokens ride the next verify command to rank 1). About 1.8 GiB a rank.
+- `glm_dflash.zig` is `Drafter`: `addTaps` (the target's stream means after layers 5, 14, 24, 33, 42 of the committed rows, `Buffers.taps`,
+  filled by every forward) through `fc`, `hidden_norm`, and each layer's K and V into a ring of 2,176 rows (`TF_GLM_DRAFT_RING=0`: flat); `block`
+  (`[pending, mask x 7]` through the five layers: two-tap dynamic convolutions `_dconv_kernel`, `_prep_kernel`, sliding-window `_dattn_kernel`, the
+  o and down projections' fp32 partials all-gathered and added in rank order, then the draft head's top 16 a rank gathered and the selector's
+  projection); `chain` (the selector's edge scores and the target's keyed noise, the noisy-confidence stop rule, float64 on the host). Both
+  context updates (1..16 rows) and the block pass replay CUDA graphs. The glue torch did is five small kernels in `glm_glue.cu`
+  (`tf_glm_df_*`); `tf_glm_topk` takes its ties by a ballot instead of one thread's walk along the row (the same pairs).
+- Who proposes: a copy first (glm_copy.zig; a round with a copy ahead runs no block, the taps still join), else DFlash2's chain of up to 7 drafts (windows of up to 8
+  rows; copies up to 16). The lane core sees DFlash2 as its head: `draftFn` gives the chain as host tokens through the backend's `tree` hook,
+  and the rule's own depth is only asked to be non-zero (the first round after a prompt takes its drafts as held ones).
+- Kept prompt states carry the drafter's ring and position (`Node.snapshotBytes`).
+- References: `df1` = `cp1`'s prompts, `df2` = v18a's, `df4` = p4's, all from v1.8 with `TF_GLM_MTP=auto TF_GLM_DFLASH_POLICY=fnc7:0.3` and the copy settings
+  (`capture_glm.py --drafter`); `aot/p18d` = `aot/p18c` plus their kernels. Their serial replies equal the earlier sets'.
+- Acceptance: `tf-glm check --copy 1 --drafter DIR` against v18a, v18b, p4 and cp1 (the sets' serial replies), and the rounds equal v1.8's:
+  `cp1` cedit 41 rounds, 17 copied (v1.8's DFlash2 capture: 41, 17), story 67 rounds, code 21, facts 39, json 22.

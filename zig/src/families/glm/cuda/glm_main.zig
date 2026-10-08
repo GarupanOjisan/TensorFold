@@ -1,11 +1,12 @@
 //! `tf-glm`: GLM-5.3-Flash on two CUDA ranks without Python, and its check against the Python engine's replies.
 //!   tf-glm check MODEL --rank R --master HOST [--port P] --prompts prompts.json --want tokens.json
-//!          [--max-tokens N] [--context N] [--depth D] [--copy 0|1] [--only NAME,...] [--kernels DIR]
+//!          [--max-tokens N] [--context N] [--depth D] [--copy 0|1] [--drafter DIR] [--only NAME,...] [--kernels DIR]
 //!   tf-glm qdump MODEL --rank R --out DIR [--only NAME,...]   (TF_GLM_DENSE=q4's quantization of a few tensors, as bytes)
 //! Run once on each Spark (rank 0 on HOST). Each prompt is prefilled and decoded serially, then with MTP drafts;
 //! rank 0 prints whether both equal the capture's serial reply. `--copy 1` drafts by v1.8's prompt lookup where the
 //! context repeats (glm_copy.zig; TF_GLM_COPY_MAX, _MATCH, _REPLY_MATCH and TF_GLM_WIDE_GRAPHS as in Python) and the MTP
-//! head elsewhere.
+//! head elsewhere. `--drafter DIR` (a DFlash2 snapshot) drafts with it instead of the MTP head, as v1.8's DRAFTER=dflash2
+//! does (`TF_GLM_DFLASH_POLICY`, default fnc7:0.3).
 const std = @import("std");
 const cuda = @import("cuda");
 const glm_config = @import("glm_config");
@@ -16,6 +17,7 @@ const fwd = @import("glm_forward.zig");
 const dec = @import("glm_decode.zig");
 const node = @import("glm_node.zig");
 const copy = @import("glm_copy.zig");
+const dflash = @import("glm_dflash.zig");
 
 const Opts = struct {
     model: []const u8 = "",
@@ -28,6 +30,7 @@ const Opts = struct {
     context: usize = 1048576,
     depth: usize = 3,
     copy: bool = false,
+    drafter: ?[]const u8 = null,
     only: []const u8 = "",
     kernels: ?[]const u8 = null,
     out: []const u8 = "",
@@ -58,6 +61,7 @@ pub fn main(init: std.process.Init) !u8 {
         else if (std.mem.eql(u8, a, "--context")) o.context = try std.fmt.parseInt(usize, v, 10)
         else if (std.mem.eql(u8, a, "--depth")) o.depth = try std.fmt.parseInt(usize, v, 10)
         else if (std.mem.eql(u8, a, "--copy")) o.copy = !std.mem.eql(u8, v, "0")
+        else if (std.mem.eql(u8, a, "--drafter")) o.drafter = v
         else if (std.mem.eql(u8, a, "--only")) o.only = v
         else if (std.mem.eql(u8, a, "--kernels")) o.kernels = v
         else if (std.mem.eql(u8, a, "--out")) o.out = v
@@ -112,15 +116,19 @@ pub fn main(init: std.process.Init) !u8 {
     var k = try kern.Kernels.load(&driver);
     defer k.deinit();
     var t0 = now(io);
-    var w = try wt.load(gpa, io, &driver, .{ .d = &driver, .s = stream }, &k, o.model, cfg, o.rank, true);
+    var w = try wt.load(gpa, io, &driver, .{ .d = &driver, .s = stream }, &k, o.model, cfg, o.rank, o.drafter == null);
     defer w.deinit(gpa);
+    if (o.drafter) |dd| try wt.loadDraft(gpa, io, &driver, .{ .d = &driver, .s = stream }, &k, &w, dd, o.rank, true);
     std.debug.print("[tf-glm] rank {d}: weights {d:.1} GiB in {d:.1} s\n", .{ o.rank, @as(f64, @floatFromInt(w.bytes)) / (1 << 30), secs(io, t0) });
 
     var set = try cuda.aot.Set.load(gpa, io, &driver, ctx.device, kernels_dir);
     defer set.deinit();
     const long_context = o.context > fwd.denseLimit(&w);
-    var e = try fwd.Engine.init(&w, &driver, stream, .{ .set = &set, .s = stream }, &k, .{ .lib = &lib, .comm = comm }, o.context + fwd.Engine.max_rows, long_context);
+    var e = try fwd.Engine.init(&w, &driver, stream, .{ .set = &set, .s = stream }, &k, .{ .lib = &lib, .comm = comm }, o.context + fwd.Engine.max_rows, long_context, if (w.draft) |dr| dr.taps else null);
     defer e.deinit();
+    var drafter: ?dflash.Drafter = if (w.draft != null) try dflash.Drafter.init(gpa, &driver, &w, o.context + fwd.Engine.max_rows) else null;
+    defer if (drafter) |*dr| dr.deinit();
+    const policy = try dflash.Policy.fromEnv();
 
     const prompts_text = try std.Io.Dir.cwd().readFileAlloc(io, o.prompts, arena, .limited(1 << 26));
     const prompts = try std.json.parseFromSliceLeaky(std.json.Value, arena, prompts_text, .{});
@@ -140,16 +148,17 @@ pub fn main(init: std.process.Init) !u8 {
             var out: std.ArrayList(u32) = .empty;
             defer out.deinit(gpa);
             t0 = now(io);
-            const first = try dec.prefill(&e, ids, drafted);
+            const first = try dec.prefill(&e, ids, drafted, if (drafted) (if (drafter) |*dr| dr else null) else null);
             const pre_s = secs(io, t0);
             t0 = now(io);
             var rounds: usize = 0;
             var detail: []const u8 = "";
+            if (drafted and std.c.getenv("TF_GLM_DF_PROF") != null) if (drafter) |*dr| try dr.profile(&e, io);
             if (drafted) {
                 const settings: ?copy.Settings = if (o.copy) try copy.Settings.fromEnv(e.wide_graph) else null;
-                const r = try dec.mtpDecode(&e, first, count, o.depth, true, &out, gpa, settings, ids);
+                const r = if (drafter) |*dr| try dec.dflashDecode(&e, dr, first, count, true, &out, gpa, settings, ids, policy) else try dec.mtpDecode(&e, first, count, o.depth, true, &out, gpa, settings, ids);
                 rounds = r.rounds;
-                if (settings != null) {
+                if (settings != null or drafter != null) {
                     var hist: std.ArrayList(u8) = .empty;
                     for (r.windows, 0..) |n, rows| if (n > 0) try hist.print(arena, " {d}x{d}", .{ n, rows });
                     detail = try std.fmt.allocPrint(arena, ", copies {d} rounds {d} drafts {d} kept, windows (n x rows){s}", .{ r.copy_rounds, r.copy_drafted, r.copy_accepted, hist.items });
@@ -168,7 +177,7 @@ pub fn main(init: std.process.Init) !u8 {
             if (!same) failed += 1;
             if (o.rank == 0) std.debug.print("{s} {s}: {d} prompt tokens in {d:.2} s, {d} tokens in {d:.2} s ({d:.1} tok/s{s}), {s}{s}\n", .{
                 if (same) "PASS" else "FAIL", name, ids.len, pre_s, out.items.len, dec_s,
-                @as(f64, @floatFromInt(out.items.len)) / @max(dec_s, 1e-9), if (drafted) try std.fmt.allocPrint(arena, ", {d} rounds{s}, MTP", .{ rounds, detail }) else "",
+                @as(f64, @floatFromInt(out.items.len)) / @max(dec_s, 1e-9), if (drafted) try std.fmt.allocPrint(arena, ", {d} rounds{s}, {s}", .{ rounds, detail, if (drafter != null) "DFlash2" else "MTP" }) else "",
                 if (same) "equal to Python" else try std.fmt.allocPrint(arena, "first difference at {d}", .{at}),
                 if (same) "" else try std.fmt.allocPrint(arena, " (got {any})", .{out.items[0..@min(out.items.len, at + 4)]}),
             });

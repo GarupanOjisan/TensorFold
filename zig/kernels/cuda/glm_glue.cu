@@ -126,16 +126,38 @@ extern "C" __global__ void tf_glm_topk(const unsigned short* __restrict__ logits
     }
   }
   __syncthreads();
-  if (threadIdx.x == 0) {   // ties at the threshold, lowest columns first
-    int at = written, left = need_eq;
-    for (int i = 0; i < vocab && left > 0; ++i) {
-      if (tf_glm_key(row[i]) == threshold) {
-        o[2 * at] = __float_as_uint(__uint_as_float((uint32_t)row[i] << 16));
-        o[2 * at + 1] = (uint32_t)(i + offset);
-        ++at;
-        --left;
-      }
+  // ties at the threshold, lowest columns first: a tile of blockDim.x columns at a time, each tie ranked in column order by a
+  // warp ballot and the warps' counts (the same pairs as a serial scan from column 0, without one thread walking the row)
+  __shared__ int warp_ties[32];
+  __shared__ int tie_at, tie_left;
+  if (threadIdx.x == 0) {
+    tie_at = written;
+    tie_left = need_eq;
+  }
+  __syncthreads();
+  const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+  for (int base = 0; base < vocab && tie_left > 0; base += blockDim.x) {
+    const int i = base + threadIdx.x;
+    const bool tie = i < vocab && tf_glm_key(row[i]) == threshold;
+    const unsigned mask = __ballot_sync(0xffffffffu, tie);
+    if (lane == 0) warp_ties[warp] = __popc(mask);
+    __syncthreads();
+    int before = 0;
+    for (int w = 0; w < warp; ++w) before += warp_ties[w];
+    const int rank = before + __popc(mask & ((1u << lane) - 1u));
+    if (tie && rank < tie_left) {
+      o[2 * (tie_at + rank)] = __float_as_uint(__uint_as_float((uint32_t)row[i] << 16));
+      o[2 * (tie_at + rank) + 1] = (uint32_t)(i + offset);
     }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      int total = 0;
+      for (int w = 0; w < (int)(blockDim.x >> 5); ++w) total += warp_ties[w];
+      const int took = total < tie_left ? total : tie_left;
+      tie_at += took;
+      tie_left -= took;
+    }
+    __syncthreads();
   }
 }
 
@@ -262,4 +284,60 @@ extern "C" __global__ void tf_glm_make_f8(const __nv_bfloat16* __restrict__ w, i
     q8[b * 128 + i] = (uint8_t)__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3);
   }
   scale[b] = s;
+}
+
+// -- DFlash2's glue (glm5_next/cuda/dflash2.py): the torch ops between its Triton launches --------------------------
+
+// `self.kc[i].index_copy_(1, idx, k)`: rows [kvh, rows, hd] into a cache [kvh, cap, hd] at the positions pos + r (modulo the
+// ring). grid (rows, kvh), block 128.
+extern "C" __global__ void tf_glm_df_scatter(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ cache,
+                                             const int64_t* __restrict__ pos, int rows, int cap, int ring, int hd) {
+  const int r = blockIdx.x, h = blockIdx.y;
+  int64_t at = pos[0] + r;
+  if (ring) at %= ring;
+  for (int d = threadIdx.x; d < hd; d += blockDim.x)
+    cache[((int64_t)h * cap + at) * hd + d] = src[((int64_t)h * rows + r) * hd + d];
+}
+
+// `_rotary`: phase = float(pos + r) * inv_freq, cos and sin in fp32, [rows, half]. grid (ceil(rows half / 128)), block 128.
+extern "C" __global__ void tf_glm_df_rope(const int64_t* __restrict__ pos, const float* __restrict__ inv_freq, int rows, int half,
+                                          float* __restrict__ cos_out, float* __restrict__ sin_out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * half) return;
+  const float phase = (float)(pos[0] + i / half) * inv_freq[i % half];
+  cos_out[i] = cosf(phase);
+  sin_out[i] = sinf(phase);
+}
+
+// `self.pos_dev += n`. one thread.
+extern "C" __global__ void tf_glm_df_pos_add(int64_t* __restrict__ pos, int n) { pos[0] += n; }
+
+// `_row`: the ranks' fp32 partials [world, count] added in rank order, then bf16. grid (ceil(count / 256)), block 256.
+extern "C" __global__ void tf_glm_df_rowsum(const float* __restrict__ g, int world, int count, __nv_bfloat16* __restrict__ out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= count) return;
+  float acc = g[i];
+  for (int w = 1; w < world; ++w) acc += g[(int64_t)w * count + i];
+  out[i] = __float2bfloat16(acc);
+}
+
+// `tap_rows`: five taps [n, d] side by side, [n, 5 d]. grid (n), block 256.
+extern "C" __global__ void tf_glm_df_cat(const __nv_bfloat16* __restrict__ t0, const __nv_bfloat16* __restrict__ t1,
+                                         const __nv_bfloat16* __restrict__ t2, const __nv_bfloat16* __restrict__ t3,
+                                         const __nv_bfloat16* __restrict__ t4, int d, __nv_bfloat16* __restrict__ out) {
+  const __nv_bfloat16* t[5] = {t0, t1, t2, t3, t4};
+  const int r = blockIdx.x;
+  for (int c = threadIdx.x; c < 5 * d; c += blockDim.x) out[(int64_t)r * 5 * d + c] = t[c / d][(int64_t)r * d + c % d];
+}
+
+// `F.linear(h, hproj).float()`: h [rows, k] times w [n, k] transposed, fp32 sums, rounded to bf16 and back. One warp an
+// output. grid (ceil(n / 8), rows), block 256.
+extern "C" __global__ void tf_glm_df_proj(const __nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ w,
+                                          float* __restrict__ out, int n, int k) {
+  const int col = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32, row = blockIdx.y;
+  if (col >= n) return;
+  float acc = 0.f;
+  for (int i = lane; i < k; i += 32) acc += __bfloat162float(h[(int64_t)row * k + i]) * __bfloat162float(w[(int64_t)col * k + i]);
+  for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
+  if (lane == 0) out[(int64_t)row * n + col] = __bfloat162float(__float2bfloat16(acc));
 }

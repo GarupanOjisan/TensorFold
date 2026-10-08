@@ -1,18 +1,20 @@
 //! GLM-5.3-Flash on two CUDA ranks behind the native family interface (native/cuda.zig): this process is rank 0
 //! and serves; rank 1 runs `tf-glm follow` on the other Spark. One stream at a time, windows of up to 16 rows, MTP
-//! drafts and v1.8's prompt-lookup (copy) drafts (glm_copy.zig). TF_GLM_PORT (default 29660) is the port rank 0 listens on for rank 1.
+//! drafts or DFlash2's (TF_GLM_DRAFTER_DIR; glm_dflash.zig) and v1.8's prompt-lookup (copy) drafts (glm_copy.zig). TF_GLM_PORT (default 29660) is the port rank 0 listens on for rank 1.
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
 const node = @import("glm_node.zig");
 const fwd = @import("glm_forward.zig");
 const copy = @import("glm_copy.zig");
+const dflash = @import("glm_dflash.zig");
 
 const be = lanes.backend;
 const Node = node.Node;
 const max_rows = fwd.Engine.max_rows;
 /// Drafts the MTP head chains at most: the 8-row window of earlier builds (the rows past it serve copies).
 const head_drafts = 7;
+const dflash_max = 15;
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{"exl3-mcg-4bit"};
@@ -41,7 +43,7 @@ pub const Loaded = struct {
 /// This rank's share of the checkpoint (the routed experts and most projections halve, the embedding and the
 /// replicated layers do not): what the memory admission compares with the budget before loading.
 pub fn weightBytes(total: u64) u64 {
-    return total / 2 + (4 << 30);
+    return total / 2 + (4 << 30) + if (node.drafterDir() != null) @as(u64, 2 << 30) else 0; // DFlash2's 4-bit layers: 1.8 GiB a rank
 }
 
 const ring = 64;
@@ -90,6 +92,10 @@ const Glm = struct {
     gpa: std.mem.Allocator,
     n: *Node,
     drafts: bool,
+    dflash: bool = false, // DFlash2 drafts (the MTP head is not loaded)
+    policy: dflash.Policy = .{},
+    dtoks: [dflash_max]u32 = undefined, // the chain DFlash2 picked for the stream's next window
+    dn: usize = 0,
     copy: CopyRule,
     stream: ?*lanes.Stream = null,
     drawn: [ring]u32 = undefined,
@@ -211,7 +217,7 @@ const Glm = struct {
             } else s.reuse_failed = true;
         }
         g.live.shrinkRetainingCapacity(@min(g.live.items.len, at));
-        try g.n.begin(ids, g.drafts, snap, at);
+        try g.n.begin(ids, g.drafts and !g.dflash, snap, at);
         s.cached = @intCast(at);
         g.pass = ids;
         defer {
@@ -291,10 +297,57 @@ const Glm = struct {
         _ = windows;
     }
 
+    /// DFlash2 in place of the MTP head (v1.8's dflash_decode): the kept rows' taps join its context, then, unless a copy is
+    /// ahead (v1.8 takes the copy first and runs no block), its block pass and chain (its own stop rule, not `r.depth`, up to
+    /// TF_GLM_DFLASH_POLICY's most) give the next window's drafts as host tokens (`treeFn`). The first round after a prompt
+    /// is taken as `r.depth` held drafts (the core does not ask for the chain there), filled up with the pending token.
+    fn draftDflash(g: *Glm, r: be.DraftRequest) !void {
+        const s = r.stream;
+        var from: node.From = .prompt;
+        var keep: usize = 0;
+        var pending: u32 = undefined;
+        if (r.rows) |rows| {
+            for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
+            try g.commit(rows.len);
+            if (r.position != g.n.e.st.pos + 1) return error.PositionMismatch;
+            from = .verify;
+            keep = rows.len;
+            pending = r.follow[rows.len - 1];
+        } else {
+            if (r.position != g.n.e.st.pos + 1) return error.PositionMismatch;
+            pending = if (r.follow.len > 0) r.follow[0] else try g.value(r.first orelse return error.NoFirstToken);
+        }
+        const room: i64 = s.draftRoom() - 1;
+        var want: usize = if (room > 0) @min(g.policy.most, @as(usize, @intCast(room))) else 0;
+        if (r.depth == 0) want = 0; // forced rows ahead: absorb only
+        if (want > 0) if (s.proposer) |pr| {
+            const width: i64 = @min(@as(i64, @intCast(g.copy.cfg.most)), room);
+            const found = pr.propose(s.context.items, width) catch @as([]const u32, &.{});
+            if (found.len >= 2 and pr.lastMatch() >= 8) want = 0; // the core's own copy test
+        };
+        try g.n.dflashTurn(from, keep, pending, want > 0);
+        g.dn = if (want > 0) g.n.dflash.?.chain(want, pending, r.position, if (s.sampling) |sm| .{ .seed = sm.seed, .temperature = sm.temperature } else null, g.policy, &g.dtoks) else 0;
+        const held = @max(g.dn, r.depth);
+        @memcpy(g.held[0..g.dn], g.dtoks[0..g.dn]);
+        for (g.dn..held) |i| g.held[i] = pending;
+        g.held_n = held;
+    }
+
+    fn treeFn(p: *anyopaque, s: *lanes.Stream, gpa: std.mem.Allocator) anyerror!?lanes.stream.Held {
+        _ = s;
+        const g = of(p);
+        if (!g.dflash) return null;
+        return .{ .count = @intCast(g.dn), .tokens = try gpa.dupe(u32, g.dtoks[0..g.dn]) };
+    }
+
     /// Absorb the kept rows with their following tokens, then hold `depth` drafts for the next window.
     fn draftFn(p: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
         const g = of(p);
         for (requests) |r| {
+            if (g.dflash) {
+                try g.draftDflash(r);
+                continue;
+            }
             if (r.depth > max_rows - 1) return error.DepthPastWindow;
             if (r.rows) |rows| {
                 for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
@@ -318,7 +371,7 @@ const Glm = struct {
     }
 
     fn backend(g: *Glm) be.Backend {
-        g.vtable = .{ .prefill = prefillFn, .first = firstFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn };
+        g.vtable = .{ .prefill = prefillFn, .first = firstFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .tree = treeFn };
         return .{ .ptr = g, .vtable = &g.vtable };
     }
 
@@ -332,7 +385,7 @@ const Glm = struct {
             .speculate_early = false,
             .drafts = head_drafts,
             .window_costs = &g.costs,
-            .mtp_step_ms = g.mtp_ms,
+            .mtp_step_ms = if (g.dflash) 0.1 else g.mtp_ms, // DFlash2's block pass costs the same at any depth
             .max_streams = 1,
         };
     }
@@ -341,7 +394,7 @@ const Glm = struct {
     fn measure(g: *Glm, io: std.Io) !void {
         var prompt: [64]u32 = undefined;
         for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + i);
-        _ = try g.n.prefill(&prompt, true, 0);
+        _ = try g.n.prefill(&prompt, !g.dflash, 0);
         var out: [max_rows]u32 = undefined;
         var ids: [max_rows]u32 = undefined;
         for (&ids, 0..) |*t, i| t.* = @intCast(2000 + i);
@@ -357,15 +410,34 @@ const Glm = struct {
         }
         var one: f64 = std.math.inf(f64);
         var three: f64 = std.math.inf(f64);
-        for (0..3) |_| {
+        if (!g.dflash) for (0..3) |_| {
             var t0 = now(io);
             try g.n.draft(.verify, out[0..1], ids[0..1]);
             one = @min(one, ms(io, t0));
             t0 = now(io);
             try g.n.draft(.verify, out[0..1], ids[0..3]);
             three = @min(three, ms(io, t0));
+        };
+        g.mtp_ms = if (g.dflash) 0.1 else @max(0.1, (three - one) / 2);
+        if (g.dflash) {
+            // DFlash2's pieces (Engine._calibrate's "block" and "taps8"): the block pass with its candidates read back, the
+            // chain on the host, and a context update of the last window's first 8 rows
+            var blk: f64 = std.math.inf(f64);
+            var chn: f64 = std.math.inf(f64);
+            var tap: f64 = std.math.inf(f64);
+            for (0..7) |_| {
+                var t0 = now(io);
+                try g.n.dflashTurn(.prompt, 0, 2000, true);
+                blk = @min(blk, ms(io, t0));
+                t0 = now(io);
+                _ = g.n.dflash.?.chain(7, 2000, 100, null, g.policy, &g.dtoks);
+                chn = @min(chn, ms(io, t0));
+                t0 = now(io);
+                try g.n.dflashTurn(.verify, 8, 2000, false);
+                tap = @min(tap, ms(io, t0));
+            }
+            std.log.info("GLM DFlash2 ms: block {d:.2}, chain {d:.2}, context update of 8 rows {d:.2}", .{ blk, chn, tap });
         }
-        g.mtp_ms = @max(0.1, (three - one) / 2);
         var line: [max_rows * 8]u8 = undefined;
         var w = std.Io.Writer.fixed(&line);
         for (g.costs) |c| w.print(" {d:.1}", .{c.ms}) catch {};
@@ -517,7 +589,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer n.deinit();
     const g = try gpa.create(Glm);
     errdefer gpa.destroy(g);
-    g.* = .{ .gpa = gpa, .n = n, .drafts = o.drafts and n.w.mtp != null, .copy = .{ .cfg = try copy.Settings.fromEnv(n.e.wide_graph) } };
+    g.* = .{ .gpa = gpa, .n = n, .drafts = o.drafts and (n.w.mtp != null or n.dflash != null), .dflash = n.dflash != null, .policy = try dflash.Policy.fromEnv(), .copy = .{ .cfg = try copy.Settings.fromEnv(n.e.wide_graph) } };
+    if (g.dflash and g.drafts) std.log.info("GLM drafts: DFlash2 (block {d}, up to {d} drafts a round, stop at {d:.2} of the noisy chain, beta {d:.1}); the MTP head is not loaded", .{ n.w.draft.?.block, g.policy.most, g.policy.confidence, g.policy.beta });
     if (g.drafts and g.copy.cfg.on) std.log.info("GLM copy drafts: up to {d} a round, match {d} tokens, {d} inside the reply, windows of 9 to 15 rows padded to {d}", .{ g.copy.cfg.most, g.copy.cfg.match, g.copy.cfg.reply_match, g.copy.cfg.pad });
     try g.measure(io);
     return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = 0, .ctx = g, .deinit = release };
@@ -543,7 +616,7 @@ pub const cache_planned = true;
 
 pub fn snapBytes(p: *anyopaque, at: u32) u64 {
     _ = at;
-    return Glm.of(p).n.e.snapshotBytes();
+    return Glm.of(p).n.snapshotBytes();
 }
 
 pub fn snapSave(p: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {

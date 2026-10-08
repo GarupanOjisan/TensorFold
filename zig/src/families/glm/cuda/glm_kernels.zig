@@ -56,6 +56,12 @@ pub const Kernels = struct {
     kda_chunk: cuda.Function,
     hc_partial: cuda.Function,
     l2pf: cuda.Function,
+    df_scatter: cuda.Function, // DFlash2's glue (glm_glue.cu)
+    df_rope: cuda.Function,
+    df_pos_add: cuda.Function,
+    df_rowsum: cuda.Function,
+    df_cat: cuda.Function,
+    df_proj: cuda.Function,
 
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
@@ -104,6 +110,12 @@ pub const Kernels = struct {
         k.tokens = try k.mods[2].function("tf_glm_tokens");
         k.greedy = try k.mods[2].function("tf_glm_greedy");
         k.topk = try k.mods[2].function("tf_glm_topk");
+        k.df_scatter = try k.mods[2].function("tf_glm_df_scatter");
+        k.df_rope = try k.mods[2].function("tf_glm_df_rope");
+        k.df_pos_add = try k.mods[2].function("tf_glm_df_pos_add");
+        k.df_rowsum = try k.mods[2].function("tf_glm_df_rowsum");
+        k.df_cat = try k.mods[2].function("tf_glm_df_cat");
+        k.df_proj = try k.mods[2].function("tf_glm_df_proj");
         k.quantize4 = try k.mods[2].function("tf_glm_quantize4");
         k.pack_dense = try k.mods[5].function("tf_pack_dense");
         k.transpose16 = try k.mods[5].function("tf_transpose_pad16");

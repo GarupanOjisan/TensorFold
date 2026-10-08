@@ -269,6 +269,25 @@ pub const Tri = struct {
     }
 
     /// qmm.group_sums (qmm.py:117): x [m, k] bf16 (rows strided) -> xs [m, k/64] fp32.
+    /// dflash2._dconv: the two-tap grouped dynamic convolution of x [rows, d] over rows r and r - 1 (`branch` 0 the first
+    /// mix, 1 the second), plus the residual `res` when given.
+    pub fn dconv(t: Tri, x: u64, dyn: u64, base: u64, res: ?u64, out: u64, rows: usize, d: usize, gs: usize, branch: usize) !void {
+        const block = 1024;
+        try t.run("_dconv_kernel", .{ rows, cdiv(d, block), 1 }, &.{ p("X", "*bf16", x), p("DYN", "*bf16", dyn), p("BASE", "*bf16", base), p("RES", "*bf16", res orelse x), p("OUT", "*bf16", out) }, &.{ ci("D", d), ci("G", d / gs), ci("GS", gs), ci("BRANCH", branch), flag("HAS_RES", res != null), ci("BLOCK", block), ci("SEG", 0) });
+    }
+
+    /// dflash2._prep: q and k normalized and rotated, v copied, [heads, rows, head_dim] each (`qo` unused without query heads).
+    pub fn draftPrep(t: Tri, qkv: u64, qn: u64, kn: u64, cos: u64, sin: u64, qo: u64, ko: u64, vo: u64, rows: usize, stride: usize, eps: f32, heads: usize, kvh: usize, hd: usize) !void {
+        try t.run("_prep_kernel", .{ rows, heads + 2 * kvh, 1 }, &.{ p("QKV", "*bf16", qkv), p("QN", "*bf16", qn), p("KN", "*bf16", kn), p("COS", "*fp32", cos), p("SIN", "*fp32", sin), p("QO", "*bf16", qo), p("KO", "*bf16", ko), p("VO", "*bf16", vo), int("L", rows), int("stride", stride), aot.float("eps", eps) }, &.{ ci("H", heads), ci("HKV", kvh), ci("HALF", hd / 2) });
+    }
+
+    /// dflash2's `_dattn_kernel`: each KV head attends its queries to the window's tiles and the block's keys. `pos` is the
+    /// context's end on the device.
+    pub fn draftAttention(t: Tri, q: u64, kc: u64, vc: u64, out: u64, pos: u64, window: usize, rows: usize, heads: usize, kvh: usize, hd: usize, cap: usize, causal: bool, ring: bool) !void {
+        const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(hd), -0.5));
+        try t.run("_dattn_kernel", .{ kvh, 1, 1 }, &.{ p("Q", "*bf16", q), p("K", "*bf16", kc), p("V", "*bf16", vc), p("OUT", "*bf16", out), p("POS", "*i64", pos), int("window", window), aot.float("scale", scale) }, &.{ ci("N", rows), ci("G", heads / kvh), ci("NH", heads), ci("HD", hd), ci("CAP", cap), ci("BK", 64), flag("CAUSAL", causal), flag("RING", ring), flag("SKIP", true) });
+    }
+
     pub fn groupSums(t: Tri, x: u64, x_stride: usize, xs: u64, m: usize, k: usize) !void {
         try t.run("_group_sums", .{ m, cdiv(k / 64, 16), 1 }, &.{ p("X", "*bf16", x), p("XS", "*fp32", xs), int("x_stride", x_stride) }, &.{ ci("K", k), ci("GB", 16) });
     }

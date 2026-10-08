@@ -105,6 +105,7 @@ pub const Buffers = struct {
     spo: u64,
     spm: u64,
     spl: u64,
+    taps: [5]u64, // DFlash2's taps: the stream means after five layers, [rows, D] each (0: off)
     pos_at: u64, // block positions, 16 bytes apart (TORCH-GLUE `pos_dev + r0`)
     greedy: u64, // [rows, 2] u32: this rank's (value, token)
     greedy_all: u64, // [2, rows, 2] u32 gathered
@@ -117,18 +118,18 @@ pub const Buffers = struct {
 pub const KdaScratch = struct { out: u64, k: u64, v: u64, g: u64, b: u64 };
 
 /// A captured graph's key: which head, window rows, the KDA state half it reads (main only), pool bucket (0: dense).
-const GraphKey = struct {
+pub const GraphKey = struct {
     head: Head,
     rows: u8,
     cur: u8,
     np: u32,
 
-    const Head = enum(u8) { main, mtp };
+    pub const Head = enum(u8) { main, mtp, dtaps, dblock }; // DFlash2's context update and block pass (glm_dflash.zig)
 };
 const GraphEntry = struct { key: GraphKey, exec: cuda.graph.Exec };
 
 /// Sizes every buffer for `rows`, then carves them out of `a` (a.size 0: count only).
-fn carve(a: *Arena, w: *const Weights, rows: usize, capacity: usize, prefill: bool, np_max: usize) Buffers {
+fn carve(a: *Arena, w: *const Weights, rows: usize, capacity: usize, prefill: bool, np_max: usize, tap_n: usize) Buffers {
     const c = w.cfg;
     const d: usize = c.hidden;
     const s: usize = c.hc;
@@ -154,6 +155,7 @@ fn carve(a: *Arena, w: *const Weights, rows: usize, capacity: usize, prefill: bo
     b.prefill = prefill;
     b.zero_first = false;
     b.ids = a.take(rows * 4);
+    for (&b.taps, 0..) |*t, i| t.* = if (i < tap_n) a.take(rows * d * bf) else 0;
     b.hin = a.take(rows * d * bf);
     b.x = a.take(rows * s * d * bf);
     b.normed = a.take(rows * d * bf);
@@ -301,6 +303,8 @@ pub const Engine = struct {
     /// TF_GLM_WIDE_GRAPHS (v1.8 production: 16; 0: off): the one verify-window width past 8 rows that replays a CUDA graph
     /// (copy drafts pad their windows up to it, glm_copy.zig); the others of 9..15 rows run eagerly.
     wide_graph: usize = 16,
+    /// DFlash2's tap layers (the target layers whose stream means `Buffers.taps` take); none when taps are off.
+    tap_layers: [5]u32 = @splat(std.math.maxInt(u32)),
     /// TF_GLM_EXL3_DEC (default on): v1.8's routed-expert kernels, plan and direct shared-expert combine; 0: the generic
     /// grouped kernel of v0.6.6 (the A/B path).
     exl3_v18: bool = true,
@@ -333,13 +337,13 @@ pub const Engine = struct {
     pub const mtp_rows = 8; // engine.MTP_ROWS: rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
     /// Windows of 1..8 and `wide_graph` rows x 2 KDA parities and MTP steps of 1..8 rows, each dense or at one of ~10 pool
     /// buckets (9 widths x 2 x 11 + 8 x 11 = 286).
-    pub const max_graphs = 320;
+    pub const max_graphs = 352;
     /// The most candidates a rank gives a sampled row (top_k + exact_sampling.MARGIN).
     pub const max_k = 1024;
     pub const prefill_rows = 2048; // geometry.PREFILL_ROWS
 
     /// Buffers for windows of max_rows rows, prompt chunks of prefill_rows and the MTP head, and one sequence's state.
-    pub fn init(w: *const Weights, d: *const cuda.Driver, s: cuda.Stream, t: tri.Tri, k: *const kern.Kernels, comm: Comm, capacity: usize, long_context: bool) !Engine {
+    pub fn init(w: *const Weights, d: *const cuda.Driver, s: cuda.Stream, t: tri.Tri, k: *const kern.Kernels, comm: Comm, capacity: usize, long_context: bool, taps: ?[5]u32) !Engine {
         if (std.c.getenv("TF_GLM_KDA_WIDE_ROWS")) |v| kern.wide_rows = try std.fmt.parseInt(usize, std.mem.span(v), 10);
         const c = w.cfg;
         const ll: usize = c.kda_heads / wt.world;
@@ -363,9 +367,10 @@ pub const Engine = struct {
         e.st.dsa_layers = n_dsa;
         // count, then allocate once and carve
         var count: Arena = .{ .base = 0, .size = 0 };
-        _ = carve(&count, w, max_rows, capacity, false, np_max);
-        _ = carve(&count, w, prefill_rows, capacity, true, np_max);
-        _ = carve(&count, w, mtp_rows, capacity, false, np_max);
+        const tap_n: usize = if (taps != null) 5 else 0;
+        _ = carve(&count, w, max_rows, capacity, false, np_max, tap_n);
+        _ = carve(&count, w, prefill_rows, capacity, true, np_max, tap_n);
+        _ = carve(&count, w, mtp_rows, capacity, false, np_max, 0);
         const kv_fp8 = try kvFp8();
         const state_bytes = stateBytes(w, capacity, n_kda, n_dsa, width, long_context, kv_fp8);
         const total = count.used + state_bytes + 4096 + (w.head.n + c.hidden) * bf + 1024;
@@ -373,9 +378,10 @@ pub const Engine = struct {
         errdefer e.mem.free();
         try e.mem.fill8(0, null);
         var a: Arena = .{ .base = e.mem.ptr, .size = total };
-        e.buf = carve(&a, w, max_rows, capacity, false, np_max);
-        e.pbuf = carve(&a, w, prefill_rows, capacity, true, np_max);
-        e.mbuf = carve(&a, w, mtp_rows, capacity, false, np_max);
+        e.buf = carve(&a, w, max_rows, capacity, false, np_max, tap_n);
+        e.pbuf = carve(&a, w, prefill_rows, capacity, true, np_max, tap_n);
+        e.mbuf = carve(&a, w, mtp_rows, capacity, false, np_max, 0);
+        e.tap_layers = taps orelse @splat(std.math.maxInt(u32));
         const st = &e.st;
         const lat_b: usize = if (kv_fp8) c.kv_lora + 16 else c.kv_lora * bf; // a latent cache row (kv8.row_bytes)
         const pk_b: usize = if (kv_fp8) c.i_dim + 16 else c.i_dim * bf; // and a pooled key row
@@ -459,7 +465,7 @@ pub const Engine = struct {
     }
 
     /// Launches key's graph, capturing `body(args)` into it the first time.
-    fn replay(e: *Engine, key: GraphKey, comptime body: anytype, args: anytype) !void {
+    pub fn replay(e: *Engine, key: GraphKey, comptime body: anytype, args: anytype) !void {
         for (e.graphs[0..e.n_graphs]) |g| if (std.meta.eql(g.key, key)) return g.exec.launchOn(e.s);
         if (e.n_graphs == max_graphs) return @call(.auto, body, args); // ponytail: past the table, eager
         try cuda.graph.beginCapture(e.s, .thread_local);
@@ -481,7 +487,7 @@ pub const Engine = struct {
         try exec.launchOn(e.s);
     }
 
-    fn upload(e: *Engine, dst: u64, bytes: []const u8) !void {
+    pub fn upload(e: *Engine, dst: u64, bytes: []const u8) !void {
         try e.d.check(e.d.api.cuMemcpyHtoDAsync_v2(dst, bytes.ptr, bytes.len, e.s.handle), "cuMemcpyHtoDAsync");
     }
 
@@ -489,7 +495,7 @@ pub const Engine = struct {
         try e.d.check(e.d.api.cuMemcpyDtoDAsync_v2(dst, src, bytes, e.s.handle), "cuMemcpyDtoDAsync");
     }
 
-    fn zero(e: *Engine, dst: u64, bytes: usize) !void {
+    pub fn zero(e: *Engine, dst: u64, bytes: usize) !void {
         try e.d.check(e.d.api.cuMemsetD8Async(dst, 0, bytes, e.s.handle), "cuMemsetD8Async");
     }
 
@@ -781,7 +787,10 @@ pub const Engine = struct {
         const c = e.w.cfg;
         const d: usize = c.hidden;
         try e.t.embed(b.ids, e.w.embed, b.x, rows, d, c.hc);
-        for (e.w.layers) |*l| try e.layerForward(l, b, rows, e.st.pos);
+        for (e.w.layers) |*l| {
+            try e.layerForward(l, b, rows, e.st.pos);
+            for (e.tap_layers, 0..) |tl, slot| if (tl == l.index and b.taps[slot] != 0) try e.t.streamMean(b.x, b.taps[slot], rows, d, c.hc);
+        }
         try e.t.streamMean(b.x, b.hidden, rows, d, c.hc);
         try e.t.rmsnorm(b.hidden, d, e.w.norm, b.fnormed, d, b.fxs, rows, d, c.eps);
         if (b.prefill) {

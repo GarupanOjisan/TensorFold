@@ -9,10 +9,18 @@ const tri = @import("glm_triton.zig");
 const kern = @import("glm_kernels.zig");
 const fwd = @import("glm_forward.zig");
 const dec = @import("glm_decode.zig");
+const dflash = @import("glm_dflash.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10 };
+
+/// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
+pub fn drafterDir() ?[]const u8 {
+    const v = std.c.getenv("TF_GLM_DRAFTER_DIR") orelse return null;
+    const s = std.mem.span(v);
+    return if (s.len == 0) null else s;
+}
 
 /// `begin` without a kept state: the pass starts at 0.
 pub const no_snapshot: u32 = 0xFFFF_FFFF;
@@ -34,6 +42,7 @@ pub const Node = struct {
     words: std.ArrayList(u32) = .empty,
     prompt: std.ArrayList(u32) = .empty, // the prompt `begin` started, which `chunk` reads
     mtp: bool = false,
+    dflash: ?dflash.Drafter = null,
     snaps: std.AutoHashMapUnmanaged(u32, cuda.DeviceBuffer) = .empty, // kept prompt states by id, this rank's half
 
     /// Both ranks: the TCP pair (rank 0 listens on `port`), NCCL, the rank's weights, kernels and engine state.
@@ -55,8 +64,8 @@ pub const Node = struct {
         errdefer n.pair.close();
         // both ranks must have been started with the same window and the same TF_GLM_DENSE (their all-gathered partials
         // would mix 4-bit and BF16 projections)
-        var mine = [3]u32{ @intCast(context), 0x474c4d31, @intFromEnum(try wt.denseKind()) };
-        var theirs: [3]u32 = undefined;
+        var mine = [4]u32{ @intCast(context), 0x474c4d31, @intFromEnum(try wt.denseKind()), @intFromBool(drafterDir() != null) };
+        var theirs: [4]u32 = undefined;
         if (rank == 0) {
             try n.pair.send(std.mem.sliceAsBytes(&mine));
             try n.pair.recv(std.mem.sliceAsBytes(&theirs));
@@ -84,12 +93,17 @@ pub const Node = struct {
         const cfg = try glm_config.parse(gpa, cfg_text);
         n.k = try kern.Kernels.load(d);
         errdefer n.k.deinit();
-        n.w = try wt.load(gpa, io, d, .{ .d = d, .s = n.stream }, &n.k, dir, cfg, rank, true);
+        const draft_dir = drafterDir();
+        n.w = try wt.load(gpa, io, d, .{ .d = d, .s = n.stream }, &n.k, dir, cfg, rank, draft_dir == null); // DFlash2 and the MTP head are not loaded together (TF_GLM_MTP=auto)
         errdefer n.w.deinit(gpa);
+        n.dflash = null;
+        if (draft_dir) |dd| try wt.loadDraft(gpa, io, d, .{ .d = d, .s = n.stream }, &n.k, &n.w, dd, rank, rank == 0);
         n.set = try cuda.aot.Set.load(gpa, io, d, ctx.device, kernels);
         errdefer n.set.deinit();
         const long_context = context > fwd.denseLimit(&n.w);
-        n.e = try Engine.init(&n.w, d, n.stream, .{ .set = &n.set, .s = n.stream }, &n.k, .{ .lib = &n.lib, .comm = n.comm }, context + Engine.max_rows, long_context);
+        n.e = try Engine.init(&n.w, d, n.stream, .{ .set = &n.set, .s = n.stream }, &n.k, .{ .lib = &n.lib, .comm = n.comm }, context + Engine.max_rows, long_context, if (n.w.draft) |dr| dr.taps else null);
+        errdefer n.e.deinit();
+        if (n.w.draft != null) n.dflash = try dflash.Drafter.init(gpa, d, &n.w, context + Engine.max_rows);
         return n;
     }
 
@@ -98,6 +112,7 @@ pub const Node = struct {
         while (it.next()) |b| b.free();
         n.snaps.deinit(n.gpa);
         n.prompt.deinit(n.gpa);
+        if (n.dflash) |*dr| dr.deinit();
         n.e.deinit();
         n.k.deinit();
         n.set.deinit();
@@ -141,15 +156,20 @@ pub const Node = struct {
         n.prompt.clearRetainingCapacity();
         try n.prompt.appendSlice(n.gpa, prompt);
         n.mtp = mtp;
-        if (snap == no_snapshot) return n.e.reset();
+        if (snap == no_snapshot) {
+            try n.e.reset();
+            if (n.dflash) |*dr| try dr.reset(&n.e);
+            return;
+        }
         const b = n.snaps.get(snap) orelse return error.NoSuchSnapshot;
         try n.e.restoreState(b.ptr, at);
+        if (n.dflash) |*dr| try dr.restore(&n.e, b.ptr + n.e.snapshotBytes(), at);
     }
 
     /// The begun prompt's rows at .. at + rows, at the state's position.
     pub fn chunk(n: *Node, at: usize, rows: usize) !void {
         try n.send(.chunk, &.{ @intCast(at), @intCast(rows) });
-        try dec.prefillChunk(&n.e, n.prompt.items, at, rows, n.mtp);
+        try dec.prefillChunk(&n.e, n.prompt.items, at, rows, n.mtp, if (n.dflash) |*dr| dr else null);
     }
 
     /// The first token after the prompt's last chunk. k 0: greedy, the token returned; else the last row's k
@@ -163,11 +183,30 @@ pub const Node = struct {
     pub fn save(n: *Node, id: u32) !void {
         try n.send(.save, &.{id});
         errdefer n.drop(id); // rank 0 failed: rank 1 frees its half too
-        var b = try cuda.DeviceBuffer.alloc(n.e.d, n.e.snapshotBytes());
+        var b = try cuda.DeviceBuffer.alloc(n.e.d, n.snapshotBytes());
         errdefer b.free();
         try n.e.saveState(b.ptr);
+        if (n.dflash) |*dr| try dr.save(&n.e, b.ptr + n.e.snapshotBytes());
         try n.stream.synchronize(); // the copy is whole before a later chunk changes the state
         try n.snaps.put(n.gpa, id, b);
+    }
+
+    /// A kept prompt state's bytes on this rank: the engine's, and DFlash2's ring.
+    pub fn snapshotBytes(n: *const Node) usize {
+        return n.e.snapshotBytes() + if (n.dflash) |*dr| dr.stateBytes() else 0;
+    }
+
+    /// DFlash2's turn (rank 0 sends it, both run it): from .verify the first `keep` rows of the last window join its context
+    /// (their taps); then, with `block`, the block pass for `pending`, whose merged candidates rank 0 reads back (`chainOf`).
+    pub fn dflashTurn(n: *Node, from: From, kept: usize, pending: u32, block: bool) !void {
+        try n.send(.dflash, &.{ @backingInt(from), @intCast(kept), pending, @intFromBool(block) });
+        try n.dflashRun(from, kept, pending, block);
+    }
+
+    fn dflashRun(n: *Node, from: From, kept: usize, pending: u32, block: bool) !void {
+        const dr = &(n.dflash orelse return error.NoDraftModel);
+        if (from == .verify) try dr.addTaps(&n.e, &n.e.buf, kept);
+        if (block and dr.context_end > 0) try dr.block(&n.e, pending, n.rank == 0);
     }
 
     pub fn drop(n: *Node, id: u32) void {
@@ -252,6 +291,7 @@ pub const Node = struct {
                 .verify => try n.verify(w[1..], w[0], scratch[0 .. w.len - 1]),
                 .keep => try n.keep(w[0], w[1]),
                 .draft => try n.draft(@fromBackingInt(@intCast(w[0])), w[2..], scratch[0..w[1]]),
+                .dflash => try n.dflashRun(@fromBackingInt(@intCast(w[0])), w[1], w[2], w[3] != 0),
                 .quit => return,
             }
         }
