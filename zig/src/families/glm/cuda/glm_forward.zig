@@ -332,6 +332,9 @@ pub const Engine = struct {
     /// TF_GLM_COMBINE_SY (default on, with exl3_v18): decode windows combine the shared expert's row where it is.
     combine_sy: bool = true,
     capturing: bool = false,
+    /// The nucleus draw's device scratch (`nucleusGather`), allocated at its first use, and its host copy.
+    nuc_dev: ?cuda.DeviceBuffer = null,
+    nuc_host: []u64 = &.{},
 
     pub const max_rows = 16; // engine.MAX_ROWS: a pending token and up to 15 copied drafts
     pub const mtp_rows = 8; // engine.MTP_ROWS: rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
@@ -345,6 +348,13 @@ pub const Engine = struct {
     /// Buffers for windows of max_rows rows, prompt chunks of prefill_rows and the MTP head, and one sequence's state.
     pub fn init(w: *const Weights, d: *const cuda.Driver, s: cuda.Stream, t: tri.Tri, k: *const kern.Kernels, comm: Comm, capacity: usize, long_context: bool, taps: ?[5]u32) !Engine {
         if (std.c.getenv("TF_GLM_KDA_WIDE_ROWS")) |v| kern.wide_rows = try std.fmt.parseInt(usize, std.mem.span(v), 10);
+        if (std.c.getenv("TF_GLM_EXL3_DEC_ORDER")) |v| {
+            kern.dec_order = std.fmt.parseInt(usize, std.mem.span(v), 10) catch 9;
+            if (kern.dec_order > 2) {
+                std.log.err("TF_GLM_EXL3_DEC_ORDER is 0, 1 or 2, not {s}", .{std.mem.span(v)});
+                return error.BadDecOrder;
+            }
+        }
         const c = w.cfg;
         const ll: usize = c.kda_heads / wt.world;
         const width = 3 * ll * 128 + 2 * 128 + ll;
@@ -410,6 +420,8 @@ pub const Engine = struct {
         e.np_max = np_max;
         e.n_graphs = 0;
         e.capturing = false;
+        e.nuc_dev = null;
+        e.nuc_host = &.{};
         e.l2pf_active = false; // `e` starts undefined, so every field with a default but no assignment here is garbage
         e.draft_head = w.draft_head;
         e.full_dev = try cuda.DeviceBuffer.alloc(d, wt.world * max_rows * w.head.n * bf);
@@ -444,6 +456,8 @@ pub const Engine = struct {
         for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
         if (e.l2pf) |*p| p.deinit();
         e.full_dev.free();
+        if (e.nuc_dev) |*b| b.free();
+        if (e.nuc_host.len > 0) std.heap.page_allocator.free(e.nuc_host);
         std.heap.page_allocator.free(e.full_host);
         e.mem.free();
     }
@@ -922,6 +936,72 @@ pub const Engine = struct {
         try e.comm.lib.check(e.comm.lib.api.ncclAllGather(b.cand, b.cand_all, n, .u32, e.comm.comm, e.s.handle), "ncclAllGather");
         try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(&e.cand_host, b.cand_all, wt.world * n * 4, e.s.handle), "cuMemcpyDtoHAsync");
         try e.s.synchronize();
+    }
+
+    /// The most candidates a rank sends for a nucleus draw (sampling.WIDER).
+    pub const max_nucleus = 16384;
+
+    /// sampling.nucleus_rows' `_shares` for `rows` rows of `logits` (this rank's half of the vocabulary, bf16): every rank's top
+    /// `count` (value, id, mass) per row and its shard's mass total and width, as 64-bit words [rank][row][count float64 values,
+    /// count ids, count masses, sum, width], gathered on every rank. The row maxima come from `greedy`'s gather.
+    pub fn nucleusGather(e: *Engine, logits: u64, rows: usize, temperature: f64, count: usize) ![]const u64 {
+        if (rows == 0 or rows > max_rows or count == 0 or count > max_nucleus) return error.BadNucleus;
+        const world = wt.world;
+        const vn = e.w.head.n;
+        const per_row = 3 * max_nucleus + 2;
+        // [sums: max_rows words][candidate pairs: max_rows * 2 * max_nucleus u32][packed: max_rows * per_row words][gathered]
+        const cand_off = max_rows * 8;
+        const loc_off = cand_off + max_rows * 2 * max_nucleus * 4;
+        const all_off = loc_off + max_rows * per_row * 8;
+        if (e.nuc_dev == null) {
+            e.nuc_dev = try cuda.DeviceBuffer.alloc(e.d, all_off + world * max_rows * per_row * 8);
+            e.nuc_host = try std.heap.page_allocator.alloc(u64, world * max_rows * per_row);
+        }
+        const base = e.nuc_dev.?.ptr;
+        const inv_t: f64 = 1.0 / @max(temperature, 1e-6);
+        const b = &e.buf;
+        var a: cuda.Args = .{};
+        a.add(logits);
+        a.add(@as(i32, @intCast(vn)));
+        a.add(@as(i32, @intCast(vn)));
+        a.add(@as(i32, @intCast(e.w.rank * vn)));
+        a.add(b.greedy);
+        try cuda.launch.launch(e.k.greedy, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.s, &a);
+        try e.comm.lib.check(e.comm.lib.api.ncclAllGather(b.greedy, b.greedy_all, rows * 2, .u32, e.comm.comm, e.s.handle), "ncclAllGather");
+        var st: cuda.Args = .{};
+        st.add(logits);
+        st.add(@as(i32, @intCast(vn)));
+        st.add(@as(i32, @intCast(vn)));
+        st.add(inv_t);
+        st.add(b.greedy_all);
+        st.add(@as(i32, world));
+        st.add(@as(i32, @intCast(rows)));
+        st.add(base);
+        try cuda.launch.launch(e.k.nuc_stats, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.s, &st);
+        var tk: cuda.Args = .{};
+        tk.add(logits);
+        tk.add(@as(i32, @intCast(vn)));
+        tk.add(@as(i32, @intCast(vn)));
+        tk.add(@as(i32, @intCast(count)));
+        tk.add(@as(i32, @intCast(e.w.rank * vn)));
+        tk.add(base + cand_off);
+        try cuda.launch.launch(e.k.topk, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.s, &tk);
+        const words = rows * (3 * count + 2);
+        var pk: cuda.Args = .{};
+        pk.add(base + cand_off);
+        pk.add(@as(i32, @intCast(count)));
+        pk.add(inv_t);
+        pk.add(b.greedy_all);
+        pk.add(@as(i32, world));
+        pk.add(@as(i32, @intCast(rows)));
+        pk.add(base);
+        pk.add(@as(i32, @intCast(vn)));
+        pk.add(base + loc_off);
+        try cuda.launch.launch(e.k.nuc_pack, .{ .grid = .{ .x = @intCast((count + 255) / 256), .y = @intCast(rows) }, .block = .{ .x = 256 } }, e.s, &pk);
+        try e.comm.lib.check(e.comm.lib.api.ncclAllGather(base + loc_off, base + all_off, words * 2, .u32, e.comm.comm, e.s.handle), "ncclAllGather");
+        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(e.nuc_host.ptr, base + all_off, world * words * 8, e.s.handle), "cuMemcpyDtoHAsync");
+        try e.s.synchronize();
+        return e.nuc_host[0 .. world * words];
     }
 
     /// nucleus_rows' gather of whole shards: every rank's `rows` logits rows into full_host, [rank][row][head.n].

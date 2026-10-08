@@ -341,3 +341,60 @@ extern "C" __global__ void tf_glm_df_proj(const __nv_bfloat16* __restrict__ h, c
   for (int o = 16; o > 0; o >>= 1) acc += __shfl_xor_sync(0xffffffffu, acc, o);
   if (lane == 0) out[(int64_t)row * n + col] = __bfloat162float(__float2bfloat16(acc));
 }
+
+// -- the top_p nucleus draw's device side (cuda/sampling.py nucleus_rows, TENSORFOLD_NUCLEUS_UNION): per row, the mass floor(exp(v - top)
+// 2^40) of every token in fixed point (v = logit * (1 / max(T, 1e-6)) in float64 as torch's tensor / scalar computes it, top the
+// maximum over the ranks' row maxima, which `all` holds as tf_glm_greedy wrote them, gathered: [world][rows][value bits, id]),
+// the shard's sum, and the top `count` candidates' (value, id, mass). No fused multiply-add (the module's flags), the same
+// double exp as torch's CUDA kernel.
+__device__ __forceinline__ double tf_nuc_top(const uint32_t* all, int world, int rows, int r, double inv_t) {
+  double top = -INFINITY;
+  for (int k = 0; k < world; ++k) {
+    const double x = (double)__uint_as_float(all[((int64_t)k * rows + r) * 2]) * inv_t;
+    top = x > top ? x : top;
+  }
+  return top;
+}
+
+// grid (rows), block 1024: sums[r] = the shard's mass total (an integer: the order of the sum does not matter).
+extern "C" __global__ void tf_glm_nuc_stats(const unsigned short* __restrict__ logits, int vocab, int ld, double inv_t,
+                                            const uint32_t* __restrict__ all, int world, int rows,
+                                            unsigned long long* __restrict__ sums) {
+  __shared__ unsigned long long red[1024];
+  const int r = blockIdx.x;
+  const unsigned short* row = logits + (int64_t)r * ld;
+  const double top = tf_nuc_top(all, world, rows, r, inv_t);
+  unsigned long long acc = 0;
+  for (int i = threadIdx.x; i < vocab; i += blockDim.x) {
+    const double x = (double)__uint_as_float((uint32_t)row[i] << 16) * inv_t;
+    acc += (unsigned long long)floor(exp(x - top) * 1099511627776.0);
+  }
+  red[threadIdx.x] = acc;
+  __syncthreads();
+  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) red[threadIdx.x] += red[threadIdx.x + s];
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) sums[r] = red[0];
+}
+
+// grid (ceil(count / 256), rows), block 256: out[r] = [count value bits (float64)][count ids][count masses][sum][width] as 64-bit
+// words, from tf_glm_topk's (value bits, id) pairs `cand` [rows][count][2].
+extern "C" __global__ void tf_glm_nuc_pack(const uint32_t* __restrict__ cand, int count, double inv_t, const uint32_t* __restrict__ all,
+                                           int world, int rows, const unsigned long long* __restrict__ sums, int width,
+                                           unsigned long long* __restrict__ out) {
+  const int r = blockIdx.y, i = blockIdx.x * blockDim.x + threadIdx.x;
+  unsigned long long* o = out + (int64_t)r * (3 * count + 2);
+  if (i < count) {
+    const uint32_t* c = cand + ((int64_t)r * count + i) * 2;
+    const double x = (double)__uint_as_float(c[0]) * inv_t;
+    const double top = tf_nuc_top(all, world, rows, r, inv_t);
+    o[i] = (unsigned long long)__double_as_longlong(x);
+    o[count + i] = (unsigned long long)c[1];
+    o[2 * count + i] = (unsigned long long)floor(exp(x - top) * 1099511627776.0);
+  }
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    o[3 * count] = sums[r];
+    o[3 * count + 1] = (unsigned long long)width;
+  }
+}

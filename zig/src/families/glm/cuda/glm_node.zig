@@ -13,7 +13,7 @@ const dflash = @import("glm_dflash.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11 };
 
 /// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 pub fn drafterDir() ?[]const u8 {
@@ -227,14 +227,35 @@ pub const Node = struct {
         _ = try n.pick(n.e.buf.logits, rows.len, k, out);
     }
 
-    /// A `k` asking for every rank's whole logits rows (Engine.fullRows) instead of k candidates a rank.
+    /// A `k` asking for a draw over the vocabulary (sampling.nucleus_rows, or a top_k past the candidates a rank gives): the
+    /// forward leaves its rows' logits where they are and the draw's `nucleus` commands follow.
     pub const whole_vocabulary: usize = Engine.max_k + 1;
 
-    fn pick(n: *Node, logits: u64, rows: usize, k: usize, out: ?[]u32) !u32 {
-        if (k == whole_vocabulary) {
+    /// Which rows a `nucleus` command reads: the last window's, or the prompt's last row.
+    pub const Rows = enum(u32) { window = 0, last = 1 };
+
+    /// The draw's gather (rank 0 sends it, both run it): `count` > 0: Engine.nucleusGather's candidates; 0: every rank's whole rows
+    /// (Engine.fullRows, into Engine.full_host). The words are valid until the next call.
+    pub fn nucleus(n: *Node, which: Rows, rows: usize, temperature: f64, count: usize) ![]const u64 {
+        const t: u64 = @bitCast(temperature);
+        try n.send(.nucleus, &.{ @backingInt(which), @intCast(rows), @intCast(count), @truncate(t), @truncate(t >> 32) });
+        return n.nucleusRun(which, rows, temperature, count);
+    }
+
+    fn nucleusRun(n: *Node, which: Rows, rows: usize, temperature: f64, count: usize) ![]const u64 {
+        const logits = switch (which) {
+            .window => n.e.buf.logits,
+            .last => n.e.last_logits,
+        };
+        if (count == 0) {
             _ = try n.e.fullRows(logits, rows);
-            return 0;
+            return &.{};
         }
+        return n.e.nucleusGather(logits, rows, temperature, count);
+    }
+
+    fn pick(n: *Node, logits: u64, rows: usize, k: usize, out: ?[]u32) !u32 {
+        if (k == whole_vocabulary) return 0; // the draw's own commands (`nucleus`) read the rows
         if (k > 0) {
             try n.e.candidates(&n.e.buf, logits, rows, k);
             return 0;
@@ -292,6 +313,7 @@ pub const Node = struct {
                 .keep => try n.keep(w[0], w[1]),
                 .draft => try n.draft(@fromBackingInt(@intCast(w[0])), w[2..], scratch[0..w[1]]),
                 .dflash => try n.dflashRun(@fromBackingInt(@intCast(w[0])), w[1], w[2], w[3] != 0),
+                .nucleus => _ = try n.nucleusRun(@fromBackingInt(@intCast(w[0])), w[1], @bitCast(@as(u64, w[3]) | (@as(u64, w[4]) << 32)), w[2]),
                 .quit => return,
             }
         }

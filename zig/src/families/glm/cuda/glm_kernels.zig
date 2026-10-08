@@ -41,9 +41,9 @@ pub const Kernels = struct {
     /// v1.8's routed-expert kernels (glm_exl3d: glm5_next/cuda/exl3.cu) and the plan kernels of experts.cu.
     rot_rows: cuda.Function,
     rot_pairs: cuda.Function,
-    dec_gu_rows: cuda.Function,
-    dec_gu: cuda.Function,
-    dec_down: cuda.Function,
+    dec_gu_rows: [3]cuda.Function, // by launch order (TF_GLM_EXL3_DEC_ORDER, v1.10 patch 0090)
+    dec_gu: [3]cuda.Function,
+    dec_down: [3]cuda.Function,
     gu_epilogue18: cuda.Function,
     prompt_order: cuda.Function,
     prompt_gu_rows: cuda.Function,
@@ -56,6 +56,8 @@ pub const Kernels = struct {
     kda_chunk: cuda.Function,
     hc_partial: cuda.Function,
     l2pf: cuda.Function,
+    nuc_stats: cuda.Function, // the top_p nucleus draw's device side (glm_glue.cu)
+    nuc_pack: cuda.Function,
     df_scatter: cuda.Function, // DFlash2's glue (glm_glue.cu)
     df_rope: cuda.Function,
     df_pos_add: cuda.Function,
@@ -110,6 +112,8 @@ pub const Kernels = struct {
         k.tokens = try k.mods[2].function("tf_glm_tokens");
         k.greedy = try k.mods[2].function("tf_glm_greedy");
         k.topk = try k.mods[2].function("tf_glm_topk");
+        k.nuc_stats = try k.mods[2].function("tf_glm_nuc_stats");
+        k.nuc_pack = try k.mods[2].function("tf_glm_nuc_pack");
         k.df_scatter = try k.mods[2].function("tf_glm_df_scatter");
         k.df_rope = try k.mods[2].function("tf_glm_df_rope");
         k.df_pos_add = try k.mods[2].function("tf_glm_df_pos_add");
@@ -133,9 +137,11 @@ pub const Kernels = struct {
         };
         k.rot_rows = try k.mods[7].function(e18.rot_rows);
         k.rot_pairs = try k.mods[7].function(e18.rot_pairs);
-        k.dec_gu_rows = try k.mods[7].function(e18.dec_gu_rows);
-        k.dec_gu = try k.mods[7].function(e18.dec_gu);
-        k.dec_down = try k.mods[7].function(e18.dec_down);
+        inline for (0..3) |o| {
+            k.dec_gu_rows[o] = try k.mods[7].function(e18.dec(0, true, o));
+            k.dec_gu[o] = try k.mods[7].function(e18.dec(0, false, o));
+            k.dec_down[o] = try k.mods[7].function(e18.dec(1, false, o));
+        }
         k.gu_epilogue18 = try k.mods[7].function(e18.gu_epilogue);
         k.prompt_order = try k.mods[7].function(e18.prompt_order);
         k.prompt_gu_rows = try k.mods[7].function(e18.prompt_gu_rows);
@@ -190,9 +196,10 @@ const qmm_cfgs = [_]QmmCfg{ .{ .bn = 64, .wn = 4, .stages = 4 }, .{ .bn = 128, .
 const e18 = struct {
     const rot_rows = "_ZN12tf_glm_exl3d13rot_in_kernelILb1EEEvPK13__nv_bfloat16iPKiPK6__halfS8_PS6_S9_ii";
     const rot_pairs = "_ZN12tf_glm_exl3d13rot_in_kernelILb0EEEvPK13__nv_bfloat16iPKiPK6__halfS8_PS6_S9_ii";
-    const dec_gu_rows = "_ZN12tf_glm_exl3d10dec_kernelILi8ELi4ELi16ELi0ELb1ELi1ELi1EEEvPK6__halfS3_PKjS5_PKiS7_S7_PfiiiiiiS3_S3_S3_PvfPi";
-    const dec_gu = "_ZN12tf_glm_exl3d10dec_kernelILi8ELi4ELi16ELi0ELb0ELi1ELi1EEEvPK6__halfS3_PKjS5_PKiS7_S7_PfiiiiiiS3_S3_S3_PvfPi";
-    const dec_down = "_ZN12tf_glm_exl3d10dec_kernelILi8ELi4ELi16ELi1ELb0ELi1ELi1EEEvPK6__halfS3_PKjS5_PKiS7_S7_PfiiiiiiS3_S3_S3_PvfPi";
+    /// dec_kernel<8, 4, 16, fuse, xrow, 1, 1, swz>'s mangled name.
+    fn dec(comptime fuse: u8, comptime xrow: bool, comptime swz: u8) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN12tf_glm_exl3d10dec_kernelILi8ELi4ELi16ELi{d}ELb{d}ELi1ELi1ELi{d}EEEvPK6__halfS3_PKjS5_PKiS7_S7_PfiiiiiiS3_S3_S3_PvfPi", .{ fuse, @intFromBool(xrow), swz });
+    }
     const gu_epilogue = "_ZN12tf_glm_exl3d22gateup_epilogue_kernelEPKfPKiPK6__halfS6_S6_PS4_iiiif";
     const prompt_order = "_ZN12tf_glm_exl3d19prompt_order_kernelEPKiS1_Piii";
     const prompt_gu_rows = "_ZN12tf_glm_exl3d20prompt_gateup_kernelILi64ELi8ELb1EEEvPK6__halfS3_PKjS5_PKiS7_S7_S3_S3_S3_PS1_iiifiS7_";
@@ -434,6 +441,10 @@ pub fn l2Prefetch(k: *const Kernels, s: cuda.Stream, table: u64, first: usize, c
 /// kda.py WIDE_ROWS (TF_GLM_KDA_WIDE_ROWS, v1.8's default 1; 64 was v0.6.6's): from this many rows a chain runs as prep, step
 /// and out (the same bits as the one-block chain). The engine sets it from the environment before it sizes its buffers.
 pub var wide_rows: usize = 1;
+
+/// TF_GLM_EXL3_DEC_ORDER (v1.10 patch 0090): the decode expert kernel's block launch order, 0 (default) as launched, 1 or 2 a k slice's
+/// blocks together; the same bits. The engine sets it from the environment.
+pub var dec_order: usize = 0;
 
 /// sizeof(Smem) of kda_chunk.cu's chunk_kernel (nvcc).
 const kda_chunk_smem: u32 = 98560;
@@ -754,7 +765,7 @@ pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick
     for ([_]u64{ ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| g.add(v);
     g.add(limit);
     g.add(@as(u64, 0)); // done: only the gate/up epilogue fused into the kernel (TF_GLM_EXL3_FUSE 2) counts blocks
-    try go(if (rows_in) k.dec_gu_rows else k.dec_gu, s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
+    try go(if (rows_in) k.dec_gu_rows[dec_order] else k.dec_gu[dec_order], s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
     var e: cuda.Args = .{};
     for ([_]u64{ sc.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| e.add(v);
     for ([_]usize{ p, i_w, sk_gu, slots }) |v| e.add(int(v));
@@ -766,7 +777,7 @@ pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick
     for ([_]u64{ ex.svh_d, ex.svh_d, ex.svh_d, sc.y }) |v| dn.add(v);
     dn.add(@as(f32, 0));
     dn.add(@as(u64, 0));
-    try go(k.dec_down, s, .{ items, d / 128, 1 }, 128, 0, &dn);
+    try go(k.dec_down[dec_order], s, .{ items, d / 128, 1 }, 128, 0, &dn);
 }
 
 fn grouped(k: *const Kernels, s: cuda.Stream, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, sc: Exl3Scratch, mats: usize, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, maxu: usize, mt: usize) !void {

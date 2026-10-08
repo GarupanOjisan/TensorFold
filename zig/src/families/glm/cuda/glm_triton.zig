@@ -99,6 +99,10 @@ pub const row_score_g = 128;
 pub const score_rb = 4;
 pub const split_from = 8192;
 pub const split_rows = 64;
+/// sparse.SPLIT_BLK (v1.10 patch 0085): step 4's earlier chunks an iteration. And sparse.SCORE_LOOP (patch 0086): the pool blocks a
+/// `_scores` program takes (one row a program; speed only).
+pub const split_blk = 16;
+pub const score_loop = 32;
 
 /// sparse.split_chunk / split_chunks: scores a `_select_split` chunk program takes, and the chunk programs a row of np scores takes.
 fn splitChunk(np: usize) usize {
@@ -404,7 +408,7 @@ pub const Tri = struct {
         const gt = split + rows * (1024 + cp * 256) * 4;
         try t.s.d.check(t.s.d.api.cuMemsetD8Async(tot, 0, rows * 1024 * 4, t.s.handle), "cuMemsetD8Async");
         for (0..5) |step| {
-            try t.run("_select_split", .{ rows, cp, 1 }, &.{ p("S", "*fp32", scores), int("s_stride", np), int("NPC", np), p("POS", "*i32", pos), p("SPR", "*i32", split), p("TOT", "*i32", tot), p("HIST", "*i32", hist), p("GT", "*i32", gt), if (toks) p("OUT", "*i32", split) else p("OUT", "*i64", pools), p("TOK", "*i32", if (toks) tokens else split), p("CNT", "*i32", if (toks) counts else split) }, &.{ ci("W", select_width), ci("K", topk_pools), ci("PL", pool), ci("CHS", splitChunk(np)), ci("CP", cp), ci("STEP", step), flag("SEG", false), flag("VIS", toks), flag("TOKS", toks) });
+            try t.run("_select_split", .{ rows, cp, 1 }, &.{ p("S", "*fp32", scores), int("s_stride", np), int("NPC", np), p("POS", "*i32", pos), p("SPR", "*i32", split), p("TOT", "*i32", tot), p("HIST", "*i32", hist), p("GT", "*i32", gt), if (toks) p("OUT", "*i32", split) else p("OUT", "*i64", pools), p("TOK", "*i32", if (toks) tokens else split), p("CNT", "*i32", if (toks) counts else split) }, &.{ ci("W", select_width), ci("K", topk_pools), ci("PL", pool), ci("CHS", splitChunk(np)), ci("CP", cp), ci("STEP", step), flag("SEG", false), flag("VIS", toks), flag("TOKS", toks), ci("BLK", split_blk) });
         }
     }
 
@@ -422,7 +426,7 @@ pub const Tri = struct {
         while (a < rows) : (a += b) {
             const n = @min(b, rows - a);
             const at = pos_at[a / b];
-            try t.run("_scores", .{ cdiv(n, score_rb), cdiv(np, 64), 1 }, &.{ p("QI", "*bf16", qi + a * heads * dim * bf16), p("W", "*bf16", w + a * w_stride * bf16), int("w_stride", w_stride), t.kvv("PK", pk), t.kvs("PKS", pk), p("OUT", "*fp32", scores), p("POS", "*i32", at), int("R", n), int("NP", np), aot.float("scale", indexScale(dim)), aot.float("wscale", wscale) }, &.{ ci("H", heads), ci("HP", @max(16, pow2(heads))), ci("D", dim), ci("BP", 64), ci("RB", score_rb), ci("RS", t.kvRow(128)), flag("FP8", t.fp8) });
+            try t.run("_scores", .{ n, cdiv(cdiv(np, 64), score_loop), 1 }, &.{ p("QI", "*bf16", qi + a * heads * dim * bf16), p("W", "*bf16", w + a * w_stride * bf16), int("w_stride", w_stride), t.kvv("PK", pk), t.kvs("PKS", pk), p("OUT", "*fp32", scores), p("POS", "*i32", at), int("R", n), int("NP", np), aot.float("scale", indexScale(dim)), aot.float("wscale", wscale) }, &.{ ci("H", heads), ci("HP", @max(16, pow2(heads))), ci("D", dim), ci("BP", 64), ci("L", score_loop), ci("RS", t.kvRow(128)), flag("FP8", t.fp8) });
             if (n < split_rows and np >= split_from) {
                 try t.selectSplit(scores, np, at, split, pools, 0, 0, n, false);
             } else {

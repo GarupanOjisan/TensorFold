@@ -346,7 +346,7 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
 //      ld.global.nc.L1::no_allocate.v4 (lane l: bytes 16 l .. of each 512 B of a step, NT / 4 loads a lane), PD
 //      steps in flight, through a 1 KB staging area in the warp's own slice of `red` (two __syncwarp a step), read
 //      back as word `lane` of each tile.
-template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1>
+template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1, int SWZ = 0>
 __global__ void __launch_bounds__(W * 32) dec_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
     const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
@@ -355,7 +355,14 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
     float limit, int* __restrict__ done) {
     static_assert(FUSE == 0 || NT * 16 == 128, "a fused epilogue needs one 128-column Hadamard block a program");
     static_assert(LD == 0 || (NT % 4 == 0 && PD >= 1 && STEPS % PD == 0), "LD 1: NT a multiple of 4, PD | STEPS");
-    const int item = blockIdx.x, nblock = blockIdx.y;
+    int item = blockIdx.x, nblock = blockIdx.y, zz = blockIdx.z;
+    if constexpr (SWZ != 0) {                            // launch order only (v1.10 patch 0090): the blocks of one k slice run together
+        const unsigned lid = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
+        nblock = (int)(lid % gridDim.y);
+        const unsigned r = lid / gridDim.y;
+        if (SWZ == 1) { item = (int)(r % gridDim.x); zz = (int)(r / gridDim.x); }
+        else { zz = (int)(r % gridDim.z); item = (int)(r / gridDim.z); }
+    }
     int e, first, cnt;
     if constexpr (LD == 0) {
         if (item >= counts[0]) return;
@@ -366,7 +373,7 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
         if (item >= total) return;
     }
     if (e >= E) return;                                  // the shared expert (id E) is not EXL3
-    const int mat = blockIdx.z / SK, split = blockIdx.z % SK;
+    const int mat = zz / SK, split = zz % SK;
     const half* X = mat ? X1 : X0;
     const uint32_t* T = mat ? T1 : T0;
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
@@ -915,13 +922,19 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
 // The instantiations GLM-5.3-Flash at two ranks launches (glm5_next/cuda/exl3_mm.py routed): a decode window's gate/up
 // and down projections (NT 8, 4 warps, 16 k steps a warp, 16-byte loads one step ahead: TF_GLM_EXL3_LOADS=nc; the
 // down projection with its epilogue fused), the row rotation, and a prompt chunk's passes of 64 pairs.
-#define TF_DEC(FUSE, XROW)                                                                                          \
-    template __global__ void tf_glm_exl3d::dec_kernel<8, 4, 16, FUSE, XROW, 1, 1>(                                  \
+#define TF_DEC(FUSE, XROW, SWZ)                                                                                     \
+    template __global__ void tf_glm_exl3d::dec_kernel<8, 4, 16, FUSE, XROW, 1, 1, SWZ>(                             \
         const half*, const half*, const uint32_t*, const uint32_t*, const int*, const int*, const int*, float*,   \
         int, int, int, int, int, int, const half*, const half*, const half*, void*, float, int*);
-TF_DEC(0, true)
-TF_DEC(0, false)
-TF_DEC(1, false)
+TF_DEC(0, true, 0)
+TF_DEC(0, false, 0)
+TF_DEC(1, false, 0)
+TF_DEC(0, true, 1)
+TF_DEC(0, false, 1)
+TF_DEC(1, false, 1)
+TF_DEC(0, true, 2)
+TF_DEC(0, false, 2)
+TF_DEC(1, false, 2)
 #undef TF_DEC
 
 #define TF_ROT(ROWS)                                                                                               \

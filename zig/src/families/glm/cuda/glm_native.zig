@@ -15,6 +15,18 @@ const max_rows = fwd.Engine.max_rows;
 /// Drafts the MTP head chains at most: the 8-row window of earlier builds (the rows past it serve copies).
 const head_drafts = 7;
 const dflash_max = 15;
+/// sampling.WIDER: the candidates a rank sends when a row's nucleus runs past the first (union rule); then the whole shards.
+const nucleus_wider = fwd.Engine.max_nucleus;
+
+const NucEnt = struct {
+    v: f64,
+    id: i64,
+    m: i64,
+
+    fn before(_: void, a: NucEnt, b: NucEnt) bool {
+        return a.v > b.v or (a.v == b.v and a.id < b.id);
+    }
+};
 
 pub const model_type = "glm5_next";
 pub const formats: []const []const u8 = &.{"exl3-mcg-4bit"};
@@ -96,6 +108,8 @@ const Glm = struct {
     policy: dflash.Policy = .{},
     dtoks: [dflash_max]u32 = undefined, // the chain DFlash2 picked for the stream's next window
     dn: usize = 0,
+    nucleus_first: usize = 1024, // TF_GLM_NUCLEUS: the candidates a rank sends first for a top_k-off draw (sampling.NUCLEUS)
+    nucleus_union: bool = true, // TENSORFOLD_NUCLEUS_UNION
     copy: CopyRule,
     stream: ?*lanes.Stream = null,
     drawn: [ring]u32 = undefined,
@@ -145,9 +159,19 @@ const Glm = struct {
         return g.live.items.len > sn.at and std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(g.live.items[0 .. sn.at + 1])) == sn.key;
     }
 
-    /// Each row's draw over the whole vocabulary (Node.whole_vocabulary): nucleus_rows for top_k off, else
-    /// choose_rows over every token (top_k past the candidates a rank gives). Row r keyed at position0 + r.
-    fn chooseWhole(g: *Glm, sm: lanes.sampling.Sampling, rows: usize, position0: u64, out: []u32) !void {
+    /// Each row's draw over the vocabulary (Node.whole_vocabulary): top_k off: sampling.nucleus_rows, its candidates a rank first
+    /// (`nucleus_first`, then `nucleus_wider`: TENSORFOLD_NUCLEUS_UNION, v1.10 patch 0034's rule), whole shards when a row's nucleus
+    /// runs past them; else choose_rows over every token (a top_k past the candidates a rank gives). Row r keyed at position0 + r.
+    fn chooseWhole(g: *Glm, sm: lanes.sampling.Sampling, which: Node.Rows, rows: usize, position0: u64, out: []u32) !void {
+        if (sm.top_k == 0) {
+            const stages = [_]usize{ g.nucleus_first, nucleus_wider };
+            // without the union rule (stock v1.8) a row whose nucleus is not inside one rank's candidates goes straight to the shards
+            for (stages[0 .. if (g.nucleus_union) 2 else 1]) |count| {
+                const words = try g.n.nucleus(which, rows, sm.temperature, count);
+                if (try g.drawNucleus(sm, rows, position0, words, count, out)) return;
+            }
+        }
+        _ = try g.n.nucleus(which, rows, sm.temperature, 0);
         const host = g.n.e.full_host;
         const n = g.n.e.w.head.n;
         const row = try g.gpa.alloc(u16, 2 * n);
@@ -170,10 +194,101 @@ const Glm = struct {
         }
     }
 
+    /// sampling._draw over the ranks' `count` best candidates (`words`, Engine.nucleusGather's layout): false when some row's nucleus
+    /// is not inside them (a wider gather or the whole shards decide it). With the union rule (TENSORFOLD_NUCLEUS_UNION, default
+    /// on) a row is covered when the merged walk to the cumulative mass ceil(top_p total) stops above every rank's last candidate:
+    /// no token left out can be in the nucleus, so the draw is the whole vocabulary's.
+    fn drawNucleus(g: *Glm, sm: lanes.sampling.Sampling, rows: usize, position0: u64, words: []const u64, count: usize, out: []u32) !bool {
+        const per_row = 3 * count + 2;
+        const cut = sm.top_p > 0.0 and sm.top_p < 1.0;
+        const union_rule = cut and g.nucleus_union;
+        const min_log = sm.minLog();
+        const ents = try g.gpa.alloc(NucEnt, 2 * count);
+        defer g.gpa.free(ents);
+        for (0..rows) |r| {
+            var total: u64 = 0;
+            var top = -std.math.inf(f64);
+            var lows: [2]f64 = undefined;
+            for (0..2) |k| {
+                const at = (k * rows + r) * per_row;
+                const vals = words[at..][0..count];
+                const ids = words[at + count ..][0..count];
+                const mass = words[at + 2 * count ..][0..count];
+                total += words[at + 3 * count];
+                lows[k] = std.math.inf(f64);
+                for (0..count) |j| {
+                    const v: f64 = @bitCast(vals[j]);
+                    ents[k * count + j] = .{ .v = v, .id = @bitCast(ids[j]), .m = @bitCast(mass[j]) };
+                    top = @max(top, v);
+                    lows[k] = @min(lows[k], v);
+                }
+            }
+            const need: i64 = if (cut) @intCast(ceilShare(sm.top_p, total)) else 0;
+            const floor = top + min_log;
+            std.mem.sort(NucEnt, ents, {}, NucEnt.before);
+            if (cut and union_rule) {
+                var cum: i64 = 0;
+                var stop: ?usize = null;
+                for (ents, 0..) |en, i| {
+                    cum += en.m;
+                    if (cum >= need) {
+                        stop = i;
+                        break;
+                    }
+                }
+                const at = stop orelse return false;
+                for (lows) |low| if (!(ents[at].v > low)) return false;
+            } else for (0..2) |k| {
+                // a rank's own share must end inside its candidates (min_p alone: a candidate below its cut)
+                var cum: i64 = 0;
+                var covered = false;
+                if (cut) {
+                    for (ents) |en| {
+                        if (en.id < @as(i64, 0) or @as(usize, @intCast(en.id)) / g.n.e.w.head.n != k) continue;
+                        cum += en.m;
+                        if (cum >= need) {
+                            covered = en.v > lows[k];
+                            break;
+                        }
+                    }
+                } else covered = sm.min_p > 0.0 and lows[k] < floor;
+                if (!covered) return false;
+            }
+            var keep: usize = ents.len;
+            if (cut) {
+                var cum: i64 = 0;
+                var below: usize = 0;
+                for (ents) |en| {
+                    cum += en.m;
+                    if (cum < need) below += 1 else break;
+                }
+                keep = below + 1;
+            }
+            if (sm.min_p > 0.0) {
+                var n: usize = 0;
+                for (ents) |en| {
+                    if (en.v >= floor) n += 1 else break;
+                }
+                keep = @min(keep, n);
+            }
+            var best: usize = 0;
+            var best_score = -std.math.inf(f64);
+            for (ents[0..keep], 0..) |en, j| {
+                const score = en.v - libm_log(-libm_log(lanes.sampling.uniform(sm.seed, position0 + r, @intCast(en.id))));
+                if (j == 0 or score > best_score) {
+                    best = j;
+                    best_score = score;
+                }
+            }
+            out[r] = @intCast(ents[best].id);
+        }
+        return true;
+    }
+
     /// Each row's draw among the gathered candidates (exact_sampling.choose_rows), row r keyed at position0 + r.
-    fn choose(g: *Glm, s: *lanes.Stream, k: usize, rows: usize, position0: u64, out: []u32) !void {
+    fn choose(g: *Glm, s: *lanes.Stream, which: Node.Rows, k: usize, rows: usize, position0: u64, out: []u32) !void {
         const sm = s.sampling.?;
-        if (k == Node.whole_vocabulary) return g.chooseWhole(sm, rows, position0, out);
+        if (k == Node.whole_vocabulary) return g.chooseWhole(sm, which, rows, position0, out);
         const host = &g.n.e.cand_host;
         var values: [2 * fwd.Engine.max_k]f64 = undefined;
         var ids: [2 * fwd.Engine.max_k]u64 = undefined;
@@ -238,7 +353,7 @@ const Glm = struct {
         }
         const first = try g.n.first(k);
         var one: [1]u32 = .{first};
-        if (k > 0) try g.choose(s, k, 1, ids.len, &one);
+        if (k > 0) try g.choose(s, .last, k, 1, ids.len, &one);
         _ = g.take(one[0]);
     }
 
@@ -280,7 +395,7 @@ const Glm = struct {
         @memcpy(ids[1 + w.held ..][0..w.tokens.len], w.tokens);
         const k = try candidateCount(w.stream);
         try g.n.verify(ids[0..rows], k, out[0].sampled[0..rows]);
-        if (k > 0) try g.choose(w.stream, k, rows, w.positions[0], out[0].sampled[0..rows]);
+        if (k > 0) try g.choose(w.stream, .window, k, rows, w.positions[0], out[0].sampled[0..rows]);
         @memcpy(out[0].drafts[0 .. rows - 1], ids[1..rows]);
         @memcpy(g.window[0..rows], ids[0..rows]);
         g.pending_rows = rows;
@@ -578,6 +693,18 @@ fn ms(io: std.Io, t0: i96) f64 {
     return @as(f64, @floatFromInt(now(io) - t0)) / 1e6;
 }
 
+/// A switch that is on unless set to "0".
+fn envOff(name: [*:0]const u8) bool {
+    const v = std.c.getenv(name) orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "0");
+}
+
+fn envCount(name: [*:0]const u8, default: usize) usize {
+    const v = std.c.getenv(name) orelse return default;
+    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return default;
+    return if (n >= 1 and n <= fwd.Engine.max_nucleus) n else default;
+}
+
 fn envPort() u16 {
     const v = std.c.getenv("TF_GLM_PORT") orelse return default_port;
     return std.fmt.parseInt(u16, std.mem.span(v), 10) catch default_port;
@@ -589,7 +716,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer n.deinit();
     const g = try gpa.create(Glm);
     errdefer gpa.destroy(g);
-    g.* = .{ .gpa = gpa, .n = n, .drafts = o.drafts and (n.w.mtp != null or n.dflash != null), .dflash = n.dflash != null, .policy = try dflash.Policy.fromEnv(), .copy = .{ .cfg = try copy.Settings.fromEnv(n.e.wide_graph) } };
+    g.* = .{ .nucleus_union = !envOff("TENSORFOLD_NUCLEUS_UNION"), .nucleus_first = envCount("TF_GLM_NUCLEUS", 1024), .gpa = gpa, .n = n, .drafts = o.drafts and (n.w.mtp != null or n.dflash != null), .dflash = n.dflash != null, .policy = try dflash.Policy.fromEnv(), .copy = .{ .cfg = try copy.Settings.fromEnv(n.e.wide_graph) } };
     if (g.dflash and g.drafts) std.log.info("GLM drafts: DFlash2 (block {d}, up to {d} drafts a round, stop at {d:.2} of the noisy chain, beta {d:.1}); the MTP head is not loaded", .{ n.w.draft.?.block, g.policy.most, g.policy.confidence, g.policy.beta });
     if (g.drafts and g.copy.cfg.on) std.log.info("GLM copy drafts: up to {d} a round, match {d} tokens, {d} inside the reply, windows of 9 to 15 rows padded to {d}", .{ g.copy.cfg.most, g.copy.cfg.match, g.copy.cfg.reply_match, g.copy.cfg.pad });
     try g.measure(io);

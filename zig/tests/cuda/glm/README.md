@@ -166,3 +166,26 @@ Acceptance: `tf-glm check` against the production-setting captures `v18a` (6 pro
   (`capture_glm.py --drafter`); `aot/p18d` = `aot/p18c` plus their kernels. Their serial replies equal the earlier sets'.
 - Acceptance: `tf-glm check --copy 1 --drafter DIR` against v18a, v18b, p4 and cp1 (the sets' serial replies), and the rounds equal v1.8's:
   `cp1` cedit 41 rounds, 17 copied (v1.8's DFlash2 capture: 41, 17), story 67 rounds, code 21, facts 39, json 22.
+
+## 11. v1.10's speed patches (recipe 7d42f90, patches 0084-0097)
+
+- References: `w1` = v18a's prompts, `w2` = the copy-heavy ones (`--set copy`), `w3` = p4's 123k-token prompt, `w4` = v18b's lengths, recorded from
+  the published image (`ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold@sha256:bc34d7d6...`, extracted to `~/tf-native/py110`; `capv110.sh`) at its
+  defaults with one stream: DRAFTER=dflash2, COPY=1, NUCLEUS_UNION=1, DEC_ORDER=0. Their replies and round counts equal the v1.8 DFlash2 captures'
+  (`df1`, `df2`), so the token references did not move. `aot/p110` = `aot/p18d` plus their `_scores` and `_select_split` (400 kernels).
+- 0085, 0086: `_select_split` gets `BLK=16` (step 4's earlier chunks an iteration), `_scores` one row and `L=32` pool blocks a program, grid `(n, cdiv(cdiv(np, 64), 32))`
+  (`glm_triton.zig`: `split_blk`, `score_loop`). Same bits; `tf-glm check` passes on w1..w4 (the 123k prompt of w3 exercises both).
+- 0090: `dec_kernel` takes `SWZ` (a launch order: blocks of one k slice together); `TF_GLM_EXL3_DEC_ORDER` 0 (default), 1, 2 picks one of nine instantiations. A/B in one
+  session, greedy, native, tok/s (0 / 1 / 2): cedit 104.9 / 106.1 / 106.0, quote 137.9 / 139.2 / 138.8, story 46.3 / 46.2 / 45.6, code 90.0 / 88.8 / 89.5,
+  facts 59.5 / 59.4 / 58.6, json 87.5 / 87.7 / 86.3; a second run of order 0 differs from the first by as much (code 87.4). No gain, so the default stays 0, as v1.10's.
+- 0092: a block pass's candidate ids at or past the vocabulary are a copy read before it had landed: the rows are copied again once the device is idle, a second failure is an error.
+- Sampled draws over the top_p nucleus (top_k 0; patch 0034, `TENSORFOLD_NUCLEUS_UNION`, default on): `Engine.nucleusGather` runs the row maxima's gather, `tf_glm_nuc_stats`
+  (the shard's mass total, an integer), `tf_glm_topk` for the first `TF_GLM_NUCLEUS` (1024) candidates a rank and `tf_glm_nuc_pack` (value, id and mass floor(exp(v - top) 2^40)
+  in float64 with v = logit * (1 / T) as torch's tensor / scalar computes it), then one gather; `Glm.drawNucleus` is `_draw` with the union test (the merged walk to
+  ceil(top_p total) stops above every rank's last candidate), then 16,384 candidates a rank, then the whole shards (`fullRows` and the host `nucleus`, as before).
+  Without the union rule (0) a row whose nucleus is not inside one rank's candidates goes straight to the shards. Both give v1.10's draws.
+  The server's default top_k differs: v1.10 uses 20 (its `Sampling` default; the checkpoint's generation_config has no top_k), the native server 0. Run it with `--top-k 20`
+  to draw as v1.10 does by default (the candidates path); a request with `top_k: 0` takes the union path.
+- Sampled replies (temperature 1, top_p 0.95, seed 11) of the 13 benchmark prompts equal v1.10's, with top_k 20 (default) and with `top_k: 0`, and with the union rule off.
+  Native, top_k 0, tok/s: union on / off: story 42.4 / 33.0, code 59.9 / 45.7, facts 48.0 / 37.0, cenc 125.3 / 82.8; v1.10: 42.9, 59.2, 48.9, 120.8.
+

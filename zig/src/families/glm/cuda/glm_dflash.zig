@@ -470,14 +470,21 @@ pub const Drafter = struct {
         if (!read) return;
         const dr = self.dr;
         const nb = dr.block - 1;
-        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(self.cand_host.ptr, self.cand_all, wt.world * nb * 2 * dr.top_k * 4, e.s.handle), "cuMemcpyDtoHAsync");
-        try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(self.proj_host.ptr, self.proj, nb * dr.sel_rank * f4, e.s.handle), "cuMemcpyDtoHAsync");
-        try e.s.synchronize();
-        self.merge(nb);
+        // v1.10 patch 0092: an id outside the vocabulary is a float's bits read before the copy had landed; the rows are copied
+        // again once the device is idle, and a second failure is an error
+        for (0..2) |attempt| {
+            try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(self.cand_host.ptr, self.cand_all, wt.world * nb * 2 * dr.top_k * 4, e.s.handle), "cuMemcpyDtoHAsync");
+            try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(self.proj_host.ptr, self.proj, nb * dr.sel_rank * f4, e.s.handle), "cuMemcpyDtoHAsync");
+            try e.s.synchronize();
+            if (self.merge(nb)) return;
+            if (attempt == 1) return error.BadDrafterCandidates;
+            std.log.warn("drafter: a candidate id outside the vocabulary; copying the rows again once the device is idle", .{});
+            try e.d.check(e.d.api.cuCtxSynchronize(), "cuCtxSynchronize");
+        }
     }
 
     /// merge_candidates: each row's rank lists (values, then ids as fp32 bits... here pairs) merged by value then id, the top k.
-    fn merge(self: *Drafter, nb: usize) void {
+    fn merge(self: *Drafter, nb: usize) bool {
         const dr = self.dr;
         const k = dr.top_k;
         const Cand = struct { v: f32, id: u32 };
@@ -488,6 +495,7 @@ pub const Drafter = struct {
                 const base = (rank * nb + r) * 2 * k;
                 for (0..k) |j| {
                     all[m] = .{ .v = @bitCast(self.cand_host[base + 2 * j]), .id = self.cand_host[base + 2 * j + 1] };
+                    if (all[m].id >= self.w.cfg.vocab) return false;
                     m += 1;
                 }
             }
@@ -502,6 +510,7 @@ pub const Drafter = struct {
             }
             for (0..dr.sel_rank) |j| self.cand_proj[r * dr.sel_rank + j] = self.proj_host[r * dr.sel_rank + j];
         }
+        return true;
     }
 
     /// dflash2.noisy_confidence: softmax((score + g) / beta) at the pick j (g null: greedy).
