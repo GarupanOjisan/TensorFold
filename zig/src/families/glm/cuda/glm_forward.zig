@@ -27,7 +27,132 @@ pub const Comm = struct {
         if (c.roce) |r| if (r.fits(count * 4) and send % 16 == 0 and recv % 16 == 0) return r.gather(s, send, recv, count * 4);
         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, .f32, c.comm, s.handle), "ncclAllGather");
     }
+
+    /// comm.exchange: byte ranges sent to and received from the peer in one NCCL group, always through NCCL (hcsplit's swaps).
+    pub fn exchange(c: Comm, s: cuda.Stream, sends: []const Seg, recvs: []const Seg, peer: usize) !void {
+        const api = c.lib.api;
+        try c.lib.check(api.ncclGroupStart(), "ncclGroupStart");
+        for (sends) |x| try c.lib.check(api.ncclSend(x.ptr, x.bytes, .u8, @intCast(peer), c.comm, s.handle), "ncclSend");
+        for (recvs) |x| try c.lib.check(api.ncclRecv(x.ptr, x.bytes, .u8, @intCast(peer), c.comm, s.handle), "ncclRecv");
+        try c.lib.check(api.ncclGroupEnd(), "ncclGroupEnd");
+    }
+
+    pub const Seg = struct { ptr: u64, bytes: usize };
 };
+
+/// TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (v1.10 hcsplit.SplitSettings; the recipe's default SPLIT=1 sets 1 and 2, as here):
+/// a prompt chunk's hyper-connection glue split by rows between the ranks (each rank sends the other its partial of the
+/// other's rows and glues its own), the swaps on a second stream in row pieces (overlap), and the next block's
+/// row-independent front on own rows while the swaps run (fronts). Every glue kernel is row-independent and the partials are
+/// summed rank 0 first as unsplit, so every bit is the unsplit path's. Swaps are p2p only (no TF_GLM_HC_EXCHANGE=gather).
+pub const SplitSettings = struct {
+    split: bool = true,
+    overlap: bool = true,
+    fronts: bool = true,
+    pieces: usize = 2, // TF_GLM_OVERLAP_PIECES
+    min_rows: usize = 64, // TF_GLM_HC_SPLIT_MIN_ROWS: shorter chunks (a prompt's tail) run unsplit
+
+    pub fn fromEnv() !SplitSettings {
+        var s: SplitSettings = .{};
+        if (std.c.getenv("TF_GLM_HC_SPLIT")) |v| {
+            const t = std.mem.span(v);
+            if (!std.mem.eql(u8, t, "0") and !std.mem.eql(u8, t, "1")) return bad("TF_GLM_HC_SPLIT is 0 or 1", t);
+            s.split = t[0] == '1';
+        }
+        const level: u8 = if (std.c.getenv("TF_GLM_PREFILL_OVERLAP")) |v| blk: {
+            const t = std.mem.span(v);
+            if (t.len != 1 or t[0] < '0' or t[0] > '2') return bad("TF_GLM_PREFILL_OVERLAP is 0, 1 or 2", t);
+            break :blk t[0] - '0';
+        } else if (s.split) 2 else 0;
+        if (level > 0 and !s.split) return bad("TF_GLM_PREFILL_OVERLAP overlaps the row-split swaps: it needs TF_GLM_HC_SPLIT=1, not", "0");
+        s.overlap = level > 0;
+        s.fronts = level == 2;
+        if (std.c.getenv("TF_GLM_HC_EXCHANGE")) |v| if (!std.mem.eql(u8, std.mem.span(v), "p2p")) return bad("TF_GLM_HC_EXCHANGE: only p2p is ported, not", std.mem.span(v));
+        if (std.c.getenv("TF_GLM_OVERLAP_PIECES")) |v| s.pieces = try ranged("TF_GLM_OVERLAP_PIECES", v, 1, 8);
+        if (std.c.getenv("TF_GLM_HC_SPLIT_MIN_ROWS")) |v| s.min_rows = try ranged("TF_GLM_HC_SPLIT_MIN_ROWS", v, 2, 16384);
+        return s;
+    }
+
+    pub fn pieceCount(s: SplitSettings) usize {
+        return if (s.overlap) s.pieces else 1;
+    }
+
+    /// What both ranks must agree on (hcsplit.SplitSettings.code), one word.
+    pub fn code(s: SplitSettings) u32 {
+        if (!s.split) return 0;
+        return 1 | @as(u32, @intFromBool(s.overlap)) << 1 | @as(u32, @intFromBool(s.fronts)) << 2 | @as(u32, @intCast(s.pieceCount())) << 4 | @as(u32, @intCast(s.min_rows)) << 8;
+    }
+
+    fn bad(what: []const u8, v: []const u8) error{BadSplitSetting} {
+        std.log.err("{s} {s}", .{ what, v });
+        return error.BadSplitSetting;
+    }
+
+    fn ranged(name: []const u8, v: [*:0]const u8, lo: usize, hi: usize) !usize {
+        const t = std.mem.span(v);
+        const n = std.fmt.parseInt(usize, t, 10) catch return bad(name, t);
+        if (n < lo or n > hi) return bad(name, t);
+        return n;
+    }
+};
+
+/// One prompt buffer's row split (hcsplit.HcSplit, two ranks, p2p): rank r owns rows [r H, r H + H), H = Rp / 2 (an odd
+/// chunk gets one zero pad row, never read); the second stream and its events when overlapping.
+const Split = struct {
+    set: SplitSettings,
+    side: ?cuda.Stream,
+    ev_begin: cuda.Event,
+    ev_done: cuda.Event,
+    ev_fill: [8]cuda.Event,
+    ev_part: [8]cuda.Event,
+    ev_glue: [8]cuda.Event,
+    active: bool = false,
+    r: usize = 0,
+    rp: usize = 0,
+    h: usize = 0,
+    pieces: [8][2]usize = undefined, // (offset in the rank's rows, rows)
+    n: usize = 0,
+
+    fn init(d: *const cuda.Driver, set: SplitSettings) !Split {
+        var sp: Split = .{ .set = set, .side = null, .ev_begin = try cuda.Event.init(d, false), .ev_done = try cuda.Event.init(d, false), .ev_fill = undefined, .ev_part = undefined, .ev_glue = undefined };
+        for (0..8) |j| {
+            sp.ev_fill[j] = try cuda.Event.init(d, false);
+            sp.ev_part[j] = try cuda.Event.init(d, false);
+            sp.ev_glue[j] = try cuda.Event.init(d, false);
+        }
+        // TF_GLM_OVERLAP_PRIORITY's default: the side stream at normal priority (0022)
+        if (set.overlap) sp.side = try cuda.Stream.init(d, true);
+        return sp;
+    }
+
+    fn deinit(sp: *Split) void {
+        if (sp.side) |*s| s.deinit();
+        sp.ev_begin.deinit();
+        sp.ev_done.deinit();
+        for (0..8) |j| {
+            sp.ev_fill[j].deinit();
+            sp.ev_part[j].deinit();
+            sp.ev_glue[j].deinit();
+        }
+    }
+};
+
+/// What a split site writes into b.part for rows lo .. hi (forward.partials' `fill`): an output projection's rows, or the
+/// MoE's shared expert on the rows its front has not run on, then the combine.
+const Fill = union(enum) {
+    proj: struct { x: u64, xs: u64, q: Mat },
+    moe: struct { m: wt.Moe, done: ?[2]usize },
+};
+
+/// The next block's row-independent start (forward.mixer_front / ffn_front) the glue runs on own rows (TF_GLM_PREFILL_OVERLAP=2).
+const Front = union(enum) { none, kda: *const wt.Layer, dsa: *const wt.Layer, mlp: wt.Mlp, shared: wt.Mlp };
+
+/// forward.undone: the row ranges of [0, rows) outside `done` (rows a front already ran on), in row order; empty ranges
+/// have hi <= lo.
+fn undone(rows: usize, done: ?[2]usize) [2][2]usize {
+    const d = done orelse return .{ .{ 0, rows }, .{ 0, 0 } };
+    return .{ .{ 0, @min(d[0], rows) }, .{ d[1], rows } };
+}
 
 /// A bump allocator over one device allocation, 256-byte aligned pieces.
 const Arena = struct {
@@ -340,6 +465,8 @@ pub const Engine = struct {
     /// The nucleus draw's device scratch (`nucleusGather`), allocated at its first use, and its host copy.
     nuc_dev: ?cuda.DeviceBuffer = null,
     nuc_host: []u64 = &.{},
+    /// TF_GLM_HC_SPLIT (default on): prompt chunks' glue split by rows between the ranks (`SplitSettings`); null when off.
+    split: ?Split = null,
 
     pub const max_rows = 16; // engine.MAX_ROWS: a pending token and up to 15 copied drafts
     pub const mtp_rows = 8; // engine.MTP_ROWS: rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
@@ -444,6 +571,14 @@ pub const Engine = struct {
         e.combine_sy = e.exl3_v18 and (if (std.c.getenv("TF_GLM_COMBINE_SY")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true);
         e.use_graphs = if (std.c.getenv("TF_GLM_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         e.wide_graph = try wideGraph();
+        const split_set = try SplitSettings.fromEnv();
+        e.split = if (split_set.split) try Split.init(d, split_set) else null;
+        errdefer if (e.split) |*sp| sp.deinit();
+        if (e.split != null) {
+            // hcsplit.warm (0064): both ranks open the send/receive connection now, not on the first prompt chunk
+            try e.comm.exchange(s, &.{.{ .ptr = e.pbuf.part, .bytes = 16 }}, &.{.{ .ptr = e.pbuf.gath, .bytes = 16 }}, 1 - e.w.rank);
+            try s.synchronize();
+        }
         return e;
     }
 
@@ -461,6 +596,7 @@ pub const Engine = struct {
         for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
         if (e.l2pf) |*p| p.deinit();
         e.full_dev.free();
+        if (e.split) |*sp| sp.deinit();
         if (e.nuc_dev) |*b| b.free();
         if (e.nuc_host.len > 0) std.heap.page_allocator.free(e.nuc_host);
         std.heap.page_allocator.free(e.full_host);
@@ -574,28 +710,51 @@ pub const Engine = struct {
         }
     }
 
+    /// forward.out_proj: every rank's partials [world, R, D] (b.gath), or 0 while a prompt chunk runs row-split, which
+    /// exchanges them itself (forward.partials).
     fn outProj(e: *Engine, b: *const Buffers, x: u64, xs: u64, q: Mat, rows: usize, site: ?struct { u32, usize }) !u64 {
+        if (e.splitActive(b)) {
+            try e.splitPartial(b, .{ .proj = .{ .x = x, .xs = xs, .q = q } });
+            return 0;
+        }
         try e.mm(b, x, q.k, xs, q, b.part, rows, true);
         if (site) |s| try e.pfSite(s[0], s[1]);
         return e.gather(b, rows);
     }
 
-    fn kdaBlock(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize, host_pos: usize) !u64 {
+    /// forward.kda_front: a prompt chunk's KDA input projections of rows lo .. hi (row-independent).
+    fn kdaFront(e: *Engine, l: *const wt.Layer, b: *const Buffers, lo: usize, hi: usize) !void {
+        const c = e.w.cfg;
+        const kw = l.kda.?;
+        const ll: usize = c.kda_heads / wt.world;
+        const n = hi - lo;
+        const p = b.kproj + lo * e.width * bf;
+        try e.mm(b, b.normed + lo * c.hidden * bf, c.hidden, b.xs + lo * c.hidden / 64 * f4, kw.proj, p, n, false);
+        try e.mm(b, p + kw.fa_off * bf, e.width, b.xs_fa + lo * 2 * f4, kw.fb, b.ka + lo * ll * 128 * bf, n, false);
+        try e.mm(b, p + kw.ga_off * bf, e.width, b.xs_ga + lo * 2 * f4, kw.gb, b.kg + lo * ll * 128 * bf, n, false);
+    }
+
+    /// `done`: rows whose projections kdaFront already wrote (a prompt chunk, TF_GLM_PREFILL_OVERLAP=2).
+    fn kdaBlock(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize, host_pos: usize, done: ?[2]usize) !u64 {
         const c = e.w.cfg;
         const kw = l.kda.?;
         const li = e.st.kda_index[l.index];
         const ll: usize = c.kda_heads / wt.world;
         const st = &e.st;
         const p = if (b.prefill) b.kproj else st.proj + li * max_rows * e.width * bf;
-        try e.mm(b, b.normed, c.hidden, b.xs, kw.proj, p, rows, false);
-        const fa = p + kw.fa_off * bf;
-        const ga = p + kw.ga_off * bf;
-        // f_b and g_b read these group sums when 4-bit; BF16 weights ignore them (qmm.matmul), but Python still launches _group_sums
-        if (!b.prefill) try e.t.groupSums(fa, e.width, b.xs_fa, rows, 128);
-        try e.mm(b, fa, e.width, b.xs_fa, kw.fb, b.ka, rows, false);
-        if (!b.prefill) try e.t.groupSums(ga, e.width, b.xs_ga, rows, 128);
-        try e.mm(b, ga, e.width, b.xs_ga, kw.gb, b.kg, rows, false);
-        try e.pfSite(l.index, 2);
+        if (b.prefill) {
+            for (undone(rows, done)) |r| if (r[1] > r[0]) try e.kdaFront(l, b, r[0], r[1]);
+        } else {
+            try e.mm(b, b.normed, c.hidden, b.xs, kw.proj, p, rows, false);
+            const fa = p + kw.fa_off * bf;
+            const ga = p + kw.ga_off * bf;
+            // f_b and g_b read these group sums when 4-bit; BF16 weights ignore them (qmm.matmul), but Python still launches _group_sums
+            try e.t.groupSums(fa, e.width, b.xs_fa, rows, 128);
+            try e.mm(b, fa, e.width, b.xs_fa, kw.fb, b.ka, rows, false);
+            try e.t.groupSums(ga, e.width, b.xs_ga, rows, 128);
+            try e.mm(b, ga, e.width, b.xs_ga, kw.gb, b.kg, rows, false);
+            try e.pfSite(l.index, 2);
+        }
         const rec_layer = ll * 128 * 128 * f4;
         const rec_half = st.kda_layers * rec_layer;
         const scr: KdaScratch = if (b.prefill) b.kscr else .{ .out = st.scr.out + li * max_rows * ll * 128 * bf, .k = st.scr.k + li * max_rows * ll * 128 * f4, .v = st.scr.v + li * max_rows * ll * 128 * bf, .g = st.scr.g + li * max_rows * ll * 128 * f4, .b = st.scr.b + li * max_rows * ll * f4 };
@@ -637,18 +796,31 @@ pub const Engine = struct {
         return e.outProj(b, scr.out, b.kxs, kw.o, rows, .{ l.index, 0 });
     }
 
-    fn dsaBlock(e: *Engine, l: *const wt.Layer, b: *Buffers, kc: u64, pos_dev: u64, host_pos: usize, index: ?[3]u64, rows: usize) !u64 {
+    /// forward.dsa_front: DSA's projection, query and latent norms and query expansion of rows lo .. hi (row-independent).
+    fn dsaFront(e: *Engine, l: *const wt.Layer, b: *const Buffers, lo: usize, hi: usize) !void {
+        const c = e.w.cfg;
+        const a = l.dsa.?;
+        const hl: usize = c.mla_heads / wt.world;
+        const n = hi - lo;
+        const qkv = c.q_lora + c.kv_lora;
+        const dp = b.dp + lo * qkv * bf;
+        const qr = b.qr + lo * c.q_lora * bf;
+        const xs_qr = b.xs_qr + lo * c.q_lora / 64 * f4;
+        try e.mm(b, b.normed + lo * c.hidden * bf, c.hidden, b.xs + lo * c.hidden / 64 * f4, a.proj, dp, n, false);
+        try e.t.rmsnorm(dp, qkv, a.q_norm, qr, c.q_lora, xs_qr, n, c.q_lora, c.eps);
+        try e.t.rmsnorm(dp + c.q_lora * bf, qkv, a.kv_norm, b.lat + lo * c.kv_lora * bf, c.kv_lora, b.xs_lat + lo * c.kv_lora / 64 * f4, n, c.kv_lora, c.eps);
+        try e.mm(b, qr, c.q_lora, xs_qr, a.q_b, b.q + lo * hl * c.nope * bf, n, false);
+    }
+
+    /// `done`: rows dsaFront already ran on (a prompt chunk, TF_GLM_PREFILL_OVERLAP=2).
+    fn dsaBlock(e: *Engine, l: *const wt.Layer, b: *Buffers, kc: u64, pos_dev: u64, host_pos: usize, index: ?[3]u64, rows: usize, done: ?[2]usize) !u64 {
         const c = e.w.cfg;
         const a = l.dsa.?;
         const hl: usize = c.mla_heads / wt.world;
         const qk: usize = c.nope;
         const lw: usize = c.kv_lora;
         const dense_limit = denseLimit(e.w);
-        try e.mm(b, b.normed, c.hidden, b.xs, a.proj, b.dp, rows, false);
-        const qkv = c.q_lora + c.kv_lora;
-        try e.t.rmsnorm(b.dp, qkv, a.q_norm, b.qr, c.q_lora, b.xs_qr, rows, c.q_lora, c.eps);
-        try e.t.rmsnorm(b.dp + c.q_lora * bf, qkv, a.kv_norm, b.lat, c.kv_lora, b.xs_lat, rows, c.kv_lora, c.eps);
-        try e.mm(b, b.qr, c.q_lora, b.xs_qr, a.q_b, b.q, rows, false);
+        for (undone(rows, done)) |r| if (r[1] > r[0]) try e.dsaFront(l, b, r[0], r[1]);
         // _dsa_latent
         try e.t.latentWrite(b.lat, c.kv_lora, kc, pos_dev, rows, lw);
         const all_sparse = host_pos >= dense_limit;
@@ -708,14 +880,21 @@ pub const Engine = struct {
         }
     }
 
-    fn mlpBlock(e: *Engine, m: wt.Mlp, b: *const Buffers, rows: usize, layer: u32) !u64 {
+    /// forward.mlp_front: the dense MLP's gate/up and SwiGLU of rows lo .. hi.
+    fn mlpFront(e: *Engine, m: wt.Mlp, b: *const Buffers, lo: usize, hi: usize) !void {
         const c = e.w.cfg;
-        try e.mm(b, b.normed, c.hidden, b.xs, m.gu, b.gu, rows, false);
-        try e.t.swiglu(b.gu, b.act, b.xs_act, rows, m.width, c.swiglu_limit);
+        const gu = b.gu + lo * 2 * m.width * bf;
+        try e.mm(b, b.normed + lo * c.hidden * bf, c.hidden, b.xs + lo * c.hidden / 64 * f4, m.gu, gu, hi - lo, false);
+        try e.t.swiglu(gu, b.act + lo * m.width * bf, b.xs_act + lo * m.width / 64 * f4, hi - lo, m.width, c.swiglu_limit);
+    }
+
+    fn mlpBlock(e: *Engine, m: wt.Mlp, b: *const Buffers, rows: usize, layer: u32, done: ?[2]usize) !u64 {
+        for (undone(rows, done)) |r| if (r[1] > r[0]) try e.mlpFront(m, b, r[0], r[1]);
         return e.outProj(b, b.act, b.xs_act, m.down, rows, .{ layer, 1 });
     }
 
-    fn moeBlock(e: *Engine, m: wt.Moe, b: *const Buffers, rows: usize, layer: u32) !u64 {
+    /// `done`: rows whose shared expert its front already ran (a prompt chunk, TF_GLM_PREFILL_OVERLAP=2).
+    fn moeBlock(e: *Engine, m: wt.Moe, b: *const Buffers, rows: usize, layer: u32, done: ?[2]usize) !u64 {
         const c = e.w.cfg;
         const d: usize = c.hidden;
         const slots: usize = c.topk + 1;
@@ -726,6 +905,10 @@ pub const Engine = struct {
         // L2 still holds what site "a" prefetched for it
         if (e.l2pf_active) try e.sharedExpert(b, sh, rows);
         if (e.exl3_v18) try kern.routed18(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit, b.prefill) else try kern.routed(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit);
+        if (e.splitActive(b)) { // the shared expert and combine a piece of rows at a time (forward.moe_block's fill)
+            try e.splitPartial(b, .{ .moe = .{ .m = m, .done = done } });
+            return 0;
+        }
         if (!e.l2pf_active) try e.sharedExpert(b, sh, rows);
         // forward.py moe_block: the shared row read from sy where it is (a prompt chunk always, a decode window unless
         // TF_GLM_COMBINE_SY=0), else copied into the routed rows' last slot
@@ -741,10 +924,19 @@ pub const Engine = struct {
 
     /// forward.shared_front: the MoE's shared expert on b.normed into b.sy.
     fn sharedExpert(e: *Engine, b: *const Buffers, sh: wt.Mlp, rows: usize) !void {
+        return e.sharedRows(b, sh, 0, rows);
+    }
+
+    /// forward.shared_front: the shared expert on rows lo .. hi into b.sy.
+    fn sharedRows(e: *Engine, b: *const Buffers, sh: wt.Mlp, lo: usize, hi: usize) !void {
         const c = e.w.cfg;
-        try e.mm(b, b.normed, c.hidden, b.xs, sh.gu, b.sgu, rows, false);
-        try e.t.swiglu(b.sgu, b.sact, b.sxs, rows, sh.width, c.swiglu_limit);
-        try e.mm(b, b.sact, sh.width, b.sxs, sh.down, b.sy, rows, true);
+        const n = hi - lo;
+        const sgu = b.sgu + lo * 2 * sh.width * bf;
+        const sact = b.sact + lo * sh.width * bf;
+        const sxs = b.sxs + lo * sh.width / 64 * f4;
+        try e.mm(b, b.normed + lo * c.hidden * bf, c.hidden, b.xs + lo * c.hidden / 64 * f4, sh.gu, sgu, n, false);
+        try e.t.swiglu(sgu, sact, sxs, n, sh.width, c.swiglu_limit);
+        try e.mm(b, sact, sh.width, sxs, sh.down, b.sy + lo * c.hidden * f4, n, true);
     }
 
     fn copyRows(e: *Engine, src: u64, src_ld: usize, dst: u64, dst_ld: usize, bytes: usize, rows: usize) !void {
@@ -760,11 +952,29 @@ pub const Engine = struct {
     /// glue.hc_pre: the mixing dots of a prompt chunk on the tensor cores (TF_GLM_HC_MMA), of a decode window in hc.cu
     /// (TF_GLM_HC_DEC), else glue._hc_partial; then _hc_finish.
     fn hcPre(e: *Engine, b: *const Buffers, h: wt.Hc, norm: u64, rows: usize) !void {
+        return e.hcPreRows(b, h, norm, 0, rows);
+    }
+
+    /// hcPre of rows lo .. lo + n (every glue kernel is row-independent).
+    fn hcPreRows(e: *Engine, b: *const Buffers, h: wt.Hc, norm: u64, lo: usize, n: usize) !void {
         const c = e.w.cfg;
         const d: usize = c.hidden;
         const s: usize = c.hc;
-        if (b.prefill and e.hc_mma) try e.t.hcPartialMma(b.x, h.fn_, b.hcpart, rows, d, s) else if (e.hc_dec) try kern.hcPartial(e.k, e.s, b.x, h.fn_, b.hcpart, rows) else try e.t.hcPartial(b.x, h.fn_, b.hcpart, rows, d, s);
-        try e.t.hcFinish(b.x, h.base, h.scale, norm, b.normed, b.xs, b.post, b.comb, b.hcpart, rows, d, s, c.eps, c.hc_eps, c.sinkhorn);
+        const x = b.x + lo * s * d * bf;
+        const part = b.hcpart + lo * tri.hc_blocks * 32 * f4;
+        if (b.prefill and e.hc_mma) try e.t.hcPartialMma(x, h.fn_, part, n, d, s) else if (e.hc_dec) try kern.hcPartial(e.k, e.s, x, h.fn_, part, n) else try e.t.hcPartial(x, h.fn_, part, n, d, s);
+        try e.t.hcFinish(x, h.base, h.scale, norm, b.normed + lo * d * bf, b.xs + lo * d / 64 * f4, b.post + lo * s * f4, b.comb + lo * s * s * f4, part, n, d, s, c.eps, c.hc_eps, c.sinkhorn);
+    }
+
+    /// The layer's KDA or DSA block on b.normed (forward._mixer).
+    fn mixer(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, host_pos: usize, done: ?[2]usize) !u64 {
+        return switch (l.kind) {
+            .kda => try e.kdaBlock(l, b, rows, host_pos, done),
+            .mla => blk: {
+                const di = e.st.dsa_index[l.index];
+                break :blk try e.dsaBlock(l, b, e.st.kc[di], e.st.pos_dev, host_pos, if (e.st.long_context) e.st.index[di] else null, rows, done);
+            },
+        };
     }
 
     fn layerForward(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, host_pos: usize) !void {
@@ -773,18 +983,211 @@ pub const Engine = struct {
         const s: usize = c.hc;
         const h = l.attn_hc.?;
         try e.hcPre(b, h, l.in_norm, rows);
-        const g = switch (l.kind) {
-            .kda => try e.kdaBlock(l, b, rows, host_pos),
-            .mla => blk: {
-                const di = e.st.dsa_index[l.index];
-                break :blk try e.dsaBlock(l, b, e.st.kc[di], e.st.pos_dev, host_pos, if (e.st.long_context) e.st.index[di] else null, rows);
-            },
-        };
+        const g = try e.mixer(l, b, rows, host_pos, null);
         try e.t.hcPost(b.x, b.x, g, b.post, b.comb, wt.world, rows, d, s);
         const f = l.ffn_hc.?;
         try e.hcPre(b, f, l.post_norm, rows);
-        const g2 = if (l.mlp) |m| try e.mlpBlock(m, b, rows, l.index) else try e.moeBlock(l.moe.?, b, rows, l.index);
+        const g2 = if (l.mlp) |m| try e.mlpBlock(m, b, rows, l.index, null) else try e.moeBlock(l.moe.?, b, rows, l.index, null);
         try e.t.hcPost(b.x, b.x, g2, b.post, b.comb, wt.world, rows, d, s);
+    }
+
+    // -- the row split (hcsplit.HcSplit, TF_GLM_HC_SPLIT) ------------------------------------------------------------------
+
+    fn splitActive(e: *const Engine, b: *const Buffers) bool {
+        return b.prefill and if (e.split) |sp| sp.active else false;
+    }
+
+    /// Whether a prompt chunk of `rows` rows runs split (hcsplit.applies): long enough, its pad row fits, v1.8's experts.
+    fn splitApplies(e: *const Engine, b: *const Buffers, rows: usize) bool {
+        const sp = e.split orelse return false;
+        return b.prefill and e.exl3_v18 and rows >= sp.set.min_rows and (rows + 1) / 2 * 2 <= b.rows;
+    }
+
+    fn splitBegin(e: *Engine, b: *const Buffers, rows: usize) !void {
+        const c = e.w.cfg;
+        const sp = &e.split.?;
+        sp.r = rows;
+        sp.rp = (rows + 1) / 2 * 2;
+        sp.h = sp.rp / 2;
+        const np = sp.set.pieceCount();
+        var size = (sp.h + np - 1) / np;
+        if (size > 64) size = @min(sp.h, (size + 63) / 64 * 64); // whole 64-row tiles for the glue kernels where possible
+        sp.n = 0;
+        var off: usize = 0;
+        while (off < sp.h) : (off += size) {
+            sp.pieces[sp.n] = .{ off, @min(size, sp.h - off) };
+            sp.n += 1;
+        }
+        if (sp.rp > rows) { // the pad row: zero streams and partial, never read
+            try e.zero(b.x + rows * c.hc * c.hidden * bf, c.hc * c.hidden * bf);
+            try e.zero(b.part + rows * c.hidden * f4, c.hidden * f4);
+        }
+        if (sp.side) |side| {
+            try sp.ev_begin.record(e.s);
+            try side.wait(sp.ev_begin);
+        }
+        sp.active = true;
+    }
+
+    fn splitFinish(e: *Engine) !void {
+        const sp = &e.split.?;
+        if (sp.side) |side| if (sp.active) {
+            try sp.ev_done.record(side);
+            try e.s.wait(sp.ev_done);
+        };
+        sp.active = false;
+    }
+
+    fn mine(e: *const Engine) usize {
+        return e.w.rank * e.split.?.h;
+    }
+
+    fn theirs(e: *const Engine) usize {
+        return (1 - e.w.rank) * e.split.?.h;
+    }
+
+    /// `f`'s rows lo .. hi of b.part, clipped to the chunk (hcsplit._fill).
+    fn fillRows(e: *Engine, b: *const Buffers, f: Fill, lo: usize, hi_in: usize) !void {
+        const hi = @min(hi_in, e.split.?.r);
+        if (hi <= lo) return;
+        const c = e.w.cfg;
+        const d: usize = c.hidden;
+        switch (f) {
+            .proj => |p| try e.mm(b, p.x + lo * p.q.k * bf, p.q.k, p.xs + lo * p.q.k / 64 * f4, p.q, b.part + lo * d * f4, hi - lo, true),
+            .moe => |m| {
+                for (undone(hi, m.done)) |r| {
+                    const a = @max(r[0], lo);
+                    if (a < r[1]) try e.sharedRows(b, m.m.shared, a, r[1]);
+                }
+                const slots: usize = c.topk + 1;
+                try e.t.combineSy(b.exl3.y + lo * slots * d * f4, b.sy + lo * d * f4, b.wts + lo * slots * f4, b.part + lo * d * f4, hi - lo, d, slots);
+            },
+        }
+    }
+
+    /// Piece j: this rank's partial of the peer's rows out, the peer's partial of this rank's rows in (b.gath, unused while split).
+    fn swapPartial(e: *Engine, s: cuda.Stream, b: *const Buffers, j: usize) !void {
+        const d: usize = e.w.cfg.hidden;
+        const off, const n = e.split.?.pieces[j];
+        try e.comm.exchange(s, &.{.{ .ptr = b.part + (e.theirs() + off) * d * f4, .bytes = n * d * f4 }}, &.{.{ .ptr = b.gath + off * d * f4, .bytes = n * d * f4 }}, 1 - e.w.rank);
+    }
+
+    /// Piece j of bf16 [rows, D] buffers: this rank's rows out, the peer's in.
+    fn swapRows(e: *Engine, s: cuda.Stream, j: usize, outs: []const u64) !void {
+        const d: usize = e.w.cfg.hidden;
+        const off, const n = e.split.?.pieces[j];
+        var sends: [8]Comm.Seg = undefined;
+        var recvs: [8]Comm.Seg = undefined;
+        for (outs, 0..) |t, i| {
+            sends[i] = .{ .ptr = t + (e.mine() + off) * d * bf, .bytes = n * d * bf };
+            recvs[i] = .{ .ptr = t + (e.theirs() + off) * d * bf, .bytes = n * d * bf };
+        }
+        try e.comm.exchange(s, sends[0..outs.len], recvs[0..outs.len], 1 - e.w.rank);
+    }
+
+    /// hcsplit.partial: the peer's rows of this rank's partial first, piece by piece, each piece's swap starting as it is done
+    /// (overlap), then this rank's rows.
+    fn splitPartial(e: *Engine, b: *const Buffers, f: Fill) !void {
+        const sp = &e.split.?;
+        const side = sp.side orelse {
+            try e.fillRows(b, f, 0, sp.r);
+            for (0..sp.n) |j| try e.swapPartial(e.s, b, j);
+            return;
+        };
+        for (sp.pieces[0..sp.n], 0..) |pc, j| {
+            try e.fillRows(b, f, e.theirs() + pc[0], e.theirs() + pc[0] + pc[1]);
+            try sp.ev_fill[j].record(e.s);
+            try side.wait(sp.ev_fill[j]);
+            try e.swapPartial(side, b, j);
+            try sp.ev_part[j].record(side);
+        }
+        try e.fillRows(b, f, e.mine(), e.mine() + sp.h);
+    }
+
+    fn runFront(e: *Engine, b: *const Buffers, f: Front, lo: usize, hi_in: usize) !void {
+        const hi = @min(hi_in, e.split.?.r);
+        if (hi <= lo) return;
+        switch (f) {
+            .none => {},
+            .kda => |l| try e.kdaFront(l, b, lo, hi),
+            .dsa => |l| try e.dsaFront(l, b, lo, hi),
+            .mlp => |m| try e.mlpFront(m, b, lo, hi),
+            .shared => |m| try e.sharedRows(b, m, lo, hi),
+        }
+    }
+
+    /// hcsplit.glue: hc_post of this rank's rows (both partials summed rank 0 first), then the layer's DFlash2 taps, the final
+    /// stream mean (`final`) and the next hc_pre (`hc`), their rows swapped with the peer's; `front` on own rows of each piece
+    /// while its swap is on the wire.
+    fn splitGlue(e: *Engine, b: *const Buffers, hc: ?wt.Hc, norm: u64, tap_layer: ?u32, final: bool, front: Front) !void {
+        const c = e.w.cfg;
+        const d: usize = c.hidden;
+        const s: usize = c.hc;
+        const sp = &e.split.?;
+        var outs: [8]u64 = undefined;
+        var no: usize = 0;
+        if (tap_layer) |tl| for (e.tap_layers, 0..) |t, slot| if (t == tl and b.taps[slot] != 0) {
+            outs[no] = b.taps[slot];
+            no += 1;
+        };
+        if (final) {
+            outs[no] = b.hidden;
+            no += 1;
+        }
+        if (hc != null) {
+            outs[no] = b.normed;
+            no += 1;
+        }
+        for (sp.pieces[0..sp.n], 0..) |pc, j| {
+            const lo = e.mine() + pc[0];
+            const n = pc[1];
+            if (sp.side != null) try e.s.wait(sp.ev_part[j]);
+            // glue.hc_post_pair: rank 1's partial rows read at their distance from rank 0's (may be negative)
+            const own = b.part + lo * d * f4;
+            const got = b.gath + pc[0] * d * f4;
+            const g0, const g1 = if (e.w.rank == 0) .{ own, got } else .{ got, own };
+            const rs = @divExact(@as(i64, @intCast(g1)) - @as(i64, @intCast(g0)), f4);
+            const x = b.x + lo * s * d * bf;
+            try e.t.hcPostPair(x, x, g0, b.post + lo * s * f4, b.comb + lo * s * s * f4, rs, n, d, s);
+            if (tap_layer) |tl| for (e.tap_layers, 0..) |t, slot| if (t == tl and b.taps[slot] != 0) try e.t.streamMean(x, b.taps[slot] + lo * d * bf, n, d, s);
+            if (final) try e.t.streamMean(x, b.hidden + lo * d * bf, n, d, s);
+            if (hc) |h| try e.hcPreRows(b, h, norm, lo, n);
+            if (sp.side) |side| {
+                try sp.ev_glue[j].record(e.s);
+                try side.wait(sp.ev_glue[j]);
+                try e.swapRows(side, j, outs[0..no]);
+            } else try e.swapRows(e.s, j, outs[0..no]);
+            try e.runFront(b, front, lo, lo + n);
+        }
+        if (sp.side) |side| {
+            try sp.ev_done.record(side);
+            try e.s.wait(sp.ev_done);
+        }
+    }
+
+    /// forward.split_layers: every layer of a prompt chunk with its glue split by rows; the first hc_pre runs on every row as
+    /// unsplit, and b.normed, the taps and b.hidden come back whole from the peer.
+    fn splitLayers(e: *Engine, b: *Buffers, rows: usize) !void {
+        try e.splitBegin(b, rows);
+        const fronts = e.split.?.set.fronts;
+        const layers = e.w.layers;
+        try e.hcPreRows(b, layers[0].attn_hc.?, layers[0].in_norm, 0, e.split.?.rp);
+        var done: ?[2]usize = null;
+        for (layers, 0..) |*l, i| {
+            _ = try e.mixer(l, b, rows, e.st.pos, done);
+            const ff: Front = if (!fronts) .none else if (l.mlp) |m| .{ .mlp = m } else .{ .shared = l.moe.?.shared };
+            try e.splitGlue(b, l.ffn_hc.?, l.post_norm, null, false, ff);
+            const own: [2]usize = .{ e.mine(), @min(e.mine() + e.split.?.h, rows) };
+            _ = if (l.mlp) |m| try e.mlpBlock(m, b, rows, l.index, if (fronts) own else null) else try e.moeBlock(l.moe.?, b, rows, l.index, if (fronts) own else null);
+            const nxt: ?*const wt.Layer = if (i + 1 < layers.len) &layers[i + 1] else null;
+            const mf: Front = if (!fronts or nxt == null) .none else switch (nxt.?.kind) {
+                .kda => .{ .kda = nxt.? },
+                .mla => .{ .dsa = nxt.? },
+            };
+            try e.splitGlue(b, if (nxt) |n| n.attn_hc.? else null, if (nxt) |n| n.in_norm else 0, l.index, nxt == null, mf);
+            done = if (fronts and nxt != null) own else null;
+        }
+        try e.splitFinish();
     }
 
     /// forward.compute with host_pos: logits of every row (decode) or of the last row (a prompt chunk).
@@ -806,11 +1209,15 @@ pub const Engine = struct {
         const c = e.w.cfg;
         const d: usize = c.hidden;
         try e.t.embed(b.ids, e.w.embed, b.x, rows, d, c.hc);
-        for (e.w.layers) |*l| {
-            try e.layerForward(l, b, rows, e.st.pos);
-            for (e.tap_layers, 0..) |tl, slot| if (tl == l.index and b.taps[slot] != 0) try e.t.streamMean(b.x, b.taps[slot], rows, d, c.hc);
+        if (e.splitApplies(b, rows)) {
+            try e.splitLayers(b, rows); // also leaves the taps and b.hidden
+        } else {
+            for (e.w.layers) |*l| {
+                try e.layerForward(l, b, rows, e.st.pos);
+                for (e.tap_layers, 0..) |tl, slot| if (tl == l.index and b.taps[slot] != 0) try e.t.streamMean(b.x, b.taps[slot], rows, d, c.hc);
+            }
+            try e.t.streamMean(b.x, b.hidden, rows, d, c.hc);
         }
-        try e.t.streamMean(b.x, b.hidden, rows, d, c.hc);
         try e.t.rmsnorm(b.hidden, d, e.w.norm, b.fnormed, d, b.fxs, rows, d, c.eps);
         if (b.prefill) {
             try e.mm(b, b.fnormed + (rows - 1) * d * bf, d, b.fxs, e.w.head, b.logits, 1, false);
@@ -908,10 +1315,10 @@ pub const Engine = struct {
         const l = &m.layer;
         try e.t.rmsnorm(b.mx, d, l.in_norm, b.normed, d, b.xs, n, d, c.eps);
         const ix: ?[3]u64 = if (e.st.long_context) e.st.index[e.st.dsa_layers] else null;
-        const g = try e.dsaBlock(l, b, e.st.mtp_kc, e.st.mtp_pos_dev, e.st.mtp_len, ix, n);
+        const g = try e.dsaBlock(l, b, e.st.mtp_kc, e.st.mtp_pos_dev, e.st.mtp_len, ix, n, null);
         try e.t.residualAdd(b.mx, b.mx, g, wt.world, n, d);
         try e.t.rmsnorm(b.mx, d, l.post_norm, b.normed, d, b.xs, n, d, c.eps);
-        const g2 = try e.moeBlock(l.moe.?, b, n, l.index);
+        const g2 = try e.moeBlock(l.moe.?, b, n, l.index, null);
         try e.t.residualAdd(b.mx, b.mx, g2, wt.world, n, d);
         try e.t.rmsnorm(b.mx + (n - 1) * d * bf, d, m.head_norm, b.fnormed, d, b.fxs, 1, d, c.eps);
         try e.draftHead(b, b.fnormed, 1);

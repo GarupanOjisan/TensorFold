@@ -199,6 +199,13 @@ pub const Tri = struct {
         try t.run("_hc_post", .{ rows, d / block, 1 }, &.{ p("X", "*bf16", x), p("XOUT", "*bf16", xout), p("G", "*fp32", gathered), p("POST", "*fp32", post), p("COMB", "*fp32", comb), int("RS", rows * d) }, &.{ ci("D", d), ci("S", streams), ci("WORLD", world), ci("BLOCK", block) });
     }
 
+    /// glue.hc_post_pair (v1.10 glue.py:265, TF_GLM_HC_SPLIT): hc_post of two ranks' fp32 partials [R, D] held apart, rank 0's
+    /// at `g0` and rank 1's `rs` elements from it (may be negative): the same kernel, sum order and bits.
+    pub fn hcPostPair(t: Tri, x: u64, xout: u64, g0: u64, post: u64, comb: u64, rs: i64, rows: usize, d: usize, streams: usize) !void {
+        const block = @min(1024, d);
+        try t.run("_hc_post", .{ rows, d / block, 1 }, &.{ p("X", "*bf16", x), p("XOUT", "*bf16", xout), p("G", "*fp32", g0), p("POST", "*fp32", post), p("COMB", "*fp32", comb), aot.int("RS", @intCast(rs)) }, &.{ ci("D", d), ci("S", streams), ci("WORLD", 2), ci("BLOCK", block) });
+    }
+
     /// glue.residual_add (glue.py:228): the MTP block's plain residual over [world, R, D] partials.
     pub fn residualAdd(t: Tri, x: u64, xout: u64, gathered: u64, world: usize, rows: usize, d: usize) !void {
         const block = @min(1024, d);

@@ -66,8 +66,9 @@ pub const Node = struct {
         errdefer n.pair.close();
         // both ranks must have been started with the same window and the same TF_GLM_DENSE (their all-gathered partials
         // would mix 4-bit and BF16 projections)
-        var mine = [4]u32{ @intCast(context), 0x474c4d31, @intFromEnum(try wt.denseKind()), @intFromBool(drafterDir() != null) };
-        var theirs: [4]u32 = undefined;
+        // and the same row split (TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP: one rank's swaps would wait on the other's forever)
+        var mine = [5]u32{ @intCast(context), 0x474c4d31, @intFromEnum(try wt.denseKind()), @intFromBool(drafterDir() != null), (try fwd.SplitSettings.fromEnv()).code() };
+        var theirs: [5]u32 = undefined;
         if (rank == 0) {
             try n.pair.send(std.mem.sliceAsBytes(&mine));
             try n.pair.recv(std.mem.sliceAsBytes(&theirs));
@@ -76,7 +77,7 @@ pub const Node = struct {
             try n.pair.send(std.mem.sliceAsBytes(&mine));
         }
         if (!std.mem.eql(u32, &mine, &theirs)) {
-            std.log.err("the two GLM ranks were started with different settings: window {d} here, {d} on the other rank; TF_GLM_DENSE {t} here, kind {d} there", .{ mine[0], theirs[0], try wt.denseKind(), theirs[2] });
+            std.log.err("the two GLM ranks were started with different settings: window {d} here, {d} on the other rank; TF_GLM_DENSE {t} here, kind {d} there; row split {x} here, {x} there", .{ mine[0], theirs[0], try wt.denseKind(), theirs[2], mine[4], theirs[4] });
             return error.RankSettingsDiffer;
         }
         var id: cuda.nccl.UniqueId = undefined;
