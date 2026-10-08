@@ -104,7 +104,7 @@ pub fn main(init: std.process.Init) !u8 {
     var it = prompts.object.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
-        if (o.only.len > 0 and std.mem.indexOf(u8, o.only, name) == null) continue;
+        if (o.only.len > 0 and !listed(o.only, name)) continue;
         const ids = try arena.alloc(u32, entry.value_ptr.array.items.len);
         for (entry.value_ptr.array.items, ids) |v, *x| x.* = @intCast(v.integer);
         const ref = want.object.get(name).?.object.get("serial").?.array.items;
@@ -141,6 +141,13 @@ pub fn main(init: std.process.Init) !u8 {
         }
     }
     return if (failed == 0) 0 else 1;
+}
+
+/// `name` is one of the comma-separated names in `list`.
+fn listed(list: []const u8, name: []const u8) bool {
+    var it = std.mem.splitScalar(u8, list, ',');
+    while (it.next()) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
 }
 
 fn now(io: std.Io) i96 {
