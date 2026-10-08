@@ -86,3 +86,18 @@ v0.6.6's); `glm_kda.cu` already holds those kernels, v1.8 only appended the mult
 `replay_layers` and the conv shift are unchanged for one stream.
 
 The reference sets `k1`, `k2`, `k3` are `m1`, `m2`, `m3` with `-e TF_GLM_KDA_CHUNKED=1 -e TF_GLM_KDA_WIDE_ROWS=1`.
+
+## 7. v1.8's DSA side (TF_GLM_KV, TF_GLM_LATENT_MMA, TF_GLM_SPARSE_ONEPASS, the decode selection)
+
+- `TF_GLM_KV=fp8` (default; `bf16` the earlier format): the latent cache is `[rows, 512 + 16]` bytes and the indexer's pooled
+  keys `[rows / 4 + 2, 128 + 16]` (e4m3 codes, an fp32 power-of-two scale after them, 12 zero bytes; kv8.py), written by
+  `_lat_write` / `_pool_keys` and read by `_dense_chunks`, `_sparse_chunks`, `_sparse_onepass`, `_scores`, `_scores_rows`. The
+  index keys and gates stay bf16. Prompt-cache snapshots hold only the KDA state, so they do not depend on the layout. At a
+  1,048,576-token window it frees about 6.5 GiB of the Spark's memory (13.9 to 20.5 GiB available with the server up).
+- Prompt chunks: `_absorb_mma` / `_expand_mma` (`TF_GLM_LATENT_MMA`), `_sparse_onepass` (`TF_GLM_SPARSE_ONEPASS`).
+- Selection: decode windows (and a prompt chunk of under 64 rows) `_scores_rows`, then `_select_split` (five launches from 8,192
+  scores) or `_select_rows` and `_tokens`; a prompt chunk of 64 rows or more `_select_prompt` (`_scores` four rows a program,
+  blocks of 512 rows). The torch glue of v0.6.6's port is gone.
+- Reference sets `v1`..`v4` (v4: one 123,312-token prompt, context 262,144) are `k1`..`k3` with `-e TF_GLM_KV=fp8
+  -e TF_GLM_LATENT_MMA=1 -e TF_GLM_SPARSE_ONEPASS=1 -e TF_GLM_SCORE_RB=4`; `b1` is the six prompts with `TF_GLM_KV=bf16`. `aot/v18` is
+  `aot/m18` plus the kernels of `v1`..`v4` and `b1` (`aot_pack.py --base aot/m18 --only ...`).

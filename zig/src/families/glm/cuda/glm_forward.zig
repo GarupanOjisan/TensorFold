@@ -100,6 +100,7 @@ pub const Buffers = struct {
     counts: u64,
     scores: u64,
     pools: u64,
+    split: u64, // sparse.select_split's int32 scratch (the rows that take it: under 64)
     spo: u64,
     spm: u64,
     spl: u64,
@@ -229,6 +230,7 @@ fn carve(a: *Arena, w: *const Weights, rows: usize, capacity: usize, prefill: bo
     b.counts = a.take(rows * 4);
     b.scores = a.take(srows * np_max * f4);
     b.pools = a.take(rows * tri.topk_pools * 8);
+    b.split = a.take(tri.Tri.splitInts(@min(rows, tri.split_rows - 1), np_max) * 4);
     b.spo = a.take(snch * rows * hl * lw * f4);
     b.spm = a.take(snch * rows * hl * f4);
     b.spl = a.take(snch * rows * hl * f4);
@@ -298,6 +300,16 @@ pub const Engine = struct {
     /// TF_GLM_EXL3_DEC (default on): v1.8's routed-expert kernels, plan and direct shared-expert combine; 0: the generic
     /// grouped kernel of v0.6.6 (the A/B path).
     exl3_v18: bool = true,
+    /// TF_GLM_KV (default fp8, v1.8's production setting; bf16 the earlier format): the DSA latent cache and the indexer's
+    /// pooled keys as e4m3 rows with a power-of-two scale each (kv8.py).
+    kv_fp8: bool = true,
+    /// TF_GLM_LATENT_MMA / TF_GLM_SPARSE_ONEPASS (default on): a prompt chunk's absorb and expand on the tensor cores, its
+    /// sparse attention in one pass a row.
+    latent_mma: bool = true,
+    sparse_onepass: bool = true,
+    /// The indexer's key rings hold the whole context here, so no row wraps; the ring length only picks the kernels'
+    /// 16-divisibility specialization, as Python's does.
+    index_ring: usize = 0,
     /// TF_GLM_KDA_CHUNKED (default on, v1.8's production setting): prompt chunks run KDA in chunked (WY) form, which
     /// needs prompt chunks to start on a grid of 32 (`kdaChunked`, the server's `promptGrid`); 0: the serial chain.
     kda_chunked: bool = true,
@@ -340,7 +352,8 @@ pub const Engine = struct {
         _ = carve(&count, w, max_rows, capacity, false, np_max);
         _ = carve(&count, w, prefill_rows, capacity, true, np_max);
         _ = carve(&count, w, max_rows, capacity, false, np_max);
-        const state_bytes = stateBytes(w, capacity, n_kda, n_dsa, width, long_context);
+        const kv_fp8 = try kvFp8();
+        const state_bytes = stateBytes(w, capacity, n_kda, n_dsa, width, long_context, kv_fp8);
         const total = count.used + state_bytes + 4096 + (w.head.n + c.hidden) * bf + 1024;
         e.mem = try cuda.DeviceBuffer.alloc(d, total);
         errdefer e.mem.free();
@@ -350,23 +363,27 @@ pub const Engine = struct {
         e.pbuf = carve(&a, w, prefill_rows, capacity, true, np_max);
         e.mbuf = carve(&a, w, max_rows, capacity, false, np_max);
         const st = &e.st;
+        const lat_b: usize = if (kv_fp8) c.kv_lora + 16 else c.kv_lora * bf; // a latent cache row (kv8.row_bytes)
+        const pk_b: usize = if (kv_fp8) c.i_dim + 16 else c.i_dim * bf; // and a pooled key row
         st.pos_dev = a.take(16);
         st.mtp_pos_dev = a.take(16);
         st.conv = a.take(n_kda * 3 * 3 * ll * 128 * bf);
         st.rec = a.take(2 * n_kda * ll * 128 * 128 * f4);
         st.proj = a.take(n_kda * max_rows * width * bf);
         st.scr = .{ .out = a.take(n_kda * max_rows * ll * 128 * bf), .k = a.take(n_kda * max_rows * ll * 128 * f4), .v = a.take(n_kda * max_rows * ll * 128 * bf), .g = a.take(n_kda * max_rows * ll * 128 * f4), .b = a.take(n_kda * max_rows * ll * f4) };
-        for (0..n_dsa) |i| st.kc[i] = a.take(capacity * c.kv_lora * bf);
-        st.mtp_kc = a.take(capacity * c.kv_lora * bf);
+        for (0..n_dsa) |i| st.kc[i] = a.take(capacity * lat_b);
+        st.mtp_kc = a.take(capacity * lat_b);
         e.last_logits = a.take(w.head.n * bf);
         e.last_hidden = a.take(c.hidden * bf);
         if (long_context) for (0..n_dsa + 1) |i| {
-            st.index[i] = .{ a.take(capacity * c.i_dim * bf), a.take(capacity * c.i_dim * bf), a.take((capacity / 4 + 2) * c.i_dim * bf) };
+            st.index[i] = .{ a.take(capacity * c.i_dim * bf), a.take(capacity * c.i_dim * bf), a.take((capacity / 4 + 2) * pk_b) };
         };
         e.w = w;
         e.s = s;
         e.d = d;
         e.t = t;
+        e.t.fp8 = kv_fp8;
+        e.kv_fp8 = kv_fp8;
         e.k = k;
         e.comm = comm;
         e.width = width;
@@ -378,19 +395,22 @@ pub const Engine = struct {
         errdefer e.full_dev.free();
         e.full_host = try std.heap.page_allocator.alloc(u16, wt.world * max_rows * w.head.n);
         e.kda_chunked = kdaChunked();
+        e.latent_mma = envOn("TF_GLM_LATENT_MMA");
+        e.sparse_onepass = envOn("TF_GLM_SPARSE_ONEPASS");
+        e.index_ring = std.mem.alignForward(usize, capacity, 16);
         e.exl3_v18 = if (std.c.getenv("TF_GLM_EXL3_DEC")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         e.combine_sy = e.exl3_v18 and (if (std.c.getenv("TF_GLM_COMBINE_SY")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true);
         e.use_graphs = if (std.c.getenv("TF_GLM_GRAPHS")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         return e;
     }
 
-    fn stateBytes(w: *const Weights, capacity: usize, n_kda: usize, n_dsa: usize, width: usize, long_context: bool) usize {
+    fn stateBytes(w: *const Weights, capacity: usize, n_kda: usize, n_dsa: usize, width: usize, long_context: bool, kv_fp8: bool) usize {
         const c = w.cfg;
         const ll: usize = c.kda_heads / wt.world;
         var n: usize = 64 + n_kda * 3 * 3 * ll * 128 * bf + 2 * n_kda * ll * 128 * 128 * f4 + n_kda * max_rows * width * bf;
         n += n_kda * max_rows * ll * 128 * (bf + f4 + bf + f4) + n_kda * max_rows * ll * f4;
-        n += (n_dsa + 1) * capacity * c.kv_lora * bf;
-        if (long_context) n += (n_dsa + 1) * (2 * capacity * c.i_dim * bf + (capacity / 4 + 2) * c.i_dim * bf);
+        n += (n_dsa + 1) * capacity * (if (kv_fp8) c.kv_lora + 16 else c.kv_lora * bf);
+        if (long_context) n += (n_dsa + 1) * (2 * capacity * c.i_dim * bf + (capacity / 4 + 2) * (if (kv_fp8) c.i_dim + 16 else c.i_dim * bf));
         return n + 64 * 256; // alignment slack
     }
 
@@ -588,34 +608,42 @@ pub const Engine = struct {
             const ix = a.index;
             try e.mm(b, b.normed, c.hidden, b.xs, ix.kw, b.ikr, rows, false);
             try e.t.router(b.normed, c.hidden, ix.gate, b.rpart, b.igr, rows, c.hidden, c.i_dim);
-            try e.t.indexUpdate(b.ikr, c.i_dim + c.i_heads, b.igr, ix.ln_w, ix.ln_b, ix.ape, ix3[0], ix3[1], ix3[2], pos_dev, rows);
+            try e.t.indexUpdate(b.ikr, c.i_dim + c.i_heads, b.igr, ix.ln_w, ix.ln_b, ix.ape, ix3[0], ix3[1], ix3[2], pos_dev, rows, e.index_ring);
         }
-        try e.t.absorbQ(b.q, a.wk, b.qa, rows, hl, qk, lw);
+        if (b.prefill and e.latent_mma) try e.t.absorbQMma(b.q, a.wk, b.qa, rows, hl, qk, lw) else try e.t.absorbQ(b.q, a.wk, b.qa, rows, hl, qk, lw);
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(qk), -0.5));
         if (!all_sparse) {
             const s = b.lat_s;
             const lat_nch = tri.chunksFor(@min(e.st.capacity, 2560) + b.rows);
             // a captured window serves every dense position: all chunks, as Python's graphs (pos unknown) run
             const nch = if (e.capturing) lat_nch else @min(tri.chunksFor(host_pos + rows), lat_nch);
-            const blocks = (rows + s.part_rows - 1) / s.part_rows;
+            // rows past the dense limit are recomputed sparsely below: the dense pass needs only the rows before it (a row's
+            // dense bits do not depend on the others), with the window's head block (forward.dense_rows)
+            const dense = if (sparse_rows and host_pos < dense_limit) @min(rows, dense_limit - host_pos) else rows;
+            const blocks = (dense + s.part_rows - 1) / s.part_rows;
             var at: [Buffers.pos_slots]u64 = undefined;
             try e.blockPositions(b, pos_dev, host_pos, s.part_rows, blocks, &at);
-            try e.t.denseAttention(b.qa, kc, at[0..blocks], s, b.ol, rows, hl, lw, nch, scale);
+            try e.t.denseAttention(b.qa, kc, at[0..blocks], s, b.ol, dense, rows, hl, lw, nch, scale);
         }
         if (sparse_rows) {
             const ix = a.index;
             try e.mm(b, b.qr, c.q_lora, b.xs_qr, ix.qb, b.qi, rows, false);
-            const np = tri.poolBucket(host_pos, rows, e.np_max);
-            const bsz = @min(rows, tri.select_rows);
-            const blocks = (rows + bsz - 1) / bsz;
-            var at: [Buffers.pos_slots]u64 = undefined;
-            try e.blockPositions(b, pos_dev, host_pos, bsz, blocks, &at);
             const ix3 = index.?;
-            try e.t.selectTokens(b.qi, b.ikr + c.i_dim * bf, c.i_dim + c.i_heads, ix3[2], at[0..blocks], b.scores, b.pools, rows, np, c.i_heads, c.i_dim);
-            try e.writeTokens(b, pos_dev, rows);
-            try e.t.sparseAttention(b.qa, kc, b.tokens, b.counts, b.ol, b.spo, b.spm, b.spl, rows, hl, lw, tri.select_width, scale);
+            if (b.prefill and rows >= tri.split_rows) { // select_tokens: a prompt chunk's rows in blocks (_select_prompt)
+                const bsz = @min(rows, tri.select_rows);
+                const blocks = (rows + bsz - 1) / bsz;
+                var at: [Buffers.pos_slots]u64 = undefined;
+                try e.blockPositions(b, pos_dev, host_pos, bsz, blocks, &at);
+                try e.t.selectPrompt(b.qi, b.ikr + c.i_dim * bf, c.i_dim + c.i_heads, ix3[2], at[0..blocks], b.scores, b.pools, b.split, b.tokens, b.counts, rows, host_pos, e.np_max, c.i_heads, c.i_dim);
+            } else {
+                const np = tri.poolBucket(host_pos, rows, e.np_max);
+                try e.t.selectDecode(b.qi, b.ikr + c.i_dim * bf, c.i_dim + c.i_heads, ix3[2], pos_dev, b.scores, b.pools, b.split, b.tokens, b.counts, rows, np, c.i_heads, c.i_dim);
+            }
+            if (b.prefill and e.sparse_onepass) { // prompt rows: one pass a row, no partials (their own bits)
+                try e.t.sparseOnepass(b.qa, kc, b.tokens, b.counts, b.ol, rows, hl, lw, tri.select_width, scale);
+            } else try e.t.sparseAttention(b.qa, kc, b.tokens, b.counts, b.ol, b.spo, b.spm, b.spl, rows, hl, lw, tri.select_width, scale);
         }
-        try e.t.expandV(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw);
+        if (b.prefill and e.latent_mma) try e.t.expandVMma(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw) else try e.t.expandV(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw);
         try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
         return e.outProj(b, b.vn, b.xs_ao, a.o, rows);
     }
@@ -628,17 +656,6 @@ pub const Engine = struct {
             out[j] = b.pos_at + j * 16;
             try e.setInt(out[j], host_pos + j * step);
         }
-    }
-
-    fn writeTokens(e: *Engine, b: *const Buffers, pos_dev: u64, rows: usize) !void {
-        var a: cuda.Args = .{};
-        a.add(b.pools);
-        a.add(pos_dev);
-        a.add(b.tokens);
-        a.add(b.counts);
-        a.add(@as(i32, tri.select_width));
-        a.add(@as(i32, tri.topk_pools));
-        try cuda.launch.launch(e.k.tokens, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, e.s, &a);
     }
 
     fn mlpBlock(e: *Engine, m: wt.Mlp, b: *const Buffers, rows: usize) !u64 {
@@ -889,6 +906,21 @@ pub fn kdaChunked() bool {
 /// 32-row sub-chunks, so under TF_GLM_KDA_CHUNKED the grid is 64 (a multiple of 32 that divides the 2,048-row chunks).
 pub fn promptGrid() u32 {
     return if (kdaChunked()) 64 else 0;
+}
+
+/// A switch that is on unless set to "0".
+fn envOn(name: [*:0]const u8) bool {
+    return if (std.c.getenv(name)) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
+}
+
+/// TF_GLM_KV: fp8 (the default) or bf16 (kv8.kv_kind).
+pub fn kvFp8() !bool {
+    const v = std.c.getenv("TF_GLM_KV") orelse return true;
+    const k = std.mem.span(v);
+    if (k.len == 0 or std.mem.eql(u8, k, "fp8")) return true;
+    if (std.mem.eql(u8, k, "bf16")) return false;
+    std.log.err("TF_GLM_KV is bf16 or fp8, not {s}", .{k});
+    return error.BadKvKind;
 }
 
 pub fn denseLimit(w: *const Weights) usize {
