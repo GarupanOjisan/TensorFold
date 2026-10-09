@@ -616,15 +616,16 @@ const Glm = struct {
     /// TF_GLM_DFLASH_POLICY's most) give the next window's drafts as host tokens (`treeFn`). The first round after a prompt
     /// is taken as `r.depth` held drafts (the core does not ask for the chain there), filled up with the pending token.
     fn draftDflash(g: *Glm, ln: *Lane, r: be.DraftRequest) !void {
-        const t = try g.dflashTaps(ln, r, true);
+        const t = try g.dflashTaps(ln, r, true, true);
         g.dflashChain(ln, r, t, if (t.want > 0) &g.n.dflash.? else null);
     }
 
     /// A DFlash2 turn's first half: the kept rows committed and joined to the lane's context, and how many drafts it wants.
-    const Turn = struct { want: usize, pending: u32 };
+    const Turn = struct { want: usize, pending: u32, kept: usize = 0 };
 
     /// The bound lane's DFlash2 turn up to its chain: commit, the context update and, with `block`, its own block pass.
-    fn dflashTaps(g: *Glm, ln: *Lane, r: be.DraftRequest, block: bool) !Turn {
+    /// `turn` false: no DFlash2 turn here (the caller adds the kept rows to the context, Node.dflashTapsLanes).
+    fn dflashTaps(g: *Glm, ln: *Lane, r: be.DraftRequest, block: bool, turn: bool) !Turn {
         const s = r.stream;
         var from: node.From = .prompt;
         var keep: usize = 0;
@@ -648,8 +649,8 @@ const Glm = struct {
             const found = pr.propose(s.context.items, width) catch @as([]const u32, &.{});
             if (found.len >= 2 and pr.lastMatch() >= 8) want = 0; // the core's own copy test
         };
-        try g.n.dflashTurn(from, keep, pending, block and want > 0);
-        return .{ .want = want, .pending = pending };
+        if (turn) try g.n.dflashTurn(from, keep, pending, block and want > 0);
+        return .{ .want = want, .pending = pending, .kept = keep };
     }
 
     /// A DFlash2 turn's second half: the chain from `dft`'s candidates (null: no block pass ran, no drafts), held.
@@ -691,10 +692,20 @@ const Glm = struct {
                 ln.pending_rows = 0;
             }
         }
+        // every lane's kept rows into its drafter's context in one pass (Node.dflashTapsLanes), then the block passes
+        var taps: [max_lanes][2]usize = undefined;
+        var nt: usize = 0;
         for (requests, 0..) |r, i| {
             const ln = try g.enter(r.stream);
             idx[i] = g.n.e.lane;
-            turns[i] = try g.dflashTaps(ln, r, false);
+            turns[i] = try g.dflashTaps(ln, r, false, false);
+            if (turns[i].kept > 0) {
+                taps[nt] = .{ idx[i], turns[i].kept };
+                nt += 1;
+            }
+        }
+        if (nt > 0) try g.n.dflashTapsLanes(taps[0..nt]);
+        for (0..requests.len) |i| {
             if (turns[i].want > 0 and (try g.n.drafterOf(idx[i])).context_end > 0) {
                 blocked[i] = true;
                 ls[m] = idx[i];

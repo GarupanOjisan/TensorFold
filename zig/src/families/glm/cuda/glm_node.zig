@@ -14,7 +14,7 @@ const roce_mod = @import("glm_roce.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18, chunk_lanes = 19 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18, chunk_lanes = 19, dflash_taps = 20 };
 
 /// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 pub fn drafterDir() ?[]const u8 {
@@ -259,6 +259,29 @@ pub const Node = struct {
     pub fn dflashTurn(n: *Node, from: From, kept: usize, pending: u32, block: bool) !void {
         try n.send(.dflash, &.{ @backingInt(from), @intCast(kept), pending, @intFromBool(block) });
         try n.dflashRun(from, kept, pending, block);
+    }
+
+    /// DFlash2's context updates of several lanes after a shared round (rank 0 sends it, both run it): lane items[i][0]'s
+    /// first items[i][1] rows of the last window join its context, stacked in one pass (dflash.Batch.taps), else lane by lane.
+    pub fn dflashTapsLanes(n: *Node, items: []const [2]usize) !void {
+        n.words.clearRetainingCapacity();
+        try n.words.append(n.gpa, @intCast(items.len));
+        for (items) |it| try n.words.appendSlice(n.gpa, &.{ @intCast(it[0]), @intCast(it[1]) });
+        try n.send(.dflash_taps, n.words.items);
+        if (items.len > Engine.max_lanes) return error.BadDraftBatch;
+        var ds: [Engine.max_lanes]*dflash.Drafter = undefined;
+        var kept: [Engine.max_lanes]usize = undefined;
+        var row0: [Engine.max_lanes]usize = undefined;
+        for (items, 0..) |it, i| {
+            ds[i] = try n.drafterOf(it[0]);
+            kept[i] = it[1];
+            row0[i] = n.e.laneState(it[0]).row0;
+        }
+        if (n.batch) |*b| if (try b.taps(&n.e, ds[0..items.len], kept[0..items.len], row0[0..items.len], &n.e.buf)) return;
+        for (items) |it| {
+            try n.bind(it[0]);
+            try n.dflashRun(.verify, it[1], 0, false);
+        }
     }
 
     /// Lane `lane`'s DFlash2 drafter (the bound lane's is `dflash`).
@@ -516,6 +539,13 @@ pub const Node = struct {
                     if (m > Engine.max_lanes) return error.BadChunk;
                     for (0..m) |i| items[i] = .{ w[1 + 3 * i], w[2 + 3 * i], w[3 + 3 * i] };
                     try n.chunkLanes(items[0..m]);
+                },
+                .dflash_taps => {
+                    const m = w[0];
+                    var items: [Engine.max_lanes][2]usize = undefined;
+                    if (m > Engine.max_lanes) return error.BadDraftBatch;
+                    for (0..m) |i| items[i] = .{ w[1 + 2 * i], w[2 + 2 * i] };
+                    try n.dflashTapsLanes(items[0..m]);
                 },
                 .bind => try n.bind(w[0]),
                 .grow => _ = try n.grow(w[0]),

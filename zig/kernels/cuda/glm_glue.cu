@@ -312,6 +312,25 @@ extern "C" __global__ void tf_glm_df_scatter_seg(const __nv_bfloat16* __restrict
   for (int d = threadIdx.x; d < hd; d += blockDim.x) cache[row * hd + d] = src[((int64_t)h * rows + r) * hd + d];
 }
 
+// dflash2_multi `_taps_compute`'s `index_copy_(1, idx, k)`: rows [kvh, rows, hd] into the pooled caches (`cache` is slot 0),
+// row r at dest[r] (its slot's first row plus its ring row), the kv heads cap apart. grid (rows, kvh), block 128.
+extern "C" __global__ void tf_glm_df_scatter_rows(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ cache,
+                                                  const int64_t* __restrict__ dest, int rows, int cap, int hd) {
+  const int r = blockIdx.x, h = blockIdx.y;
+  const int64_t row = dest[r] + (int64_t)h * cap;
+  for (int d = threadIdx.x; d < hd; d += blockDim.x) cache[row * hd + d] = src[((int64_t)h * rows + r) * hd + d];
+}
+
+// dflash2_multi `_rotary(pos)`: each row's own position. grid (ceil(rows half / 128)), block 128.
+extern "C" __global__ void tf_glm_df_rope_rows(const int64_t* __restrict__ pos, const float* __restrict__ inv_freq, int rows, int half,
+                                               float* __restrict__ cos_out, float* __restrict__ sin_out) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= rows * half) return;
+  const float phase = (float)pos[i / half] * inv_freq[i % half];
+  cos_out[i] = cosf(phase);
+  sin_out[i] = sinf(phase);
+}
+
 // `_rotary`: phase = float(pos + r) * inv_freq, cos and sin in fp32, [rows, half]. grid (ceil(rows half / 128)), block 128.
 extern "C" __global__ void tf_glm_df_rope(const int64_t* __restrict__ pos, const float* __restrict__ inv_freq, int rows, int half,
                                           float* __restrict__ cos_out, float* __restrict__ sin_out) {

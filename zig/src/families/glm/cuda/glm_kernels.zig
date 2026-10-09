@@ -66,6 +66,8 @@ pub const Kernels = struct {
     nuc_pack: cuda.Function,
     df_scatter: cuda.Function, // DFlash2's glue (glm_glue.cu)
     df_scatter_seg: cuda.Function,
+    df_scatter_rows: cuda.Function,
+    df_rope_rows: cuda.Function,
     df_rope: cuda.Function,
     df_pos_add: cuda.Function,
     df_rowsum: cuda.Function,
@@ -129,6 +131,8 @@ pub const Kernels = struct {
         k.nuc_pack = try k.mods[2].function("tf_glm_nuc_pack");
         k.df_scatter = try k.mods[2].function("tf_glm_df_scatter");
         k.df_scatter_seg = try k.mods[2].function("tf_glm_df_scatter_seg");
+        k.df_scatter_rows = try k.mods[2].function("tf_glm_df_scatter_rows");
+        k.df_rope_rows = try k.mods[2].function("tf_glm_df_rope_rows");
         k.df_rope = try k.mods[2].function("tf_glm_df_rope");
         k.df_pos_add = try k.mods[2].function("tf_glm_df_pos_add");
         k.df_rowsum = try k.mods[2].function("tf_glm_df_rowsum");
