@@ -823,7 +823,7 @@ pub const Engine = struct {
     fn kdaBlock(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize, host_pos: usize, done: ?[2]usize) !u64 {
         const c = e.w.cfg;
         const kw = l.kda.?;
-        const li = e.st.kda_index[l.index];
+        const li: usize = e.st.kda_index[l.index];
         const ll: usize = c.kda_heads / wt.world;
         const st = &e.st;
         const p = if (b.prefill) b.kproj else st.proj + li * max_rows * e.width * bf;
@@ -1056,7 +1056,7 @@ pub const Engine = struct {
         return switch (l.kind) {
             .kda => try e.kdaBlock(l, b, rows, host_pos, done),
             .mla => blk: {
-                const di = e.st.dsa_index[l.index];
+                const di: usize = e.st.dsa_index[l.index];
                 break :blk try e.dsaBlock(l, b, e.st.kc[di], e.st.pos_dev, host_pos, if (e.st.long_context) e.st.index[di] else null, rows, done);
             },
         };
@@ -1367,7 +1367,7 @@ pub const Engine = struct {
     fn kdaShared(e: *Engine, l: *const wt.Layer, b: *const Buffers, segs: []const Seg, rows: usize) !u64 {
         const c = e.w.cfg;
         const kw = l.kda.?;
-        const li = e.st.kda_index[l.index];
+        const li: usize = e.st.kda_index[l.index];
         const ll: usize = c.kda_heads / wt.world;
         const p = e.sproj;
         try e.mm(b, b.normed, c.hidden, b.xs, kw.proj, p, rows, false);
@@ -1427,7 +1427,7 @@ pub const Engine = struct {
         const qk: usize = c.nope;
         const lw: usize = c.kv_lora;
         const dense_limit = denseLimit(e.w);
-        const di = e.st.dsa_index[l.index];
+        const di: usize = e.st.dsa_index[l.index];
         try e.mm(b, b.normed, c.hidden, b.xs, a.proj, b.dp, rows, false);
         const qkv = c.q_lora + c.kv_lora;
         try e.t.rmsnorm(b.dp, qkv, a.q_norm, b.qr, c.q_lora, b.xs_qr, rows, c.q_lora, c.eps);
