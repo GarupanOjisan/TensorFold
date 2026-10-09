@@ -116,6 +116,8 @@ const Lane = struct {
     live: std.ArrayList(u32) = .empty,
     first: u64 = 0, // the handle of the stream's first token
     used: u64 = 0, // when a stream last took the lane (least recently used goes first)
+    fill_at: usize = 0, // a prompt filling in rounds (prefillManyFn): where it stands, and its next planned start
+    fill_next: usize = 0,
 };
 
 const Glm = struct {
@@ -419,85 +421,98 @@ const Glm = struct {
         return at;
     }
 
-    /// multi_prefill (TF_GLM_MULTI_PREFILL): several prompts admitted together share prompt chunks. Each chunk round plans one
-    /// piece a prompt, its next cut exactly as its own pass would take it (nextCut), the fewest rows left first, while the
-    /// prompt buffers hold them (each piece at a multiple of 64 rows); a prompt that does not fit waits for the next round.
-    /// A round of one piece is a chunk of its own (Node.chunk). With the MTP head each prompt fills alone.
-    // ponytail: a failed admission fails the whole group (the host drops each); per-stream errors if groups grow large
-    fn prefillManyFn(p: *anyopaque, streams: []*lanes.Stream) anyerror!void {
+    /// One prompt-chunk round over `streams` (Backend.prefill_many; v1.10 multi_prefill with FILL's alternation, the host
+    /// running a decode round between calls): a stream not on a lane yet is admitted (admitPrompt); then one piece a
+    /// prompt, its next cut exactly as its own pass takes it (nextCut), the fewest rows left first, while the prompt
+    /// buffers hold them (each piece at a multiple of 64 rows), in one chunk (Node.chunkLanes; one piece: Node.chunk); a
+    /// prompt that does not fit waits. The streams whose prompt is in (their first token drawn) or that were cancelled
+    /// move to the front; their count is returned. With the MTP head each prompt fills whole, alone.
+    fn prefillManyFn(p: *anyopaque, streams: []*lanes.Stream) anyerror!usize {
         const g = of(p);
-        if (streams.len < 2 or (g.drafts and !g.dflash)) {
+        if (g.drafts and !g.dflash) {
             for (streams) |s| try prefillFn(p, s);
-            return;
+            return streams.len;
         }
         if (streams.len > max_lanes) return error.NoFreeLane;
-        var at: [max_lanes]usize = undefined;
-        var next: [max_lanes]usize = @splat(0);
         var lane: [max_lanes]usize = undefined;
-        var admitted: usize = 0;
-        errdefer for (lane[0..admitted]) |l| {
-            g.lanes[l].stream = null;
-        };
         for (streams, 0..) |s, i| {
-            at[i] = try g.admitPrompt(s);
-            lane[i] = g.n.e.lane;
-            admitted += 1;
+            if (g.laneOf(s) == null) {
+                const at = try g.admitPrompt(s);
+                const ln = g.laneOf(s).?;
+                ln.fill_at = at;
+                ln.fill_next = 0;
+            }
+            lane[i] = for (g.lanes[0..g.n_lanes], 0..) |*ln, li| (if (ln.stream == s) break li) else unreachable;
         }
         defer {
             g.pass = &.{};
             g.pass_at = null;
         }
-        while (true) {
-            var order: [max_lanes]usize = undefined;
-            var m: usize = 0;
-            for (streams, 0..) |s, i| if (at[i] < s.prompt().len and !s.isCancelled()) {
-                order[m] = i;
-                m += 1;
-            };
-            if (m == 0) break;
-            const left = struct {
-                fn less(ctx: struct { []*lanes.Stream, []const usize }, a: usize, b: usize) bool {
-                    return ctx[0][a].prompt().len - ctx[1][a] < ctx[0][b].prompt().len - ctx[1][b];
-                }
-            };
-            std.sort.insertion(usize, order[0..m], .{ streams, at[0..streams.len] }, left.less);
-            var items: [max_lanes][3]usize = undefined;
-            var picked: [max_lanes]usize = undefined;
-            var n: usize = 0;
-            var used: usize = 0;
-            for (order[0..m]) |i| {
-                var nx = next[i];
-                const rows = nextCut(streams[i], at[i], &nx);
-                const lo = std.mem.alignForward(usize, used, 64);
-                if (lo + rows > fwd.Engine.prefill_rows) continue;
-                next[i] = nx;
-                items[n] = .{ lane[i], at[i], rows };
-                picked[n] = i;
-                n += 1;
-                used = lo + rows;
+        var order: [max_lanes]usize = undefined;
+        var m: usize = 0;
+        for (streams, 0..) |s, i| if (g.lanes[lane[i]].fill_at < s.prompt().len and !s.isCancelled()) {
+            order[m] = i;
+            m += 1;
+        };
+        const Left = struct {
+            s: []*lanes.Stream,
+            l: []const Lane,
+            ln: []const usize,
+            fn rest(c: @This(), i: usize) usize {
+                return c.s[i].prompt().len - c.l[c.ln[i]].fill_at;
             }
-            if (n == 1) {
-                try g.n.bind(lane[picked[0]]);
-                try g.n.chunk(at[picked[0]], items[0][2]);
-            } else try g.n.chunkLanes(items[0..n]);
-            for (items[0..n], picked[0..n]) |it, i| {
-                const s = streams[i];
-                const ln = &g.lanes[lane[i]];
-                try ln.live.appendSlice(g.gpa, s.prompt()[at[i]..][0..it[2]]);
-                at[i] += it[2];
-                if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at[i])) != null) if (s.reuse.hook) |hk| {
-                    try g.n.bind(lane[i]); // snapSave keeps the bound lane's state
-                    g.pass = s.prompt();
-                    g.pass_at = @intCast(at[i]);
-                    hk.at(hk.ptr, s, @intCast(at[i]));
-                };
+            fn less(c: @This(), a: usize, b: usize) bool {
+                return c.rest(a) < c.rest(b);
             }
+        };
+        std.sort.insertion(usize, order[0..m], Left{ .s = streams, .l = &g.lanes, .ln = lane[0..streams.len] }, Left.less);
+        var items: [max_lanes][3]usize = undefined;
+        var picked: [max_lanes]usize = undefined;
+        var n: usize = 0;
+        var used: usize = 0;
+        for (order[0..m]) |i| {
+            const ln = &g.lanes[lane[i]];
+            var nx = ln.fill_next;
+            const rows = nextCut(streams[i], ln.fill_at, &nx);
+            const lo = std.mem.alignForward(usize, used, 64);
+            if (lo + rows > fwd.Engine.prefill_rows) continue;
+            ln.fill_next = nx;
+            items[n] = .{ lane[i], ln.fill_at, rows };
+            picked[n] = i;
+            n += 1;
+            used = lo + rows;
         }
-        for (streams, 0..) |s, i| {
-            if (s.isCancelled()) continue; // the core releases it
-            try g.n.bind(lane[i]);
-            try g.firstOf(s, &g.lanes[lane[i]]);
+        if (n == 1) {
+            try g.n.bind(items[0][0]);
+            try g.n.chunk(items[0][1], items[0][2]);
+        } else if (n > 1) try g.n.chunkLanes(items[0..n]);
+        for (items[0..n], picked[0..n]) |it, i| {
+            const s = streams[i];
+            const ln = &g.lanes[it[0]];
+            try ln.live.appendSlice(g.gpa, s.prompt()[it[1]..][0..it[2]]);
+            ln.fill_at += it[2];
+            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(ln.fill_at)) != null) if (s.reuse.hook) |hk| {
+                try g.n.bind(it[0]); // snapSave keeps the bound lane's state
+                g.pass = s.prompt();
+                g.pass_at = @intCast(ln.fill_at);
+                hk.at(hk.ptr, s, @intCast(ln.fill_at));
+            };
         }
+        // the finished ones first (their first token drawn), in order
+        var k: usize = 0;
+        for (0..streams.len) |i| {
+            const s = streams[i];
+            const ln = &g.lanes[lane[i]];
+            if (!s.isCancelled() and ln.fill_at < s.prompt().len) continue;
+            if (!s.isCancelled()) {
+                try g.n.bind(lane[i]);
+                try g.firstOf(s, ln);
+            }
+            std.mem.swap(*lanes.Stream, &streams[k], &streams[i]);
+            std.mem.swap(usize, &lane[k], &lane[i]);
+            k += 1;
+        }
+        return k;
     }
 
     fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {

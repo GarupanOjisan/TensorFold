@@ -86,31 +86,35 @@ pub const Engine = struct {
         return e.opened(s);
     }
 
-    /// addStream for streams admitted together: one Backend.prefillMany (their prompts may share passes), then each
-    /// stream's first token and drafts in order. errs[i]: stream i's error (a failed prefill: every stream's), or null.
-    pub fn addStreams(e: *Engine, streams: []*Stream, errs: []?anyerror) void {
-        if (streams.len == 1 or e.backend.vtable.prefill_many == null) { // one stream at a time, each opened before the next
+    /// addStream for streams being filled (v1.10 FILL): one Backend.prefillMany round over them, then the first token and
+    /// drafts of each whose prompt is in; it joins the rounds. Reorders `streams` with those done first and returns their
+    /// count; errs[i] is done stream i's error (a failed round: every stream's, all done), else null. Without the hook
+    /// each stream is added whole, in order.
+    pub fn fillStreams(e: *Engine, streams: []*Stream, errs: []?anyerror) usize {
+        @memset(errs, null);
+        if (e.backend.vtable.prefill_many == null) {
             for (streams, errs) |s, *er| er.* = if (e.addStream(s)) null else |err| err;
-            return;
+            return streams.len;
         }
         _ = e.arena.reset(.retain_capacity);
-        @memset(errs, null);
-        for (streams) |s| trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) }) catch |err| {
-            @memset(errs, err);
-            return;
-        };
-        e.backend.prefillMany(streams) catch |err| {
+        const k = e.backend.prefillMany(streams) catch |err| {
             for (streams, errs) |s, *er| {
                 if (s.isCancelled()) e.backend.release(s);
                 er.* = if (s.isCancelled()) error.Cancelled else err;
             }
-            return;
+            return streams.len;
         };
-        for (streams, errs) |s, *er| {
+        for (streams[0..k], errs[0..k]) |s, *er| {
+            trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) }) catch |err| {
+                er.* = err;
+                e.backend.release(s);
+                continue;
+            };
             e.opened(s) catch |err| {
                 er.* = err;
             };
         }
+        return k;
     }
 
     /// A prefilled stream's first token and first drafts; it joins the rounds.

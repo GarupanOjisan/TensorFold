@@ -55,6 +55,7 @@ pub const LaneHost = struct {
         delivered: usize = 0,
         started: bool = false,
         prefill_sent: bool = false, // a lone driver's prefilled event went out
+        filling: bool = false, // admitted, its prompt still going in (LaneHost.fill)
         began: i96 = 0,
         prefilled: ?i96 = null,
         entry: ?*pc.Entry = null, // the kept state the backend restores, until its prompt pass reports
@@ -277,29 +278,38 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
     }
 
-    /// Prefills the queued requests that fit the free lanes, together (Engine.addStreams: their prompts may share prompt
-    /// passes); false when none waits or no lane is free.
-    fn admitMany(h: *LaneHost) bool {
-        var jobs: [max_admit]*Job = undefined;
-        var n: usize = 0;
-        var took = false;
-        while (n < jobs.len) {
-            var one = false;
-            const job = h.prepare(&one) orelse if (one) {
-                took = true;
-                continue;
-            } else break;
-            took = true;
-            jobs[n] = job;
-            n += 1;
+    /// Takes the queued requests that fit the free lanes, then runs one prompt round over every admitted request still
+    /// filling (Engine.fillStreams: their prompts may share a pass); those whose prompt is in start decoding. `run` takes a
+    /// decode round between calls, so a long prompt fills while the others decode (v1.10 FILL).
+    fn fill(h: *LaneHost) void {
+        var fresh: usize = 0;
+        var last: ?*Job = null;
+        while (true) {
+            var took = false;
+            const job = h.prepare(&took) orelse if (took) continue else break;
+            job.filling = true;
+            fresh += 1;
+            last = job;
         }
-        if (n == 0) return took;
-        if (n == 1 and h.loneFits(jobs[0])) return h.runLone(jobs[0], jobs[0].began);
+        if (fresh == 1 and h.loneFits(last.?)) {
+            last.?.filling = false;
+            _ = h.runLone(last.?, last.?.began);
+            return;
+        }
         var streams: [max_admit]*lanes.Stream = undefined;
         var errs: [max_admit]?anyerror = undefined;
-        for (jobs[0..n], streams[0..n]) |job, *s| s.* = &job.stream;
-        h.core.addStreams(streams[0..n], errs[0..n]);
-        for (jobs[0..n], errs[0..n]) |job, er| {
+        var n: usize = 0;
+        h.lock();
+        for (h.admitted.items) |job| if (job.filling and n < max_admit) {
+            streams[n] = &job.stream;
+            n += 1;
+        };
+        h.unlock();
+        if (n == 0) return;
+        const k = h.core.fillStreams(streams[0..n], errs[0..n]);
+        for (streams[0..k], errs[0..k]) |s, er| {
+            const job: *Job = @alignCast(@fieldParentPtr("stream", s));
+            job.filling = false;
             if (er) |e| {
                 _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
                 continue;
@@ -307,7 +317,11 @@ pub const LaneHost = struct {
             h.prefilled(job, job.began);
             if (h.deliver(job)) h.remove(job);
         }
-        return true;
+    }
+
+    fn anyFilling(h: *LaneHost) bool {
+        for (h.admitted.items) |job| if (job.filling) return true;
+        return false;
     }
 
     const max_admit = 16;
@@ -474,7 +488,7 @@ pub const LaneHost = struct {
     fn run(h: *LaneHost) void {
         while (true) {
             h.takeCancels();
-            while (h.admitMany()) {}
+            h.fill();
             h.noteLive();
             h.lock();
             if (h.closing) {
@@ -485,7 +499,7 @@ pub const LaneHost = struct {
                 continue;
             }
             if (h.core.activeCount() == 0) {
-                if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
+                if (h.cancels.items.len == 0 and !h.anyFilling() and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
                 h.unlock();
                 continue;

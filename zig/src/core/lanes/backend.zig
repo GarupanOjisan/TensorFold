@@ -71,15 +71,16 @@ pub const Backend = struct {
         alternatives: ?*const fn (ptr: *anyopaque, s: *Stream, out: []Alternative) anyerror!usize = null,
         /// The stream left the rounds: free its caches and held drafts.
         release: *const fn (ptr: *anyopaque, s: *Stream) void,
-        /// Prefill several streams admitted together (their prompts may share prompt passes); null: one `prefill` each.
-        /// A cancelled stream may be left part-way; the core releases it.
-        prefill_many: ?*const fn (ptr: *anyopaque, streams: []*Stream) anyerror!void = null,
+        /// One prompt round over streams being filled (their prompts may share a pass), the host running a decode round
+        /// between calls: reorders `streams` so those whose prompt is in (their first token drawn) or that were
+        /// cancelled come first, and returns their count; the others go on at the next call. null: one `prefill` each.
+        prefill_many: ?*const fn (ptr: *anyopaque, streams: []*Stream) anyerror!usize = null,
     };
 
     pub fn prefill(b: Backend, s: *Stream) !void {
         return b.vtable.prefill(b.ptr, s);
     }
-    pub fn prefillMany(b: Backend, streams: []*Stream) !void {
+    pub fn prefillMany(b: Backend, streams: []*Stream) !usize {
         return (b.vtable.prefill_many orelse return error.NoGroupedPrefill)(b.ptr, streams);
     }
     pub fn first(b: Backend, s: *Stream, position: u64) !u64 {
