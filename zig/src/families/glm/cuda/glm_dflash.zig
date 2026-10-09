@@ -753,8 +753,10 @@ pub const Batch = struct {
         b.pool = pl;
     }
 
-    /// A 4-bit projection of `rows` rows (x rows q.k apart) in pieces of up to 16.
+    /// A 4-bit projection of `rows` rows (x rows q.k apart): 17 to 32 rows in one launch on the 32-row tile (the weights
+    /// read once, v1.10's qmm bucket; drafts only propose, so these bits need not be one lane's), else pieces of up to 16.
     fn mm(e: *Engine, x: u64, xs: u64, q: kern.Q4, out: u64, rows: usize, fp32: bool) !void {
+        if (rows > piece and rows <= 2 * piece) return kern.qmmShared(e.k, e.s, x, q.k, xs, q, out, rows, fp32);
         var r: usize = 0;
         while (r < rows) : (r += piece) {
             const n = @min(piece, rows - r);
