@@ -83,6 +83,38 @@ pub const Engine = struct {
             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
             return err;
         };
+        return e.opened(s);
+    }
+
+    /// addStream for streams admitted together: one Backend.prefillMany (their prompts may share passes), then each
+    /// stream's first token and drafts in order. errs[i]: stream i's error (a failed prefill: every stream's), or null.
+    pub fn addStreams(e: *Engine, streams: []*Stream, errs: []?anyerror) void {
+        if (streams.len == 1 or e.backend.vtable.prefill_many == null) { // one stream at a time, each opened before the next
+            for (streams, errs) |s, *er| er.* = if (e.addStream(s)) null else |err| err;
+            return;
+        }
+        _ = e.arena.reset(.retain_capacity);
+        @memset(errs, null);
+        for (streams) |s| trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) }) catch |err| {
+            @memset(errs, err);
+            return;
+        };
+        e.backend.prefillMany(streams) catch |err| {
+            for (streams, errs) |s, *er| {
+                if (s.isCancelled()) e.backend.release(s);
+                er.* = if (s.isCancelled()) error.Cancelled else err;
+            }
+            return;
+        };
+        for (streams, errs) |s, *er| {
+            e.opened(s) catch |err| {
+                er.* = err;
+            };
+        }
+    }
+
+    /// A prefilled stream's first token and first drafts; it joins the rounds.
+    fn opened(e: *Engine, s: *Stream) !void {
         if (s.isCancelled()) { // cancelled in its last chunk: no first token
             e.backend.release(s);
             return error.Cancelled;

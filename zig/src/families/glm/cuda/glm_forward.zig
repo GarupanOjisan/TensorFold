@@ -627,6 +627,7 @@ pub const Engine = struct {
     /// a side stream (glm_l2pf.zig); `l2pf_active` is set while such a window runs.
     l2pf: ?l2pf.Prefetch = null,
     l2pf_active: bool = false,
+    pieces: []const Piece = &.{}, // a multi-prompt chunk's pieces while it runs (prefillPieces)
     hc_mma: bool = true,
     /// TF_GLM_LATENT_MMA / TF_GLM_SPARSE_ONEPASS (default on): a prompt chunk's absorb and expand on the tensor cores, its
     /// sparse attention in one pass a row.
@@ -721,6 +722,7 @@ pub const Engine = struct {
         e.capturing = false;
         e.nuc_dev = null;
         e.nuc_host = &.{};
+        e.pieces = &.{};
         e.l2pf_active = false; // `e` starts undefined, so every field with a default but no assignment here is garbage
         e.draft_head = w.draft_head;
         e.full_dev = try cuda.DeviceBuffer.alloc(d, wt.world * max_rows * w.head.n * bf);
@@ -1026,6 +1028,21 @@ pub const Engine = struct {
             try e.mm(b, ga, e.width, b.xs_ga, kw.gb, b.kg, rows, false);
             try e.pfSite(l.index, 2);
         }
+        try e.kdaState(l, b, rows, host_pos);
+        const scr_out = if (b.prefill) b.kscr.out else st.scr.out + li * max_rows * ll * 128 * bf;
+        if (!b.prefill) try e.t.groupSums(scr_out, ll * 128, b.kxs, rows, ll * 128);
+        return e.outProj(b, scr_out, b.kxs, kw.o, rows, .{ l.index, 0 });
+    }
+
+    /// kdaBlock's state work after its projections (b.kproj or the lane's proj): the chain over the KDA state and, for a
+    /// prompt chunk, the conv window's move; the rows' outputs in the scratch's `out`.
+    fn kdaState(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize, host_pos: usize) !void {
+        const c = e.w.cfg;
+        const kw = l.kda.?;
+        const li: usize = e.st.kda_index[l.index];
+        const ll: usize = c.kda_heads / wt.world;
+        const st = &e.st;
+        const p = if (b.prefill) b.kproj else st.proj + li * max_rows * e.width * bf;
         const rec_layer = ll * 128 * 128 * f4;
         const rec_half = st.kda_layers * rec_layer;
         const scr: KdaScratch = if (b.prefill) b.kscr else .{ .out = st.scr.out + li * max_rows * ll * 128 * bf, .k = st.scr.k + li * max_rows * ll * 128 * f4, .v = st.scr.v + li * max_rows * ll * 128 * bf, .g = st.scr.g + li * max_rows * ll * 128 * f4, .b = st.scr.b + li * max_rows * ll * f4 };
@@ -1063,8 +1080,6 @@ pub const Engine = struct {
             // a prompt chunk keeps every row: the layer's conv window moves now (its state half flips in prefillChunk)
             try e.t.convShift(st.conv + li * conv_layer, b.kproj, rows, 1, 3 * ll * 128, 3 * 3 * ll * 128, b.rows * e.width, e.width);
         }
-        if (!b.prefill) try e.t.groupSums(scr.out, ll * 128, b.kxs, rows, ll * 128);
-        return e.outProj(b, scr.out, b.kxs, kw.o, rows, .{ l.index, 0 });
     }
 
     /// forward.dsa_front: DSA's projection, query and latent norms and query expansion of rows lo .. hi (row-independent).
@@ -1088,10 +1103,20 @@ pub const Engine = struct {
         const c = e.w.cfg;
         const a = l.dsa.?;
         const hl: usize = c.mla_heads / wt.world;
+        for (undone(rows, done)) |r| if (r[1] > r[0]) try e.dsaFront(l, b, r[0], r[1]);
+        try e.dsaState(l, b, kc, pos_dev, host_pos, index, rows);
+        try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
+        return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
+    }
+
+    /// dsaBlock after its fronts: the latent write, the indexer, absorb, dense or sparse attention and expand into b.vn.
+    fn dsaState(e: *Engine, l: *const wt.Layer, b: *const Buffers, kc: u64, pos_dev: u64, host_pos: usize, index: ?[3]u64, rows: usize) !void {
+        const c = e.w.cfg;
+        const a = l.dsa.?;
+        const hl: usize = c.mla_heads / wt.world;
         const qk: usize = c.nope;
         const lw: usize = c.kv_lora;
         const dense_limit = denseLimit(e.w);
-        for (undone(rows, done)) |r| if (r[1] > r[0]) try e.dsaFront(l, b, r[0], r[1]);
         // _dsa_latent
         try e.t.latentWrite(b.lat, c.kv_lora, kc, pos_dev, rows, lw);
         const all_sparse = host_pos >= dense_limit;
@@ -1137,8 +1162,6 @@ pub const Engine = struct {
             } else try e.t.sparseAttention(b.qa, kc, b.tokens, b.counts, b.ol, b.spo, b.spm, b.spl, rows, hl, lw, tri.select_width, scale);
         }
         if (b.prefill and e.latent_mma) try e.t.expandVMma(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw) else try e.t.expandV(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw);
-        try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
-        return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
     }
 
     /// TORCH-GLUE `pos_dev + r0`: block j's first position into its own 16-byte slot (the host knows pos).
@@ -1239,6 +1262,7 @@ pub const Engine = struct {
 
     /// The layer's KDA or DSA block on b.normed (forward._mixer).
     fn mixer(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, host_pos: usize, done: ?[2]usize) !u64 {
+        if (b.prefill and e.pieces.len > 0) return e.mixPieces(l, b, rows, done);
         return switch (l.kind) {
             .kda => try e.kdaBlock(l, b, rows, host_pos, done),
             .mla => blk: {
@@ -1246,6 +1270,108 @@ pub const Engine = struct {
                 break :blk try e.dsaBlock(l, b, e.st.kc[di], e.st.pos_dev, host_pos, if (e.st.long_context) e.st.index[di] else null, rows, done);
             },
         };
+    }
+
+    // -- multi-prompt chunks (v1.10 multi_prefill) -----------------------------------------------------------------
+    /// A lane's rows of a multi-prompt chunk: its next `rows` prompt rows from its position, at row `lo` of the prompt
+    /// buffers (a multiple of 64, so each row keeps the place in the prompt kernels' 64-row tiles a chunk of its own gives it).
+    pub const Piece = struct { lane: usize, rows: usize, lo: usize };
+
+    /// multi_prefill.PieceMixer: the block's fronts and output projection over every row; its state work piece by piece,
+    /// on the piece's lane at its position, through the calls a chunk of its own makes (the piece's rows a view at `lo`).
+    fn mixPieces(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, done: ?[2]usize) !u64 {
+        const c = e.w.cfg;
+        const home = e.lane;
+        switch (l.kind) {
+            .kda => {
+                const kw = l.kda.?;
+                for (undone(rows, done)) |r| if (r[1] > r[0]) try e.kdaFront(l, b, r[0], r[1]);
+                for (e.pieces) |pc| {
+                    try e.bind(pc.lane);
+                    const v = e.pieceView(b, pc.lo);
+                    try e.kdaState(l, &v, pc.rows, e.st.pos);
+                }
+                try e.bind(home);
+                return e.outProj(b, b.kscr.out, b.kxs, kw.o, rows, .{ l.index, 0 });
+            },
+            .mla => {
+                const a = l.dsa.?;
+                const hl: usize = c.mla_heads / wt.world;
+                for (undone(rows, done)) |r| if (r[1] > r[0]) try e.dsaFront(l, b, r[0], r[1]);
+                for (e.pieces) |pc| {
+                    try e.bind(pc.lane);
+                    const v = e.pieceView(b, pc.lo);
+                    const di: usize = e.st.dsa_index[l.index];
+                    try e.dsaState(l, &v, e.st.kc[di], e.st.pos_dev, e.st.pos, if (e.st.long_context) e.st.index[di] else null, pc.rows);
+                }
+                try e.bind(home);
+                try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
+                return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
+            },
+        }
+    }
+
+    /// The prompt buffers from row `lo` on, for kdaState and dsaState: every buffer they index by row moves; their
+    /// scratch (attention partials, selection, block positions) stays, a piece's work running before the next one's.
+    fn pieceView(e: *const Engine, b: *const Buffers, lo: usize) Buffers {
+        const c = e.w.cfg;
+        const ll: usize = c.kda_heads / wt.world;
+        const hl: usize = c.mla_heads / wt.world;
+        const kh = ll * 128;
+        var v = b.*;
+        v.normed += lo * c.hidden * bf;
+        v.xs += lo * c.hidden / 64 * f4;
+        v.kproj += lo * e.width * bf;
+        v.ka += lo * kh * bf;
+        v.kg += lo * kh * bf;
+        v.kscr = .{ .out = b.kscr.out + lo * kh * bf, .k = b.kscr.k + lo * kh * f4, .v = b.kscr.v + lo * kh * bf, .g = b.kscr.g + lo * kh * f4, .b = b.kscr.b + lo * ll * f4 };
+        if (b.q_tmp != 0) v.q_tmp += lo * kh * f4;
+        if (b.y_tmp != 0) v.y_tmp += lo * kh * bf;
+        v.qr += lo * c.q_lora * bf;
+        v.xs_qr += lo * c.q_lora / 64 * f4;
+        v.lat += lo * c.kv_lora * bf;
+        v.q += lo * hl * c.nope * bf;
+        v.ikr += lo * (c.i_dim + c.i_heads) * bf;
+        v.igr += lo * c.i_dim * f4;
+        v.qi += lo * c.i_heads * c.i_dim * bf;
+        v.qa += lo * hl * c.kv_lora * bf;
+        v.ol += lo * hl * c.kv_lora * bf;
+        v.vn += lo * hl * c.v_dim * bf;
+        v.tokens += lo * tri.select_width * 4;
+        v.counts += lo * 4;
+        return v;
+    }
+
+    /// multi_prefill.prefill_pieces up to the commits: one prompt chunk over every piece (`ids`: the chunk's rows, a
+    /// piece's tokens at its `lo`, the rows between pieces any token), then per piece the head on its last row and that
+    /// row's hidden state into its lane's last_logits and last_hidden, as prefillChunk leaves them. The taps and each
+    /// lane's commitChunk are the caller's (Node.chunkLanes).
+    pub fn prefillPieces(e: *Engine, pieces: []const Piece, ids: []const u32) !void {
+        const d: usize = e.w.cfg.hidden;
+        const b = &e.pbuf;
+        const R = ids.len;
+        if (pieces.len == 0 or pieces.len > max_lanes or R > b.rows) return error.BadChunk;
+        const home = e.lane;
+        for (pieces, 0..) |pc, i| {
+            if (pc.rows == 0 or pc.lo % 64 != 0 or pc.lo + pc.rows > R) return error.BadChunk;
+            if (i > 0 and pc.lo < pieces[i - 1].lo + pieces[i - 1].rows) return error.BadChunk;
+            for (pieces[0..i]) |o| if (o.lane == pc.lane) return error.BadChunk;
+            try e.bind(pc.lane);
+            try e.checkRoom(pc.rows, e.st.pos);
+        }
+        try e.bind(home);
+        try e.upload(b.ids, std.mem.sliceAsBytes(ids));
+        e.pieces = pieces;
+        defer e.pieces = &.{};
+        try e.compute(b, R);
+        for (pieces) |pc| {
+            const r = pc.lo + pc.rows - 1;
+            // prefillChunk's head: the last row times the head, with the group sums at its chunk's first row
+            try e.mm(b, b.fnormed + r * d * bf, d, b.fxs + pc.lo * (d / 64) * f4, e.w.head, b.logits, 1, false);
+            const st = e.laneState(pc.lane);
+            try e.copyDev(st.last_logits, b.logits, e.w.head.n * bf);
+            try e.copyDev(st.last_hidden, b.fnormed + r * d * bf, d * bf);
+        }
     }
 
     fn layerForward(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, host_pos: usize) !void {

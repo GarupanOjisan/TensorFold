@@ -14,7 +14,7 @@ const roce_mod = @import("glm_roce.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18, chunk_lanes = 19 };
 
 /// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 pub fn drafterDir() ?[]const u8 {
@@ -41,7 +41,7 @@ pub const Node = struct {
     k: kern.Kernels,
     e: Engine,
     words: std.ArrayList(u32) = .empty,
-    prompt: std.ArrayList(u32) = .empty, // the prompt `begin` started, which `chunk` reads
+    prompts: [Engine.max_lanes]std.ArrayList(u32) = @splat(.empty), // each lane's begun prompt, which `chunk` and `chunkLanes` read
     mtp: bool = false,
     roce: ?*roce_mod.Roce = null,
     dflash: ?dflash.Drafter = null, // the bound lane's DFlash2 context (bind swaps it with `drafters`)
@@ -57,7 +57,7 @@ pub const Node = struct {
         n.gpa = gpa;
         n.rank = rank;
         n.words = .empty;
-        n.prompt = .empty;
+        n.prompts = @splat(.empty);
         n.mtp = false;
         n.snaps = .empty;
         n.drafters = @splat(null);
@@ -127,7 +127,7 @@ pub const Node = struct {
         var it = n.snaps.valueIterator();
         while (it.next()) |b| b.free();
         n.snaps.deinit(n.gpa);
-        n.prompt.deinit(n.gpa);
+        for (&n.prompts) |*pr| pr.deinit(n.gpa);
         if (n.dflash) |*dr| dr.deinit();
         for (&n.drafters) |*slot| if (slot.*) |*dr| dr.deinit();
         if (n.batch) |*b| b.deinit();
@@ -172,8 +172,9 @@ pub const Node = struct {
         try n.words.appendSlice(n.gpa, &.{ @intFromBool(mtp), snap, @intCast(at) });
         try n.words.appendSlice(n.gpa, prompt);
         try n.send(.begin, n.words.items);
-        n.prompt.clearRetainingCapacity();
-        try n.prompt.appendSlice(n.gpa, prompt);
+        const mine = &n.prompts[n.e.lane];
+        mine.clearRetainingCapacity();
+        try mine.appendSlice(n.gpa, prompt);
         n.mtp = mtp;
         if (snap == no_snapshot) {
             try n.e.reset();
@@ -188,7 +189,45 @@ pub const Node = struct {
     /// The begun prompt's rows at .. at + rows, at the state's position.
     pub fn chunk(n: *Node, at: usize, rows: usize) !void {
         try n.send(.chunk, &.{ @intCast(at), @intCast(rows) });
-        try dec.prefillChunk(&n.e, n.prompt.items, at, rows, n.mtp, if (n.dflash) |*dr| dr else null);
+        try dec.prefillChunk(&n.e, n.prompts[n.e.lane].items, at, rows, n.mtp, if (n.dflash) |*dr| dr else null);
+    }
+
+    /// One prompt chunk over several begun lanes' next rows (multi_prefill.prefill_pieces; rank 0 sends it, both run it):
+    /// `items` (lane, at, rows), each piece at the next multiple of 64 rows of the prompt buffers; then per piece its taps
+    /// into its lane's DFlash2 context and its lane's commit. Not with the MTP head (its cache is not grouped).
+    pub fn chunkLanes(n: *Node, items: []const [3]usize) !void {
+        n.words.clearRetainingCapacity();
+        try n.words.append(n.gpa, @intCast(items.len));
+        for (items) |it| try n.words.appendSlice(n.gpa, &.{ @intCast(it[0]), @intCast(it[1]), @intCast(it[2]) });
+        try n.send(.chunk_lanes, n.words.items);
+        if (n.mtp or items.len > Engine.max_lanes) return error.BadChunk;
+        var pieces: [Engine.max_lanes]Engine.Piece = undefined;
+        var ids: [Engine.prefill_rows]u32 = undefined;
+        var at: usize = 0;
+        for (items, 0..) |it, i| {
+            const lane = it[0];
+            if (lane >= n.e.n_lanes) return error.NoSuchLane;
+            const prompt = n.prompts[lane].items;
+            if (it[2] == 0 or it[1] + it[2] > prompt.len or n.e.laneState(lane).pos != it[1]) return error.ChunkOutOfStep;
+            const lo = std.mem.alignForward(usize, at, 64);
+            if (lo + it[2] > ids.len) return error.BadChunk;
+            @memset(ids[at..lo], 0);
+            @memcpy(ids[lo..][0..it[2]], prompt[it[1]..][0..it[2]]);
+            pieces[i] = .{ .lane = lane, .rows = it[2], .lo = lo };
+            at = lo + it[2];
+        }
+        try n.e.prefillPieces(pieces[0..items.len], ids[0..at]);
+        for (pieces[0..items.len]) |pc| {
+            try n.bind(pc.lane);
+            if (n.dflash) |*dr| { // the piece's rows of the taps (the row0 offset dflashRun takes)
+                var b = n.e.pbuf;
+                for (&b.taps) |*t| if (t.* != 0) {
+                    t.* += pc.lo * n.e.w.cfg.hidden * 2;
+                };
+                try dr.addTaps(&n.e, &b, pc.rows);
+            }
+            try n.e.commitChunk(pc.rows);
+        }
     }
 
     /// The first token after the prompt's last chunk. k 0: greedy, the token returned; else the last row's k
@@ -470,6 +509,13 @@ pub const Node = struct {
                     if (m > Engine.max_lanes) return error.TooManySegments;
                     for (0..m) |i| items[i] = .{ .lane = w[1 + 3 * i], .rows = w[2 + 3 * i], .keep = w[3 + 3 * i] };
                     try n.keepLanes(items[0..m]);
+                },
+                .chunk_lanes => {
+                    const m = w[0];
+                    var items: [Engine.max_lanes][3]usize = undefined;
+                    if (m > Engine.max_lanes) return error.BadChunk;
+                    for (0..m) |i| items[i] = .{ w[1 + 3 * i], w[2 + 3 * i], w[3 + 3 * i] };
+                    try n.chunkLanes(items[0..m]);
                 },
                 .bind => try n.bind(w[0]),
                 .grow => _ = try n.grow(w[0]),

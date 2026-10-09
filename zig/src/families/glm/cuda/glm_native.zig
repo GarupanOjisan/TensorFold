@@ -331,10 +331,49 @@ const Glm = struct {
 
     fn prefillFn(p: *anyopaque, s: *lanes.Stream) anyerror!void {
         const g = of(p);
+        const ids = s.prompt();
+        var at = try g.admitPrompt(s);
+        const ln = g.laneOf(s).?;
+        errdefer ln.stream = null;
+        g.pass = ids;
+        defer {
+            g.pass = &.{};
+            g.pass_at = null;
+        }
+        var next: usize = 0; // the planned chunk starts: a resumed pass cuts where a fresh one does
+        while (at < ids.len) {
+            if (s.isCancelled()) return error.Cancelled;
+            const rows = nextCut(s, at, &next);
+            try g.n.chunk(at, rows);
+            try ln.live.appendSlice(g.gpa, ids[at..][0..rows]);
+            at += rows;
+            g.pass_at = @intCast(at);
+            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
+        }
+        try g.firstOf(s, ln);
+    }
+
+    /// The rows of the prompt chunk from `at`: to its next planned start (`next` walks s.chunks) or its end, at most a chunk.
+    fn nextCut(s: *const lanes.Stream, at: usize, next: *usize) usize {
+        while (next.* < s.chunks.len and s.chunks[next.*] <= at) next.* += 1;
+        const end: usize = if (next.* < s.chunks.len) s.chunks[next.*] else s.prompt().len;
+        return @min(end - at, fwd.Engine.prefill_rows);
+    }
+
+    /// The first token after the bound lane's prompt.
+    fn firstOf(g: *Glm, s: *lanes.Stream, ln: *Lane) !void {
+        const k = try candidateCount(s);
+        const first = try g.n.first(k);
+        var one: [1]u32 = .{first};
+        if (k > 0) try g.choose(s, .last, k, 1, s.prompt().len, &one);
+        ln.first = g.take(one[0]);
+    }
+
+    /// A prompt's lane (bound) and its begun state: a kept state of its prefix resumed, else empty; where its pass starts.
+    fn admitPrompt(g: *Glm, s: *lanes.Stream) !usize {
         const e = &g.n.e;
         const ids = s.prompt();
         if (ids.len == 0 or ids.len + s.max_new + max_rows > e.st.capacity) return error.PromptTooLong;
-        const k = try candidateCount(s);
         s.cached = 0;
         // a kept state of this prompt's prefix resumes in a lane whose rows hold it, or in a free lane they are
         // copied to; without one the pass starts at 0 in the free lane used longest ago
@@ -377,27 +416,88 @@ const Glm = struct {
         ln.live.shrinkRetainingCapacity(@min(ln.live.items.len, at));
         try g.n.begin(ids, g.drafts and !g.dflash, snap, at);
         s.cached = @intCast(at);
-        g.pass = ids;
+        return at;
+    }
+
+    /// multi_prefill (TF_GLM_MULTI_PREFILL): several prompts admitted together share prompt chunks. Each chunk round plans one
+    /// piece a prompt, its next cut exactly as its own pass would take it (nextCut), the fewest rows left first, while the
+    /// prompt buffers hold them (each piece at a multiple of 64 rows); a prompt that does not fit waits for the next round.
+    /// A round of one piece is a chunk of its own (Node.chunk). With the MTP head each prompt fills alone.
+    // ponytail: a failed admission fails the whole group (the host drops each); per-stream errors if groups grow large
+    fn prefillManyFn(p: *anyopaque, streams: []*lanes.Stream) anyerror!void {
+        const g = of(p);
+        if (streams.len < 2 or (g.drafts and !g.dflash)) {
+            for (streams) |s| try prefillFn(p, s);
+            return;
+        }
+        if (streams.len > max_lanes) return error.NoFreeLane;
+        var at: [max_lanes]usize = undefined;
+        var next: [max_lanes]usize = @splat(0);
+        var lane: [max_lanes]usize = undefined;
+        var admitted: usize = 0;
+        errdefer for (lane[0..admitted]) |l| {
+            g.lanes[l].stream = null;
+        };
+        for (streams, 0..) |s, i| {
+            at[i] = try g.admitPrompt(s);
+            lane[i] = g.n.e.lane;
+            admitted += 1;
+        }
         defer {
             g.pass = &.{};
             g.pass_at = null;
         }
-        var next: usize = 0; // the planned chunk starts: a resumed pass cuts where a fresh one does
-        while (at < ids.len) {
-            if (s.isCancelled()) return error.Cancelled;
-            while (next < s.chunks.len and s.chunks[next] <= at) next += 1;
-            const end: usize = if (next < s.chunks.len) s.chunks[next] else ids.len;
-            const rows = @min(end - at, fwd.Engine.prefill_rows);
-            try g.n.chunk(at, rows);
-            try ln.live.appendSlice(g.gpa, ids[at..][0..rows]);
-            at += rows;
-            g.pass_at = @intCast(at);
-            if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |hk| hk.at(hk.ptr, s, @intCast(at));
+        while (true) {
+            var order: [max_lanes]usize = undefined;
+            var m: usize = 0;
+            for (streams, 0..) |s, i| if (at[i] < s.prompt().len and !s.isCancelled()) {
+                order[m] = i;
+                m += 1;
+            };
+            if (m == 0) break;
+            const left = struct {
+                fn less(ctx: struct { []*lanes.Stream, []const usize }, a: usize, b: usize) bool {
+                    return ctx[0][a].prompt().len - ctx[1][a] < ctx[0][b].prompt().len - ctx[1][b];
+                }
+            };
+            std.sort.insertion(usize, order[0..m], .{ streams, at[0..streams.len] }, left.less);
+            var items: [max_lanes][3]usize = undefined;
+            var picked: [max_lanes]usize = undefined;
+            var n: usize = 0;
+            var used: usize = 0;
+            for (order[0..m]) |i| {
+                var nx = next[i];
+                const rows = nextCut(streams[i], at[i], &nx);
+                const lo = std.mem.alignForward(usize, used, 64);
+                if (lo + rows > fwd.Engine.prefill_rows) continue;
+                next[i] = nx;
+                items[n] = .{ lane[i], at[i], rows };
+                picked[n] = i;
+                n += 1;
+                used = lo + rows;
+            }
+            if (n == 1) {
+                try g.n.bind(lane[picked[0]]);
+                try g.n.chunk(at[picked[0]], items[0][2]);
+            } else try g.n.chunkLanes(items[0..n]);
+            for (items[0..n], picked[0..n]) |it, i| {
+                const s = streams[i];
+                const ln = &g.lanes[lane[i]];
+                try ln.live.appendSlice(g.gpa, s.prompt()[at[i]..][0..it[2]]);
+                at[i] += it[2];
+                if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at[i])) != null) if (s.reuse.hook) |hk| {
+                    try g.n.bind(lane[i]); // snapSave keeps the bound lane's state
+                    g.pass = s.prompt();
+                    g.pass_at = @intCast(at[i]);
+                    hk.at(hk.ptr, s, @intCast(at[i]));
+                };
+            }
         }
-        const first = try g.n.first(k);
-        var one: [1]u32 = .{first};
-        if (k > 0) try g.choose(s, .last, k, 1, ids.len, &one);
-        ln.first = g.take(one[0]);
+        for (streams, 0..) |s, i| {
+            if (s.isCancelled()) continue; // the core releases it
+            try g.n.bind(lane[i]);
+            try g.firstOf(s, &g.lanes[lane[i]]);
+        }
     }
 
     fn firstFn(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
@@ -637,7 +737,7 @@ const Glm = struct {
     }
 
     fn backend(g: *Glm) be.Backend {
-        g.vtable = .{ .prefill = prefillFn, .first = firstFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .tree = treeFn };
+        g.vtable = .{ .prefill = prefillFn, .first = firstFn, .queue = queueFn, .read = readFn, .verify = verifyFn, .keep = keepFn, .draft = draftFn, .release = releaseFn, .tree = treeFn, .prefill_many = prefillManyFn };
         return .{ .ptr = g, .vtable = &g.vtable };
     }
 

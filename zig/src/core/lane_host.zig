@@ -277,18 +277,56 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
     }
 
-    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
-    fn admitOne(h: *LaneHost) bool {
+    /// Prefills the queued requests that fit the free lanes, together (Engine.addStreams: their prompts may share prompt
+    /// passes); false when none waits or no lane is free.
+    fn admitMany(h: *LaneHost) bool {
+        var jobs: [max_admit]*Job = undefined;
+        var n: usize = 0;
+        var took = false;
+        while (n < jobs.len) {
+            var one = false;
+            const job = h.prepare(&one) orelse if (one) {
+                took = true;
+                continue;
+            } else break;
+            took = true;
+            jobs[n] = job;
+            n += 1;
+        }
+        if (n == 0) return took;
+        if (n == 1 and h.loneFits(jobs[0])) return h.runLone(jobs[0], jobs[0].began);
+        var streams: [max_admit]*lanes.Stream = undefined;
+        var errs: [max_admit]?anyerror = undefined;
+        for (jobs[0..n], streams[0..n]) |job, *s| s.* = &job.stream;
+        h.core.addStreams(streams[0..n], errs[0..n]);
+        for (jobs[0..n], errs[0..n]) |job, er| {
+            if (er) |e| {
+                _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
+                continue;
+            }
+            h.prefilled(job, job.began);
+            if (h.deliver(job)) h.remove(job);
+        }
+        return true;
+    }
+
+    const max_admit = 16;
+
+    /// The next queued request taken into a free lane with its stream set up (not yet prefilled); null when none waits
+    /// or no lane is free (`took` false), or when the one taken failed here (`took` true, the job finished).
+    fn prepare(h: *LaneHost, took: *bool) ?*Job {
+        took.* = false;
         h.lock();
         if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
             h.unlock();
-            return false;
+            return null;
         }
+        took.* = true;
         const job = h.queued.orderedRemove(0);
         h.admitted.append(h.gpa, job) catch {
             h.unlock();
             h.finish(job, .failed, "out of memory");
-            return true;
+            return null;
         };
         h.unlock();
         const r = job.request;
@@ -300,7 +338,10 @@ pub const LaneHost = struct {
             job.marks = l.marks;
             reuse = .{ .saved = if (l.entry) |e| e.saved else null, .at = if (l.entry) |e| e.at else 0, .marks = l.marks, .hook = .{ .ptr = job, .at = Job.kept } };
         } else |_| {};
-        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch return h.drop(job, "the drafter could not start");
+        job.proposer = lanes.SuffixLookup.init(h.gpa, .{ .min_match = h.min_match }) catch {
+            _ = h.drop(job, "the drafter could not start");
+            return null;
+        };
         job.stream = lanes.Stream.init(h.gpa, .{
             .id = "request",
             .prompt = r.prompt,
@@ -319,16 +360,12 @@ pub const LaneHost = struct {
             .reuse = reuse,
         }) catch {
             job.proposer.deinit();
-            return h.drop(job, "out of memory");
+            _ = h.drop(job, "out of memory");
+            return null;
         };
         job.started = true;
-        const began = std.Io.Clock.awake.now(h.io).toNanoseconds();
-        job.began = began;
-        if (h.loneFits(job)) return h.runLone(job, began);
-        h.core.addStream(&job.stream) catch |e| return if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
-        h.prefilled(job, began);
-        if (h.deliver(job)) h.remove(job);
-        return true;
+        job.began = std.Io.Clock.awake.now(h.io).toNanoseconds();
+        return job;
     }
 
     fn prefilled(h: *LaneHost, job: *Job, began: i96) void {
@@ -437,7 +474,7 @@ pub const LaneHost = struct {
     fn run(h: *LaneHost) void {
         while (true) {
             h.takeCancels();
-            while (h.admitOne()) {}
+            while (h.admitMany()) {}
             h.noteLive();
             h.lock();
             if (h.closing) {
