@@ -557,6 +557,25 @@ const Glm = struct {
         var ls: [max_lanes]usize = undefined;
         var pend: [max_lanes]u32 = undefined;
         var m: usize = 0;
+        // every lane's kept rows in one commit (Node.keepLanes), before the turns: each turn's own commit then finds nothing
+        var keeps: [max_lanes]fwd.Engine.Keep = undefined;
+        var nk: usize = 0;
+        for (requests) |r| {
+            const rows = r.rows orelse continue;
+            for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
+            for (g.lanes[0..g.n_lanes], 0..) |*ln, li| if (ln.stream == r.stream and ln.pending_rows > 0) {
+                keeps[nk] = .{ .lane = li, .rows = ln.pending_rows, .keep = rows.len };
+                nk += 1;
+            };
+        }
+        if (nk > 0) {
+            try g.n.keepLanes(keeps[0..nk]);
+            for (keeps[0..nk]) |k| {
+                const ln = &g.lanes[k.lane];
+                try ln.live.appendSlice(g.gpa, ln.window[0..k.keep]);
+                ln.pending_rows = 0;
+            }
+        }
         for (requests, 0..) |r, i| {
             const ln = try g.enter(r.stream);
             idx[i] = g.n.e.lane;

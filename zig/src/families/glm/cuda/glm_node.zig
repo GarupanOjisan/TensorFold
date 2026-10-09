@@ -14,7 +14,7 @@ const roce_mod = @import("glm_roce.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18 };
 
 /// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 pub fn drafterDir() ?[]const u8 {
@@ -318,6 +318,26 @@ pub const Node = struct {
         try n.e.commit(rows, kept);
     }
 
+    /// keep for several lanes of the last shared window at once (Engine.commitSegs).
+    pub fn keepLanes(n: *Node, items: []const Engine.Keep) !void {
+        n.words.clearRetainingCapacity();
+        try n.words.append(n.gpa, @intCast(items.len));
+        for (items) |it| try n.words.appendSlice(n.gpa, &.{ @intCast(it.lane), @intCast(it.rows), @intCast(it.keep) });
+        try n.send(.keep_lanes, n.words.items);
+        var segs: [Engine.max_lanes]Engine.Keep = undefined;
+        var m: usize = 0;
+        for (items) |it| {
+            if (it.lane < n.e.n_lanes and n.e.laneState(it.lane).seg) {
+                segs[m] = it;
+                m += 1;
+                continue;
+            }
+            try n.bind(it.lane); // a window it ran alone: its own commit
+            try n.e.commit(it.rows, it.keep);
+        }
+        try n.e.commitSegs(segs[0..m]);
+    }
+
     /// Absorb (hidden row, following token) pairs and draft `out.len` tokens.
     pub fn draft(n: *Node, from: From, next: []const u32, out: []u32) !void {
         n.words.clearRetainingCapacity();
@@ -443,6 +463,13 @@ pub const Node = struct {
                     var ls: [Engine.max_lanes]usize = undefined;
                     for (0..m) |i| ls[i] = w[1 + i];
                     try n.dflashBlocks(ls[0..m], w[1 + m ..][0..m]);
+                },
+                .keep_lanes => {
+                    const m = w[0];
+                    var items: [Engine.max_lanes]Engine.Keep = undefined;
+                    if (m > Engine.max_lanes) return error.TooManySegments;
+                    for (0..m) |i| items[i] = .{ .lane = w[1 + 3 * i], .rows = w[2 + 3 * i], .keep = w[3 + 3 * i] };
+                    try n.keepLanes(items[0..m]);
                 },
                 .bind => try n.bind(w[0]),
                 .grow => _ = try n.grow(w[0]),

@@ -1850,6 +1850,46 @@ pub const Engine = struct {
         try e.setPos(st.pos + keep);
     }
 
+    pub const Keep = struct { lane: usize, rows: usize, keep: usize };
+
+    /// commitSeg for several lanes of the last segmented window at once (verify.BatchedVerify.commit over its segments): one
+    /// table, one replay of the segments that keep fewer rows than they ran, one conv shift; then each lane's parity and
+    /// position. Every lane's last window must be segmented (Node.keepLanes commits the others on their own).
+    pub fn commitSegs(e: *Engine, ks: []const Keep) !void {
+        const m = ks.len;
+        if (m == 0) return;
+        if (m > max_lanes) return error.TooManySegments;
+        var segs: [max_lanes]*State = undefined;
+        for (ks) |it| {
+            if (it.keep < 1 or it.keep > it.rows) return error.BadKeep;
+            if (it.lane >= e.n_lanes or !e.laneState(it.lane).seg) return error.NotSegmented;
+        }
+        for (ks[0..m], 0..) |it, i| segs[i] = e.laneState(it.lane);
+        const n = segs[0].kda_layers;
+        if (n > 0) {
+            const pl = &e.pool.?;
+            const ll: usize = e.w.cfg.kda_heads / wt.world;
+            e.kseg_host = @splat(.{ .row0 = 0, .rows = 0, .slot = 0, .parity = 0, .conv = 0, .keep = 0 });
+            var r: usize = 0; // the replayed segments first: replayLayersSegments takes the first r, convShiftSeg all m
+            for ([_]bool{ true, false }) |replayed| for (ks[0..m], segs[0..m]) |it, st| {
+                if ((it.keep < it.rows) != replayed) continue;
+                e.kseg_host[r] = .{ .row0 = @intCast(st.row0), .rows = @intCast(it.rows), .slot = @intCast(st.slot), .parity = @intCast(st.cur), .conv = @intCast(st.slot), .keep = @intCast(it.keep) };
+                r += 1;
+            };
+            var replays: usize = 0;
+            for (ks[0..m]) |it| replays += @intFromBool(it.keep < it.rows);
+            try e.upload(pl.kseg, std.mem.sliceAsBytes(&e.kseg_host));
+            if (replays > 0) try kern.replayLayersSegments(e.k, e.s, pl.kseg, replays, n, ll, pl.rec, pl.rec_slot / f4, pl.rec_slot / (2 * f4), pl.scr.k, pl.scr.v, pl.scr.g, pl.scr.b, max_rows);
+            try e.t.convShiftSeg(pl.conv, pl.proj, pl.kseg, m, n, 3 * ll * 128, pl.conv_slot / bf, 3 * 3 * ll * 128, max_rows * e.width, e.width);
+        }
+        for (ks[0..m], segs[0..m]) |it, st| {
+            st.seg = false;
+            if (n > 0) st.cur = 1 - st.cur;
+            st.pos += it.keep;
+            try e.setInt(st.pos_dev, st.pos);
+        }
+    }
+
     /// forward.commit: keep the last decode window's first `keep` rows.
     pub fn commit(e: *Engine, rows: usize, keep: usize) !void {
         if (keep < 1 or keep > rows) return error.BadKeep;
