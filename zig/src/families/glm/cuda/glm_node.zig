@@ -14,7 +14,7 @@ const roce_mod = @import("glm_roce.zig");
 
 const Engine = fwd.Engine;
 
-pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18, chunk_lanes = 19, dflash_taps = 20 };
+pub const Kind = enum(u32) { begin = 1, verify = 2, keep = 3, draft = 4, quit = 5, chunk = 6, first = 7, save = 8, drop = 9, dflash = 10, nucleus = 11, bind = 12, grow = 13, copy = 14, shared = 15, segment = 16, dflash_blocks = 17, keep_lanes = 18, chunk_lanes = 19, dflash_taps = 20, pick_rows = 21 };
 
 /// TF_GLM_DRAFTER_DIR: the DFlash2 draft model's snapshot folder (v1.8's DRAFTER=dflash2); unset: the MTP head drafts.
 pub fn drafterDir() ?[]const u8 {
@@ -432,6 +432,13 @@ pub const Node = struct {
         _ = try n.pick(n.e.buf.logits + row0 * n.e.w.head.n * 2, g.rows, k, out);
     }
 
+    /// Every row of the last shared window at once (rank 0 sends it, both run it): `pick` over its first `rows` rows of
+    /// buf.logits (the segments back to back from row 0), one greedy (or top-k candidates) pass, one gather, one copy back.
+    pub fn pickRows(n: *Node, rows: usize, k: usize, out: []u32) !void {
+        try n.send(.pick_rows, &.{ @intCast(rows), @intCast(k) });
+        _ = try n.pick(n.e.buf.logits, rows, k, out);
+    }
+
     /// Later commands act on lane `lane`'s state and DFlash2 context (sent only when the lane changes).
     pub fn bind(n: *Node, lane: usize) !void {
         if (lane == n.e.lane) return;
@@ -519,6 +526,11 @@ pub const Node = struct {
                     try n.verifyShared(segs[0..m], w[1 + 2 * m ..]);
                 },
                 .segment => try n.pickSegment(.{ .lane = w[0], .rows = w[1] }, w[2], scratch[0..w[1]]),
+                .pick_rows => {
+                    var all: [Engine.shared_rows]u32 = undefined;
+                    if (w[0] > all.len) return error.WindowTooWide;
+                    try n.pickRows(w[0], w[1], all[0..w[0]]);
+                },
                 .dflash_blocks => {
                     const m = w[0];
                     if (m > Engine.max_lanes) return error.BadDraftBatch;

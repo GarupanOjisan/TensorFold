@@ -601,7 +601,7 @@ pub const Engine = struct {
     full_dev: cuda.DeviceBuffer,
     full_host: []u16,
     /// The last `candidates` call's gathered pairs: [rank][row][k] of (fp32 value bits, token).
-    cand_host: [wt.world * max_rows * 2 * max_k]u32 = undefined,
+    cand_host: [wt.world * shared_rows * 2 * max_k]u32 = undefined, // a shared window's rows at most (Node.pickRows)
     /// Captured decode windows and MTP steps (graphs.py), found by key; TF_GLM_GRAPHS=0 runs everything eagerly.
     graphs: [max_graphs]GraphEntry = undefined,
     n_graphs: usize = 0,
@@ -2147,7 +2147,7 @@ pub const Engine = struct {
     /// sample_rows' candidates for sampled rows: each rank's top `k` of its vocabulary slice (k = top_k + MARGIN),
     /// gathered on every rank into cand_host, for the host chooser.
     pub fn candidates(e: *Engine, b: *const Buffers, logits: u64, rows: usize, k: usize) !void {
-        if (k == 0 or k > max_k or k > e.w.head.n or rows > max_rows) return error.BadCandidateCount;
+        if (k == 0 or k > max_k or k > e.w.head.n or rows > shared_rows) return error.BadCandidateCount;
         var a: cuda.Args = .{};
         a.add(logits);
         a.add(@as(i32, @intCast(e.w.head.n)));
@@ -2249,7 +2249,8 @@ pub const Engine = struct {
         a.add(b.greedy);
         try cuda.launch.launch(e.k.greedy, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 1024 } }, e.s, &a);
         try e.comm.allGather(e.s, b.greedy, b.greedy_all, rows * 2);
-        var host: [wt.world * max_rows * 2]u32 = undefined;
+        var host: [wt.world * shared_rows * 2]u32 = undefined;
+        if (rows > shared_rows) return error.WindowTooWide;
         const n = wt.world * rows * 2;
         try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(&host, b.greedy_all, n * 4, e.s.handle), "cuMemcpyDtoHAsync");
         try e.s.synchronize();

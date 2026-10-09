@@ -314,13 +314,18 @@ const Glm = struct {
     fn choose(g: *Glm, s: *lanes.Stream, which: Node.Rows, k: usize, rows: usize, position0: u64, out: []u32) !void {
         const sm = s.sampling.?;
         if (k == Node.whole_vocabulary) return g.chooseWhole(sm, which, rows, position0, out);
+        return g.chooseIn(sm, k, rows, 0, rows, position0, out);
+    }
+
+    /// choose's top-k draw for rows off .. off + rows of the `all` rows whose candidates the last pick gathered.
+    fn chooseIn(g: *Glm, sm: lanes.sampling.Sampling, k: usize, all: usize, off: usize, rows: usize, position0: u64, out: []u32) !void {
         const host = &g.n.e.cand_host;
         var values: [2 * fwd.Engine.max_k]f64 = undefined;
         var ids: [2 * fwd.Engine.max_k]u64 = undefined;
         for (0..rows) |r| {
             var m: usize = 0;
             for (0..2) |rank| {
-                const base = (rank * rows + r) * 2 * k;
+                const base = (rank * all + off + r) * 2 * k;
                 for (0..k) |j| {
                     values[m] = @as(f32, @bitCast(host[base + 2 * j]));
                     ids[m] = host[base + 2 * j + 1];
@@ -586,12 +591,22 @@ const Glm = struct {
         }
         const n = windows.len;
         try g.n.verifyShared(segs[0..n], ids[0..total]);
+        // one pick over every row when the lanes draw alike (greedy, or the same top-k), as v1.10's packed all-gather; a
+        // whole-vocabulary draw (top_k off) reads the bound lane's rows, so it picks lane by lane
+        var one = n > 1 and ks[0] != Node.whole_vocabulary;
+        for (ks[1..n]) |k| one = one and k == ks[0];
+        var all: [fwd.Engine.shared_rows]u32 = undefined;
+        if (one) try g.n.pickRows(total, ks[0], all[0..total]);
         var at: usize = 0;
         for (windows, out, segs[0..n], ks[0..n]) |w, *o, sg, k| {
             const rows = sg.rows;
-            try g.n.bind(sg.lane); // a draw's `nucleus` reads the bound lane's rows
-            try g.n.pickSegment(sg, k, o.sampled[0..rows]);
-            if (k > 0) try g.choose(w.stream, .window, k, rows, w.positions[0], o.sampled[0..rows]);
+            if (one) {
+                if (k > 0) try g.chooseIn(w.stream.sampling.?, k, total, at, rows, w.positions[0], o.sampled[0..rows]) else @memcpy(o.sampled[0..rows], all[at..][0..rows]);
+            } else {
+                try g.n.bind(sg.lane); // a draw's `nucleus` reads the bound lane's rows
+                try g.n.pickSegment(sg, k, o.sampled[0..rows]);
+                if (k > 0) try g.choose(w.stream, .window, k, rows, w.positions[0], o.sampled[0..rows]);
+            }
             @memcpy(o.drafts[0 .. rows - 1], ids[at + 1 ..][0 .. rows - 1]);
             const ln = &g.lanes[sg.lane];
             @memcpy(ln.window[0..rows], ids[at..][0..rows]);
