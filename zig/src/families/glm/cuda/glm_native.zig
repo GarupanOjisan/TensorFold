@@ -789,11 +789,14 @@ const Glm = struct {
         };
     }
 
+    /// v1.10 verify.timing_tokens(vocab, 32): numpy default_rng(1234).choice(150000, 32, replace=False), the distinct ids its
+    /// startup timings run (one token repeated, or a run of neighbours, routes to a few experts and times light).
+    const timing_ids = [_]u32{ 47774, 77768, 138462, 36260, 39247, 129560, 129538, 101230, 47857, 119011, 91475, 96893, 143736, 144598, 39544, 20813, 80395, 148162, 119363, 146872, 117894, 57018, 98981, 17711, 66146, 83336, 25699, 134558, 15731, 143261, 38205, 146475 };
+
     /// Shared windows of 2 to max_rows rows over lanes 0 and 1 (half each), timed on whatever their caches hold (both
     /// ranks run them; no commit, so the lanes stay where they were). Serving overwrites the rows they wrote.
     fn measureShared(g: *Glm) !void {
-        var ids: [fwd.Engine.shared_rows]u32 = undefined;
-        for (&ids, 0..) |*t, i| t.* = @intCast(3000 + 37 * i);
+        const ids = timing_ids;
         var out: [max_rows]u32 = undefined;
         g.shared[0] = g.costs[0];
         for (2..g.sharedRows() + 1) |total| {
@@ -808,6 +811,38 @@ const Glm = struct {
             g.shared[total - 1] = .{ .width = @intCast(total), .ms = best };
         }
         std.log.info("GLM shared window ms by rows (two lanes): 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}, {d} {d:.1}", .{ g.shared[1].ms, g.shared[3].ms, g.shared[7].ms, g.shared[15].ms, g.sharedRows(), g.shared[g.sharedRows() - 1].ms });
+        try g.compareOne(8);
+    }
+
+    /// v1.10 multi._compare_paths: one lane's window of `rows` rows on the one-stream graphs (verify) and on the shared ones
+    /// (verifyShared over a single segment), the same tokens, timed by GPU events (fastest of 5, after a warm-up), each
+    /// with its greedy pick; logged only.
+    fn compareOne(g: *Glm, rows: usize) !void {
+        const e = &g.n.e;
+        try g.n.bind(0);
+        var start = try cuda.Event.init(e.d, true);
+        defer start.deinit();
+        var stop = try cuda.Event.init(e.d, true);
+        defer stop.deinit();
+        var out: [max_rows]u32 = undefined;
+        var solo: f32 = std.math.inf(f32);
+        var shared: f32 = std.math.inf(f32);
+        const seg = [1]fwd.Engine.Seg{.{ .lane = 0, .rows = rows }};
+        for (0..6) |rep| {
+            try start.record(e.s);
+            try g.n.verify(timing_ids[0..rows], 0, out[0..rows]);
+            try stop.record(e.s);
+            try stop.synchronize();
+            if (rep > 0) solo = @min(solo, try cuda.Event.elapsedMs(start, stop));
+            try g.n.keep(rows, 1);
+            try start.record(e.s);
+            try g.n.verifyShared(&seg, timing_ids[0..rows]);
+            try g.n.pickSegment(seg[0], 0, out[0..rows]);
+            try stop.record(e.s);
+            try stop.synchronize();
+            if (rep > 0) shared = @min(shared, try cuda.Event.elapsedMs(start, stop));
+        }
+        std.log.info("GLM one lane, {d} rows (v1.10 _compare_paths; forward and greedy pick, GPU events): one-stream graphs {d:.1} ms, shared (segmented) {d:.1} ms", .{ rows, solo, shared });
     }
 
     /// TF_GLM_SHARED_FLAT (default on; 0 off): every shared width costs as 2 rows, so the core keeps every draft in a
@@ -830,8 +865,7 @@ const Glm = struct {
         for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + i);
         _ = try g.n.prefill(&prompt, !g.dflash, 0);
         var out: [max_rows]u32 = undefined;
-        var ids: [max_rows]u32 = undefined;
-        for (&ids, 0..) |*t, i| t.* = @intCast(2000 + i);
+        var ids: [max_rows]u32 = timing_ids[0..max_rows].*;
         for (1..max_rows + 1) |width| {
             var best: f64 = std.math.inf(f64);
             for (0..3) |_| {
