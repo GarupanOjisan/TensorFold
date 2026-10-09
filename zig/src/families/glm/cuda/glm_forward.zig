@@ -1681,12 +1681,12 @@ pub const Engine = struct {
     // CUDA graph a row count serves every mix of lanes and positions. Each segment's rows get the bits of its lane's window
     // alone (the kernels' contract); the commit replays and shifts one lane's segment at a time (commitSeg).
 
-    /// The segmented selection's buffers (segments.SelectScratch): scores [max_rows, seg_pools], tokens, counts and the
+    /// The segmented selection's buffers (segments.SelectScratch): scores [shared_rows, seg_pools], tokens, counts and the
     /// split selection's scratch, allocated at the first segmented window of a long-context engine (outside any capture).
     fn segSelBuffers(e: *Engine) !void {
         if (e.seg_sel != null) return;
         const np = tri.Tri.seg_pools;
-        const bytes = max_rows * np * f4 + max_rows * tri.select_width * 4 + max_rows * 4 + tri.Tri.splitInts(max_rows, np) * 4 + 4 * 256;
+        const bytes = shared_rows * np * f4 + shared_rows * tri.select_width * 4 + shared_rows * 4 + tri.Tri.splitInts(shared_rows, np) * 4 + 4 * 256;
         e.seg_sel = try cuda.DeviceBuffer.alloc(e.d, bytes);
     }
 
@@ -1695,9 +1695,9 @@ pub const Engine = struct {
     fn segSel(e: *const Engine) SegSel {
         const base = e.seg_sel.?.ptr;
         const np = tri.Tri.seg_pools;
-        const tokens = std.mem.alignForward(u64, base + max_rows * np * f4, 256);
-        const counts = std.mem.alignForward(u64, tokens + max_rows * tri.select_width * 4, 256);
-        const split = std.mem.alignForward(u64, counts + max_rows * 4, 256);
+        const tokens = std.mem.alignForward(u64, base + shared_rows * np * f4, 256);
+        const counts = std.mem.alignForward(u64, tokens + shared_rows * tri.select_width * 4, 256);
+        const split = std.mem.alignForward(u64, counts + shared_rows * 4, 256);
         return .{ .scores = base, .tokens = tokens, .counts = counts, .split = split };
     }
 
