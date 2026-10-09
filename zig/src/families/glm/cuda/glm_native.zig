@@ -135,7 +135,7 @@ const Glm = struct {
     costs: [max_rows]lanes.config.Cost = undefined,
     /// Shared windows' ms by total rows: the lone windows' until `grow` times them over two lanes (the facts point here,
     /// and the lane core reads them after `grow`).
-    shared: [max_rows]lanes.config.Cost = undefined,
+    shared: [fwd.Engine.shared_rows]lanes.config.Cost = undefined,
     io: std.Io = undefined,
     mtp_ms: f64 = 1.0,
     vtable: be.Backend.VTable = undefined,
@@ -452,14 +452,14 @@ const Glm = struct {
         if (windows.len > max_lanes) return error.TooManyWindows;
         var segs: [max_lanes]fwd.Engine.Seg = undefined;
         var ks: [max_lanes]usize = undefined;
-        var ids: [max_rows]u32 = undefined;
+        var ids: [fwd.Engine.shared_rows]u32 = undefined;
         var total: usize = 0;
         for (windows, 0..) |w, i| {
             if (w.parents != null) return error.TreesNotBuilt;
             const ln = try g.enter(w.stream);
             try g.commit(ln, ln.pending_rows); // no keep since its last window: all of its rows stay
             const rows = w.rows();
-            if (total + rows > max_rows) return error.WindowTooWide;
+            if (total + rows > g.sharedRows()) return error.WindowTooWide;
             if (w.held > ln.held_n) return error.NoHeldDrafts;
             for (w.positions, 0..) |pos, r| if (pos != g.n.e.st.pos + 1 + r) return error.PositionMismatch;
             ids[total] = w.pending;
@@ -658,7 +658,7 @@ const Glm = struct {
             .hidden_rows = true,
             .draft_streams = true, // a shared round's drafts in one call: DFlash2's block passes share one (draftDflashLanes)
             .streams_exact = true,
-            .batch_rows = max_rows,
+            .batch_rows = @intCast(g.sharedRows()),
             .max_streams = max_lanes,
         };
     }
@@ -666,11 +666,11 @@ const Glm = struct {
     /// Shared windows of 2 to max_rows rows over lanes 0 and 1 (half each), timed on whatever their caches hold (both
     /// ranks run them; no commit, so the lanes stay where they were). Serving overwrites the rows they wrote.
     fn measureShared(g: *Glm) !void {
-        var ids: [max_rows]u32 = undefined;
+        var ids: [fwd.Engine.shared_rows]u32 = undefined;
         for (&ids, 0..) |*t, i| t.* = @intCast(3000 + 37 * i);
         var out: [max_rows]u32 = undefined;
         g.shared[0] = g.costs[0];
-        for (2..max_rows + 1) |total| {
+        for (2..g.sharedRows() + 1) |total| {
             const segs = [2]fwd.Engine.Seg{ .{ .lane = 0, .rows = (total + 1) / 2 }, .{ .lane = 1, .rows = total / 2 } };
             var best: f64 = std.math.inf(f64);
             for (0..3) |_| {
@@ -681,7 +681,12 @@ const Glm = struct {
             }
             g.shared[total - 1] = .{ .width = @intCast(total), .ms = best };
         }
-        std.log.info("GLM shared window ms by rows (two lanes): 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}", .{ g.shared[1].ms, g.shared[3].ms, g.shared[7].ms, g.shared[max_rows - 1].ms });
+        std.log.info("GLM shared window ms by rows (two lanes): 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}, {d} {d:.1}", .{ g.shared[1].ms, g.shared[3].ms, g.shared[7].ms, g.shared[15].ms, g.sharedRows(), g.shared[g.sharedRows() - 1].ms });
+    }
+
+    /// A shared round's rows at most: fwd.Engine.shared_rows over the segmented kernels, else the lanes' own max_rows.
+    fn sharedRows(g: *const Glm) usize {
+        return if (g.n.e.seg_enabled) fwd.Engine.shared_rows else max_rows;
     }
 
     /// Each window width's forward and one chained MTP step, timed on a short dummy prompt (both ranks run it).
@@ -907,7 +912,8 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (g.drafts and g.copy_cfg.on) std.log.info("GLM copy drafts: up to {d} a round, match {d} tokens, {d} inside the reply, windows of 9 to 15 rows padded to {d}", .{ g.copy_cfg.most, g.copy_cfg.match, g.copy_cfg.reply_match, g.copy_cfg.pad });
     g.io = io;
     try g.measure(io);
-    g.shared = g.costs;
+    @memcpy(g.shared[0..max_rows], &g.costs);
+    for (g.shared[max_rows..]) |*c| c.* = .{ .width = 0, .ms = 0 }; // width 0: left out (lanes config); measureShared fills them
     return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = n.laneBytes(), .ctx = g, .deinit = release };
 }
 

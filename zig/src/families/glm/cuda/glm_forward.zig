@@ -492,7 +492,7 @@ pub const Pool = struct {
     pk: [16]u64 = @splat(0),
     lat_row: usize,
     pk_row: usize,
-    /// The segmented window's KDA projection rows and replay saves, [layers, max_rows, ...] as a State's (kda.KDAScratchSet).
+    /// The segmented window's KDA projection rows and replay saves, [layers, shared_rows, ...] (kda.KDAScratchSet's layout).
     proj: u64,
     scr: KdaScratch,
     /// kda.segment_table [max_lanes, kern.seg_cols] i32 and segments.SegRows' tables (glm_segments.zig), device copies.
@@ -519,7 +519,7 @@ pub const Pool = struct {
             .mla => n_dsa += 1,
         };
         const ext = extentRows(capacity);
-        const mr = Engine.max_rows;
+        const mr = Engine.shared_rows;
         var p: Pool = undefined;
         p.mem = undefined;
         p.slots = slots;
@@ -648,6 +648,9 @@ pub const Engine = struct {
     split: ?Split = null,
 
     pub const max_rows = 16; // engine.MAX_ROWS: a pending token and up to 15 copied drafts
+    /// A shared round's rows across lanes (v1.10's TF_GLM_MULTI_WINDOW, 32): the window buffers and the pool's KDA
+    /// scratch hold that many; each lane's own part stays within max_rows.
+    pub const shared_rows = segments.max_rows;
     pub const mtp_rows = 8; // engine.MTP_ROWS: rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
     /// Windows of 1..8 and `wide_graph` rows x 2 KDA parities and MTP steps of 1..8 rows, each dense or at one of ~10 pool
     /// buckets (9 widths x 2 x 11 + 8 x 11 = 286).
@@ -676,17 +679,17 @@ pub const Engine = struct {
         // count, then allocate once and carve
         var count: Arena = .{ .base = 0, .size = 0 };
         const tap_n: usize = if (taps != null) 5 else 0;
-        _ = carve(&count, w, max_rows, capacity, false, np_max, tap_n);
+        _ = carve(&count, w, shared_rows, capacity, false, np_max, tap_n);
         _ = carve(&count, w, prefill_rows, capacity, true, np_max, tap_n);
         _ = carve(&count, w, mtp_rows, capacity, false, np_max, 0);
         const kv_fp8 = try kvFp8();
-        const shared_bytes = max_rows * width * bf + max_rows * ll * 128 * bf + 512;
+        const shared_bytes = shared_rows * width * bf + shared_rows * ll * 128 * bf + 512;
         const total = count.used + shared_bytes + 4096;
         e.mem = try cuda.DeviceBuffer.alloc(d, total);
         errdefer e.mem.free();
         try e.mem.fill8(0, null);
         var a: Arena = .{ .base = e.mem.ptr, .size = total };
-        e.buf = carve(&a, w, max_rows, capacity, false, np_max, tap_n);
+        e.buf = carve(&a, w, shared_rows, capacity, false, np_max, tap_n);
         e.pbuf = carve(&a, w, prefill_rows, capacity, true, np_max, tap_n);
         e.mbuf = carve(&a, w, mtp_rows, capacity, false, np_max, 0);
         e.tap_layers = taps orelse @splat(std.math.maxInt(u32));
@@ -700,8 +703,8 @@ pub const Engine = struct {
         e.pool = null;
         e.seg_sel = null;
         e.seg_enabled = envOn("TF_GLM_SEG");
-        e.sproj = a.take(max_rows * width * bf);
-        e.sout = a.take(max_rows * ll * 128 * bf);
+        e.sproj = a.take(shared_rows * width * bf);
+        e.sout = a.take(shared_rows * ll * 128 * bf);
         e.n_lanes = 1;
         e.lane = 0;
         e.w = w;
@@ -955,8 +958,26 @@ pub const Engine = struct {
     fn mm(e: *Engine, b: *const Buffers, x: u64, x_stride: usize, xs: u64, q: Mat, out: u64, rows: usize, wide: bool) !void {
         switch (q.kind) {
             .b16 => try e.t.matmulB16(x, x_stride, q.ptr, out, b.sk, rows, q.n, q.k, wide),
-            .q4 => if (b.prefill) try kern.q4Prefill(e.k, e.s, x, x_stride, q.q4(), out, rows, wide) else try kern.qmmDecode(e.k, e.s, x, x_stride, xs, q.q4(), out, rows, wide),
-            .f8 => try e.t.matmulF8(x, x_stride, q.ptr, q.s, out, b.sk, rows, q.n, q.k, wide),
+            .q4 => if (b.prefill) try kern.q4Prefill(e.k, e.s, x, x_stride, q.q4(), out, rows, wide) else {
+                // qmm_cfg takes 16 rows a launch: a shared window past that in 16-row pieces, each row's arithmetic as alone
+                const qq = q.q4();
+                const ob: usize = if (wide) f4 else bf;
+                var r: usize = 0;
+                while (r < rows) : (r += max_rows) {
+                    const m = @min(max_rows, rows - r);
+                    try kern.qmmDecode(e.k, e.s, x + r * x_stride * bf, x_stride, xs + r * (qq.k / 64) * f4, qq, out + r * qq.n * ob, m, wide);
+                }
+            },
+            .f8 => {
+                // the captured _fmm shapes stop at a lane window (16 rows): a shared window past that in 16-row pieces
+                const step = if (b.prefill) rows else max_rows;
+                const ob: usize = if (wide) f4 else bf;
+                var r: usize = 0;
+                while (r < rows) : (r += step) {
+                    const m = @min(step, rows - r);
+                    try e.t.matmulF8(x + r * x_stride * bf, x_stride, q.ptr, q.s, out + r * q.n * ob, b.sk, m, q.n, q.k, wide);
+                }
+            },
         }
     }
 
@@ -1500,7 +1521,7 @@ pub const Engine = struct {
             st.row0 = rows;
             rows += g.rows;
         }
-        if (rows != tokens.len or rows > e.buf.rows) return error.WindowTooWide;
+        if (rows != tokens.len or rows > max_rows) return error.WindowTooWide; // the lanes' own KDA scratch
         try e.upload(e.buf.ids, std.mem.sliceAsBytes(tokens));
         const b = &e.buf;
         const prefetch = !e.l2pf_active and if (e.l2pf) |p| rows <= p.s.rows else false;
@@ -1697,7 +1718,7 @@ pub const Engine = struct {
             ks[i] = .{ .row0 = 0, .rows = @intCast(g.rows), .slot = @intCast(st.slot), .parity = @intCast(st.cur), .conv = @intCast(st.slot), .keep = @intCast(g.rows) };
             rows += g.rows;
         }
-        if (rows != tokens.len or rows > max_rows) return error.WindowTooWide;
+        if (rows != tokens.len or rows > shared_rows) return error.WindowTooWide;
         const long = e.st.long_context;
         _ = try segments.SegRows.fill(spans[0..segs.len], if (long) denseLimit(e.w) else null, &e.seg_host);
         try kern.segmentTable(ks[0..segs.len], &e.kseg_host);
@@ -1744,7 +1765,7 @@ pub const Engine = struct {
         const pl = &e.pool.?;
         const li: usize = e.st.kda_index[l.index];
         const ll: usize = c.kda_heads / wt.world;
-        const p = pl.proj + li * max_rows * e.width * bf;
+        const p = pl.proj + li * shared_rows * e.width * bf;
         try e.mm(b, b.normed, c.hidden, b.xs, kw.proj, p, rows, false);
         const fa = p + kw.fa_off * bf;
         const ga = p + kw.ga_off * bf;
@@ -1755,7 +1776,7 @@ pub const Engine = struct {
         try e.pfSite(l.index, 2);
         const rec_layer = ll * 128 * 128 * f4;
         const conv_layer = 3 * 3 * ll * 128 * bf;
-        const out = pl.scr.out + li * max_rows * ll * 128 * bf;
+        const out = pl.scr.out + li * shared_rows * ll * 128 * bf;
         try kern.chainSegments(e.k, e.s, .{
             .heads = ll,
             .seg = pl.kseg,
@@ -1780,10 +1801,10 @@ pub const Engine = struct {
             .lower = c.lower_bound,
             .rows = rows,
             .out = out,
-            .k_save = pl.scr.k + li * max_rows * ll * 128 * f4,
-            .v_save = pl.scr.v + li * max_rows * ll * 128 * bf,
-            .g_save = pl.scr.g + li * max_rows * ll * 128 * f4,
-            .b_save = pl.scr.b + li * max_rows * ll * f4,
+            .k_save = pl.scr.k + li * shared_rows * ll * 128 * f4,
+            .v_save = pl.scr.v + li * shared_rows * ll * 128 * bf,
+            .g_save = pl.scr.g + li * shared_rows * ll * 128 * f4,
+            .b_save = pl.scr.b + li * shared_rows * ll * f4,
             .q_tmp = b.q_tmp,
             .y_tmp = b.y_tmp,
         });
@@ -1843,8 +1864,8 @@ pub const Engine = struct {
             e.kseg_host = @splat(.{ .row0 = 0, .rows = 0, .slot = 0, .parity = 0, .conv = 0, .keep = 0 });
             e.kseg_host[0] = .{ .row0 = @intCast(st.row0), .rows = @intCast(rows), .slot = @intCast(st.slot), .parity = @intCast(st.cur), .conv = @intCast(st.slot), .keep = @intCast(keep) };
             try e.upload(pl.kseg, std.mem.sliceAsBytes(&e.kseg_host));
-            if (keep < rows) try kern.replayLayersSegments(e.k, e.s, pl.kseg, 1, n, ll, pl.rec, pl.rec_slot / f4, pl.rec_slot / (2 * f4), pl.scr.k, pl.scr.v, pl.scr.g, pl.scr.b, max_rows);
-            try e.t.convShiftSeg(pl.conv, pl.proj, pl.kseg, 1, n, 3 * ll * 128, pl.conv_slot / bf, 3 * 3 * ll * 128, max_rows * e.width, e.width);
+            if (keep < rows) try kern.replayLayersSegments(e.k, e.s, pl.kseg, 1, n, ll, pl.rec, pl.rec_slot / f4, pl.rec_slot / (2 * f4), pl.scr.k, pl.scr.v, pl.scr.g, pl.scr.b, shared_rows);
+            try e.t.convShiftSeg(pl.conv, pl.proj, pl.kseg, 1, n, 3 * ll * 128, pl.conv_slot / bf, 3 * 3 * ll * 128, shared_rows * e.width, e.width);
             st.cur = 1 - st.cur;
         }
         try e.setPos(st.pos + keep);
@@ -1879,8 +1900,8 @@ pub const Engine = struct {
             var replays: usize = 0;
             for (ks[0..m]) |it| replays += @intFromBool(it.keep < it.rows);
             try e.upload(pl.kseg, std.mem.sliceAsBytes(&e.kseg_host));
-            if (replays > 0) try kern.replayLayersSegments(e.k, e.s, pl.kseg, replays, n, ll, pl.rec, pl.rec_slot / f4, pl.rec_slot / (2 * f4), pl.scr.k, pl.scr.v, pl.scr.g, pl.scr.b, max_rows);
-            try e.t.convShiftSeg(pl.conv, pl.proj, pl.kseg, m, n, 3 * ll * 128, pl.conv_slot / bf, 3 * 3 * ll * 128, max_rows * e.width, e.width);
+            if (replays > 0) try kern.replayLayersSegments(e.k, e.s, pl.kseg, replays, n, ll, pl.rec, pl.rec_slot / f4, pl.rec_slot / (2 * f4), pl.scr.k, pl.scr.v, pl.scr.g, pl.scr.b, shared_rows);
+            try e.t.convShiftSeg(pl.conv, pl.proj, pl.kseg, m, n, 3 * ll * 128, pl.conv_slot / bf, 3 * 3 * ll * 128, shared_rows * e.width, e.width);
         }
         for (ks[0..m], segs[0..m]) |it, st| {
             st.seg = false;

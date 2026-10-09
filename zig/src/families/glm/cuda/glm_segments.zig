@@ -6,8 +6,8 @@ const std = @import("std");
 
 /// segments.MAX_SEGS: lanes a window holds at most.
 pub const max_segs = 8;
-/// fwd.Engine.max_rows: a window's rows at most.
-pub const max_rows = 16;
+/// fwd.Engine.shared_rows: a shared window's rows at most (v1.10's TF_GLM_MULTI_WINDOW default).
+pub const max_rows = 32;
 /// sparse.POOL: tokens a pooled key covers.
 pub const pool = 4;
 /// fwd.extent (segments.EXTENT): a lane's arena extent starts at a multiple of this many tokens.
@@ -83,5 +83,5 @@ test "SegRows lays two lanes back to back as segments.py does" {
     try std.testing.expectEqualSlices(i32, &.{ 513, 0 }, t[SegRows.pools_at..][0..2]); // (2051 + 1) / 4; lane 1 dense
     try std.testing.expect(SegRows.anySparse(&t, r));
     try std.testing.expectError(error.BadSegment, SegRows.fill(&.{.{ .base = 100, .pos = 0, .rows = 1 }}, null, &t));
-    try std.testing.expectError(error.WindowTooWide, SegRows.fill(&.{ .{ .base = 0, .pos = 0, .rows = 9 }, .{ .base = 2048, .pos = 0, .rows = 8 } }, null, &t));
+    try std.testing.expectError(error.WindowTooWide, SegRows.fill(&.{ .{ .base = 0, .pos = 0, .rows = 17 }, .{ .base = 2048, .pos = 0, .rows = 16 } }, null, &t));
 }
