@@ -280,6 +280,12 @@ const Host = struct {
                     x.inner.vtable.release(x.inner.ptr, s);
                 }
             }.f,
+            .prefill_many = if (v.prefill_many != null) struct {
+                fn f(p: *anyopaque, streams: []*lanes.Stream) anyerror!usize {
+                    const x = bind(p);
+                    return x.inner.vtable.prefill_many.?(x.inner.ptr, streams);
+                }
+            }.f else null,
         };
         return .{ .ptr = h, .vtable = &h.vtable };
     }
