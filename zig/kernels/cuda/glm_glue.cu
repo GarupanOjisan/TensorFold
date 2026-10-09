@@ -299,6 +299,19 @@ extern "C" __global__ void tf_glm_df_scatter(const __nv_bfloat16* __restrict__ s
     cache[((int64_t)h * cap + at) * hd + d] = src[((int64_t)h * rows + r) * hd + d];
 }
 
+// dflash2_multi's `self.kc[i].index_copy_(1, idx, k)`: the rows [kvh, rows, hd] of blocks of n rows side by side, block s
+// into its slot of the pooled caches (`cache` is slot 0; slot[s] counts rows of cap, the kv heads cap apart) at the positions
+// pos[s] + r (modulo the ring). grid (rows, kvh), block 128.
+extern "C" __global__ void tf_glm_df_scatter_seg(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ cache,
+                                                 const int64_t* __restrict__ pos, const int64_t* __restrict__ slot, int rows, int n,
+                                                 int cap, int ring, int hd) {
+  const int r = blockIdx.x, h = blockIdx.y, s = r / n;
+  int64_t at = pos[s] + r % n;
+  if (ring) at %= ring;
+  const int64_t row = slot[s] * cap + (int64_t)h * cap + at;
+  for (int d = threadIdx.x; d < hd; d += blockDim.x) cache[row * hd + d] = src[((int64_t)h * rows + r) * hd + d];
+}
+
 // `_rotary`: phase = float(pos + r) * inv_freq, cos and sin in fp32, [rows, half]. grid (ceil(rows half / 128)), block 128.
 extern "C" __global__ void tf_glm_df_rope(const int64_t* __restrict__ pos, const float* __restrict__ inv_freq, int rows, int half,
                                           float* __restrict__ cos_out, float* __restrict__ sin_out) {

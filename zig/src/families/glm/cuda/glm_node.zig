@@ -378,7 +378,12 @@ pub const Node = struct {
                 break;
             };
         };
-        if (n.dflash != null and mine > 1) n.batch = try dflash.Batch.init(n.gpa, n.e.d, &n.w, mine);
+        if (n.dflash != null and mine > 1) {
+            n.batch = try dflash.Batch.init(n.gpa, n.e.d, &n.w, mine);
+            var ds: [Engine.max_lanes]*dflash.Drafter = undefined;
+            for (0..mine) |i| ds[i] = try n.drafterOf(i);
+            try n.batch.?.adopt(&n.e, ds[0..mine]);
+        }
         var word = [1]u32{@intCast(mine)};
         if (n.rank != 0) {
             try n.pair.send(std.mem.sliceAsBytes(&word));

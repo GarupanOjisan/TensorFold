@@ -299,6 +299,14 @@ pub const Tri = struct {
         try t.run("_dattn_kernel", .{ kvh, 1, 1 }, &.{ p("Q", "*bf16", q), p("K", "*bf16", kc), p("V", "*bf16", vc), p("OUT", "*bf16", out), p("POS", "*i64", pos), int("window", window), aot.float("scale", scale) }, &.{ ci("N", rows), ci("G", heads / kvh), ci("NH", heads), ci("HD", hd), ci("CAP", cap), ci("BK", 64), flag("CAUSAL", causal), flag("RING", ring), flag("SKIP", true) });
     }
 
+    /// dflash2_multi's `_dattn_seg_kernel`: `_dattn_kernel` for blocks of `n` rows side by side (q [heads, rows, hd], out
+    /// [rows, heads hd]), block s reading its slot slot[s] of the pooled caches (kc, vc: slot 0; a slot counts rows of cap, the
+    /// kv heads `slot_rows` apart) at position pos[s].
+    pub fn draftAttentionSeg(t: Tri, q: u64, kc: u64, vc: u64, out: u64, pos: u64, slot: u64, window: usize, rows: usize, n: usize, slot_rows: usize, heads: usize, kvh: usize, hd: usize, cap: usize, causal: bool, ring: bool) !void {
+        const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(hd), -0.5));
+        try t.run("_dattn_seg_kernel", .{ kvh, rows / n, 1 }, &.{ p("Q", "*bf16", q), p("K", "*bf16", kc), p("V", "*bf16", vc), p("OUT", "*bf16", out), p("POS", "*i64", pos), p("SLOT", "*i64", slot), int("window", window), aot.float("scale", scale), int("L", rows), int("SLOT_ROWS", slot_rows) }, &.{ ci("N", n), ci("G", heads / kvh), ci("NH", heads), ci("HD", hd), ci("CAP", cap), ci("BK", 64), flag("CAUSAL", causal), flag("RING", ring) });
+    }
+
     pub fn groupSums(t: Tri, x: u64, x_stride: usize, xs: u64, m: usize, k: usize) !void {
         try t.run("_group_sums", .{ m, cdiv(k / 64, 16), 1 }, &.{ p("X", "*bf16", x), p("XS", "*fp32", xs), int("x_stride", x_stride) }, &.{ ci("K", k), ci("GB", 16) });
     }

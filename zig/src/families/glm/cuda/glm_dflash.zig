@@ -97,6 +97,7 @@ pub const Drafter = struct {
     kc: [8]u64 = @splat(0),
     vc: [8]u64 = @splat(0),
     pos_dev: u64,
+    cache: u64, // the K and V caches, layer by layer (the start of `mem`, or the drafter's slot of a Batch's pool)
     ids: u64,
     context_end: usize = 0,
     // scratch (nmax rows unless noted)
@@ -229,6 +230,7 @@ pub const Drafter = struct {
         }
         dft.ids = base + at[sizes.len - 2];
         dft.pos_dev = base + at[sizes.len - 1];
+        dft.cache = base;
         // the mask ids stay: only row 0 changes
         const ids: [max_block]i32 = @splat(@intCast(dr.mask_id));
         try upload(d, dft.ids, std.mem.sliceAsBytes(ids[0..dr.block]));
@@ -272,15 +274,31 @@ pub const Drafter = struct {
 
     pub fn save(self: *const Drafter, e: *Engine, dst: u64) !void {
         if (self.snap_bytes == 0) return;
-        try e.copyDev(dst, self.mem.ptr, self.snap_bytes - 8);
+        try e.copyDev(dst, self.cache, self.snap_bytes - 8);
         try e.copyDev(dst + self.snap_bytes - 8, self.pos_dev, 8);
     }
 
     pub fn restore(self: *Drafter, e: *Engine, src: u64, at: usize) !void {
         if (self.snap_bytes == 0) return error.NoDrafterState;
-        try e.copyDev(self.mem.ptr, src, self.snap_bytes - 8);
+        try e.copyDev(self.cache, src, self.snap_bytes - 8);
         try e.copyDev(self.pos_dev, src + self.snap_bytes - 8, 8);
         self.context_end = at;
+    }
+
+    /// Moves the caches to `cache` (cacheBytes), their contents with them. The position stays where it is (16-aligned:
+    /// the one-lane _dattn_kernel was captured with POS divisible by 16); the batch copies it into its `meta` each pass.
+    fn adopt(self: *Drafter, e: *Engine, cache: u64) !void {
+        try e.copyDev(cache, self.cache, self.cacheBytes());
+        const half = self.cacheBytes() / (2 * self.dr.layers.len);
+        for (0..self.dr.layers.len) |i| {
+            self.kc[i] = cache + 2 * i * half;
+            self.vc[i] = self.kc[i] + half;
+        }
+        self.cache = cache;
+    }
+
+    fn cacheBytes(self: *const Drafter) usize {
+        return 2 * self.dr.layers.len * self.dr.kvh * self.cap * self.dr.hd * bf;
     }
 
     // -- pieces -------------------------------------------------------------------------------------------------
@@ -640,6 +658,11 @@ pub const Batch = struct {
     proj: u64,
     cand_host: []u32,
     proj_host: []f32,
+    // with a ring (adopt): every lane's caches in one pool, so a layer's cache writes and attention are one launch each
+    pool: ?cuda.DeviceBuffer,
+    lane_bytes: usize, // a drafter's caches (Drafter.cacheBytes)
+    meta: u64, // the blocks' positions, i64 x lanes
+    slots: u64, // the blocks' slots (rows of cap), i64 x lanes
 
     /// The 4-bit projections' widest piece (kern.qmmDecode, kern.q4Matmul).
     const piece = 16;
@@ -658,6 +681,7 @@ pub const Batch = struct {
         b.dr = dr;
         b.w = w;
         b.lanes = lanes;
+        b.pool = null;
         const sizes = [_]usize{
             R * 4, // ids
             R * D * bf, // x
@@ -709,7 +733,24 @@ pub const Batch = struct {
     pub fn deinit(b: *Batch) void {
         b.gpa.free(b.cand_host);
         b.gpa.free(b.proj_host);
+        if (b.pool) |*pl| pl.free();
         b.mem.free();
+    }
+
+    /// v1.10 MultiDrafter's pool: moves the caches of `ds` (every lane's drafter, before any graph holds their addresses) into
+    /// one buffer, drafter s's at s caches in, so `layer` writes and reads every block's ring in one launch each. A flat
+    /// context (no ring) keeps its own caches and the launches per lane.
+    // ponytail: each drafter's own caches stay allocated and unused (about 36 MB a lane); give Drafter.init a no-cache mode if that memory counts
+    pub fn adopt(b: *Batch, e: *Engine, ds: []const *Drafter) !void {
+        if (ds.len == 0 or ds.len > b.lanes or ds[0].ring == 0) return;
+        b.lane_bytes = ds[0].cacheBytes();
+        var pl = try cuda.DeviceBuffer.alloc(e.d, ds.len * b.lane_bytes + 2 * 256 + 256);
+        errdefer pl.free();
+        b.meta = std.mem.alignForward(u64, pl.ptr + ds.len * b.lane_bytes, 256);
+        b.slots = b.meta + 256;
+        for (ds, 0..) |dft, s| try dft.adopt(e, pl.ptr + s * b.lane_bytes);
+        try e.s.synchronize();
+        b.pool = pl;
     }
 
     /// A 4-bit projection of `rows` rows (x rows q.k apart) in pieces of up to 16.
@@ -763,7 +804,27 @@ pub const Batch = struct {
         try b.dconv(e, b.normed, L.a_base, null, b.cv, S, 0);
         try e.t.groupSums(b.cv, D, b.cv_xs, R, D);
         try mm(e, b.cv, b.cv_xs, L.qkv, b.qkv, R, false);
-        for (ds, 0..) |dft, s| {
+        if (b.pool) |pl| {
+            // every block at once: q, k, v [heads, R, hd]; block s's rows into its slot at its position, then attention
+            const half = b.lane_bytes / (2 * dr.layers.len);
+            const kc = pl.ptr + 2 * i * half;
+            const d0 = ds[0];
+            try e.t.draftPrep(b.qkv, L.q_norm, L.k_norm, b.cos, b.sin, b.qq, b.kk, b.vv, R, qkv_w, dr.eps, dr.heads, dr.kvh, hd);
+            for ([_][2]u64{ .{ b.kk, kc }, .{ b.vv, kc + half } }) |sc| {
+                var a: cuda.Args = .{};
+                a.add(sc[0]);
+                a.add(sc[1]);
+                a.add(b.meta);
+                a.add(b.slots);
+                a.add(int(R));
+                a.add(int(n));
+                a.add(int(d0.cap));
+                a.add(int(d0.ring));
+                a.add(int(hd));
+                try cuda.launch.launch(e.k.df_scatter_seg, .{ .grid = .{ .x = @intCast(R), .y = @intCast(dr.kvh) }, .block = .{ .x = 128 } }, e.s, &a);
+            }
+            try e.t.draftAttentionSeg(b.qq, kc, kc + half, b.att, b.meta, b.slots, dr.window, R, n, d0.cap, dr.heads, dr.kvh, hd, d0.cap, dr.causal, true);
+        } else for (ds, 0..) |dft, s| {
             const qq = b.qq + s * dr.heads * n * hd * bf;
             const kk = b.kk + s * dr.kvh * n * hd * bf;
             const vv = b.vv + s * dr.kvh * n * hd * bf;
@@ -804,6 +865,15 @@ pub const Batch = struct {
             ids[s * n] = @intCast(pend[s]);
         }
         try e.upload(b.ids, std.mem.sliceAsBytes(ids[0..R]));
+        if (b.pool) |pl| {
+            var slot: [8]i64 = undefined;
+            const per = ds[0].cap * dr.hd * bf;
+            for (ds, 0..) |dft, s| {
+                slot[s] = @intCast((dft.cache - pl.ptr) / per);
+                try e.copyDev(b.meta + 8 * s, dft.pos_dev, 8);
+            }
+            try e.upload(b.slots, std.mem.sliceAsBytes(slot[0..S]));
+        }
         try e.t.embed(b.ids, b.w.embed, b.x, R, D, 1);
         for (ds, 0..) |dft, s| {
             var a: cuda.Args = .{};
