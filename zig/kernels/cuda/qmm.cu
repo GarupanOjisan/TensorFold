@@ -268,3 +268,12 @@ __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__
 TF_QMM_ALL(64, 4, 4)
 TF_QMM_ALL(128, 8, 4)
 TF_QMM_ALL(128, 4, 6)
+// A shared window of 17 to 32 rows on one 32-row tile (qmm.py bucket, qmm.cu dispatch case 32): each weight read once.
+#define TF_QMM32(F32, CLUSTER)                                                                                  \
+    template __global__ void tf_qmm::qmm_kernel<64, 32, 64, 1, 4, 4, F32, CLUSTER, false>(                     \
+        const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, \
+        float*, int, int, int, int, int, int, int);
+TF_QMM32(false, false)
+TF_QMM32(false, true)
+TF_QMM32(true, false)
+TF_QMM32(true, true)

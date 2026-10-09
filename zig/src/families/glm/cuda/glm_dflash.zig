@@ -902,10 +902,16 @@ pub const Batch = struct {
         for (0..dr.layers.len) |i| try b.layer(e, ds, i);
         for (0..S) |s| try b.norm(e, b.x + (s * n + 1) * D * bf, dr.norm, b.hh + s * nb * D * bf, b.hh_xs + s * nb * (D / 64) * f4, nb);
         const vl = b.w.head.n;
-        var r: usize = 0;
-        while (r < M) : (r += piece) {
-            const m = @min(piece, M - r);
-            try kern.q4Matmul(e.k, e.s, b.hh + r * D * bf, b.hh_xs + r * (D / 64) * f4, b.w.draft_head, b.logits + r * vl * bf, m);
+        if (M > piece and M <= 2 * piece) {
+            // one launch on the 32-row tile reads the head once (v1.10's qmm bucket); the drafts are hints, so these bits
+            // need not be the one-lane pass's
+            try kern.qmmShared(e.k, e.s, b.hh, D, b.hh_xs, b.w.draft_head, b.logits, M, false);
+        } else {
+            var r: usize = 0;
+            while (r < M) : (r += piece) {
+                const m = @min(piece, M - r);
+                try kern.q4Matmul(e.k, e.s, b.hh + r * D * bf, b.hh_xs + r * (D / 64) * f4, b.w.draft_head, b.logits + r * vl * bf, m);
+            }
         }
         var a: cuda.Args = .{};
         a.add(b.logits);

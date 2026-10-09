@@ -41,6 +41,8 @@ pub const Kernels = struct {
     make_f8: cuda.Function,
     /// v1.8's decode matmul qmm_kernel by tile config (qmm_cfgs), fp32 out, K slices in a cluster.
     qmm: [qmm_cfgs.len][2][2]cuda.Function,
+    /// qmm_kernel on a 32-row tile (qmm32), fp32 out, K slices in a cluster.
+    qmm32: [2][2]cuda.Function,
     /// v1.8's routed-expert kernels (glm_exl3d: glm5_next/cuda/exl3.cu) and the plan kernels of experts.cu.
     rot_rows: cuda.Function,
     rot_pairs: cuda.Function,
@@ -146,6 +148,10 @@ pub const Kernels = struct {
         inline for (qmm_cfgs, 0..) |c, i| inline for (.{ false, true }, 0..) |fp32, j| inline for (.{ false, true }, 0..) |cluster, l| {
             k.qmm[i][j][l] = try k.mods[6].function(comptime c.symbol(fp32, cluster));
             try k.qmm[i][j][l].allowDynamicShared(c.smem());
+            if (i == 0) {
+                k.qmm32[j][l] = try k.mods[6].function(comptime qmm32.symbol(fp32, cluster));
+                try k.qmm32[j][l].allowDynamicShared(qmm32.smem());
+            }
         };
         k.rot_rows = try k.mods[7].function(e18.rot_rows);
         k.rot_pairs = try k.mods[7].function(e18.rot_pairs);
@@ -186,21 +192,23 @@ const q4_sym = struct {
 /// v1.8 qmm.cu's qmm_kernel<64, 16, bn, 1, wn, stages> for a decode window (rows <= 16). Config 0 is `qmm` with the
 /// 16-row tile; 1 and 2 are `qmm_cfg` 2 and 4. dec_tile (glm qmm.py DEC_TILES) picks one by the projection's shape.
 const QmmCfg = struct {
+    bm: u32 = 16,
     bn: u32,
     wn: u32,
     stages: u32,
 
     fn symbol(c: QmmCfg, comptime fp32: bool, comptime cluster: bool) [:0]const u8 {
-        return std.fmt.comptimePrint("_ZN6tf_qmm10qmm_kernelILi64ELi16ELi{d}ELi1ELi{d}ELi{d}ELb{d}ELb{d}ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii", .{ c.bn, c.wn, c.stages, @intFromBool(fp32), @intFromBool(cluster) });
+        return std.fmt.comptimePrint("_ZN6tf_qmm10qmm_kernelILi64ELi{d}ELi{d}ELi1ELi{d}ELi{d}ELb{d}ELb{d}ELb0EEEvPK13__nv_bfloat16PKfPKjS3_S3_PvPfiiiiiii", .{ c.bm, c.bn, c.wn, c.stages, @intFromBool(fp32), @intFromBool(cluster) });
     }
 
-    /// Tile<64, 16, bn, 1, wn, stages>::SMEM: the pipeline's stages, or the cluster sum's partials if larger.
+    /// Tile<64, bm, bn, 1, wn, stages>::SMEM: the pipeline's stages, or the cluster sum's partials if larger.
     fn smem(c: QmmCfg) u32 {
-        const stage = 16 * 128 + c.bn * 64 / 2 + 2 * (c.bn * 2) + 16 * 4;
-        const partials = (c.bn / c.wn / 8) * 4 * (c.wn * 32) * 4;
+        const stage = c.bm * 128 + c.bn * 64 / 2 + 2 * (c.bn * 2) + c.bm * 4;
+        const partials = (c.bm / 16) * (c.bn / c.wn / 8) * 4 * (c.wn * 32) * 4;
         return @max(c.stages * stage, partials);
     }
 };
+const qmm32: QmmCfg = .{ .bm = 32, .bn = 64, .wn = 4, .stages = 4 };
 const qmm_cfgs = [_]QmmCfg{ .{ .bn = 64, .wn = 4, .stages = 4 }, .{ .bn = 128, .wn = 8, .stages = 4 }, .{ .bn = 128, .wn = 4, .stages = 6 } };
 
 /// glm_exl3d.cu's and experts.cu's instantiations (cuobjdump -symbols), and the prompt kernels' dynamic shared memory
@@ -308,6 +316,24 @@ pub fn denseSplitK(n: usize, kk: usize) usize {
     return q4SplitK(n, kk);
 }
 
+/// qmm.matmul of 17 to 32 rows (a shared window): `qmm` on the 32-row tile, K slices as qmmDecode's (denseSplitK), so each
+/// row's bits are those of its lane's own window on a 16-row tile.
+pub fn qmmShared(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, rows: usize, fp32: bool) !void {
+    if (rows <= 16 or rows > 32) return error.WindowTooWide;
+    if (x % 16 != 0 or x_stride % 8 != 0) return error.MisalignedInput;
+    const sk = denseSplitK(q.n, q.k);
+    const tiles = (q.n + qmm32.bn - 1) / qmm32.bn;
+    var a: cuda.Args = .{};
+    for ([_]u64{ x, xs, q.w, q.s, q.b, out, 0 }) |v| a.add(v);
+    for ([_]usize{ rows, q.n, q.k, sk, q.npad, x_stride, 1 }) |v| a.add(int(v));
+    try cuda.launch.launch(k.qmm32[@intFromBool(fp32)][@intFromBool(sk > 1)], .{
+        .grid = .{ .x = u(tiles), .y = 1, .z = u(sk) },
+        .block = .{ .x = qmm32.wn * 32 },
+        .shared = qmm32.smem(),
+        .cluster = if (sk > 1) .{ .x = 1, .y = 1, .z = u(sk) } else null,
+    }, s, &a);
+}
+
 /// qmm.matmul of a 4-bit q for a decode window (shared.matmul -> `qmm` or, with dec_tile, `qmm_cfg`: v1.8's qmm_kernel):
 /// x (rows <= 16, k) bf16, rows `x_stride` elements apart, with its group sums xs -> out (rows, n), fp32 with `f32`.
 pub fn qmmDecode(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, rows: usize, fp32: bool) !void {
@@ -390,6 +416,7 @@ test "the dense 4-bit matmuls' K slices, tile configs and shared memory" {
         try t.expectEqual(s[3], decCfg(s[0], s[1]));
     }
     try t.expectEqual(@as(u32, 17664), qmm_cfgs[0].smem()); // Tile<64, 16, 64, 1, 4, 4>
+    try t.expectEqual(@as(u32, 26112), qmm32.smem()); // Tile<64, 32, 64, 1, 4, 4>
     try t.expectEqual(@as(u32, 26880), qmm_cfgs[1].smem()); // Tile<64, 16, 128, 1, 8, 4>
     try t.expectEqual(@as(u32, 40320), qmm_cfgs[2].smem()); // Tile<64, 16, 128, 1, 4, 6>
 }

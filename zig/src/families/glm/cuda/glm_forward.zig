@@ -961,13 +961,17 @@ pub const Engine = struct {
         switch (q.kind) {
             .b16 => try e.t.matmulB16(x, x_stride, q.ptr, out, b.sk, rows, q.n, q.k, wide),
             .q4 => if (b.prefill) try kern.q4Prefill(e.k, e.s, x, x_stride, q.q4(), out, rows, wide) else {
-                // qmm_cfg takes 16 rows a launch: a shared window past that in 16-row pieces, each row's arithmetic as alone
+                // a shared window past 16 rows on the 32-row tile (each weight read once; a row's bits as on its lane's 16)
                 const qq = q.q4();
-                const ob: usize = if (wide) f4 else bf;
-                var r: usize = 0;
-                while (r < rows) : (r += max_rows) {
-                    const m = @min(max_rows, rows - r);
-                    try kern.qmmDecode(e.k, e.s, x + r * x_stride * bf, x_stride, xs + r * (qq.k / 64) * f4, qq, out + r * qq.n * ob, m, wide);
+                if (rows > max_rows and envOn("TF_GLM_QMM32")) {
+                    try kern.qmmShared(e.k, e.s, x, x_stride, xs, qq, out, rows, wide);
+                } else {
+                    const ob: usize = if (wide) f4 else bf;
+                    var r: usize = 0;
+                    while (r < rows) : (r += max_rows) {
+                        const m = @min(max_rows, rows - r);
+                        try kern.qmmDecode(e.k, e.s, x + r * x_stride * bf, x_stride, xs + r * (qq.k / 64) * f4, qq, out + r * qq.n * ob, m, wide);
+                    }
                 }
             },
             .f8 => {

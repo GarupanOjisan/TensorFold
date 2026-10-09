@@ -784,6 +784,15 @@ const Glm = struct {
         std.log.info("GLM shared window ms by rows (two lanes): 2 {d:.1}, 4 {d:.1}, 8 {d:.1}, 16 {d:.1}, {d} {d:.1}", .{ g.shared[1].ms, g.shared[3].ms, g.shared[7].ms, g.shared[15].ms, g.sharedRows(), g.shared[g.sharedRows() - 1].ms });
     }
 
+    /// TF_GLM_SHARED_FLAT (default on; 0 off): every shared width costs as 2 rows, so the core keeps every draft in a
+    /// shared round, as v1.10 does (its multi-stream rounds take each stream's drafts with no depth policy): +1.7% at
+    /// four streams, the same replies.
+    fn flatten(g: *Glm) void {
+        if (std.c.getenv("TF_GLM_SHARED_FLAT")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return;
+        for (g.shared[1..g.sharedRows()]) |*c| c.ms = g.shared[1].ms;
+        std.log.info("GLM shared rounds keep every draft (TF_GLM_SHARED_FLAT; costs flat at {d:.1} ms)", .{g.shared[1].ms});
+    }
+
     /// A shared round's rows at most: fwd.Engine.shared_rows over the segmented kernels, else the lanes' own max_rows.
     fn sharedRows(g: *const Glm) usize {
         return if (g.n.e.seg_enabled) fwd.Engine.shared_rows else max_rows;
@@ -1022,7 +1031,10 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
 pub fn grow(p: *anyopaque, total: u32) !u32 {
     const g = Glm.of(p);
     g.n_lanes = try g.n.grow(total);
-    if (g.n_lanes > 1 and g.drafts) try g.measureShared();
+    if (g.n_lanes > 1 and g.drafts) {
+        try g.measureShared();
+        g.flatten();
+    }
     return @intCast(g.n_lanes);
 }
 
