@@ -22,6 +22,9 @@ pub const LaneHost = struct {
     core: *lanes.Engine,
     info_: Info,
     min_match: i64 = 4,
+    /// TENSORFOLD_ACCEPT_WAIT_MS: when nothing decodes or fills and a request arrives, wait up to this long for others,
+    /// so prompts sent together prefill in one pass (what v1.10's Python front end ends up doing); 0: take it at once.
+    accept_wait_ms: u32 = 0,
     mutex: std.Io.Mutex = .init,
     wake: std.Io.Condition = .init,
     queued: std.ArrayList(*Job) = .empty,
@@ -83,7 +86,8 @@ pub const LaneHost = struct {
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
         enforced.loop_guard = true;
-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
+        const wait: u32 = if (std.c.getenv("TENSORFOLD_ACCEPT_WAIT_MS")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0 else 0;
+        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .accept_wait_ms = wait };
     }
 
     pub fn start(h: *LaneHost) !void {
@@ -282,6 +286,7 @@ pub const LaneHost = struct {
     /// filling (Engine.fillStreams: their prompts may share a pass); those whose prompt is in start decoding. `run` takes a
     /// decode round between calls, so a long prompt fills while the others decode (v1.10 FILL).
     fn fill(h: *LaneHost) void {
+        h.gather();
         var fresh: usize = 0;
         var last: ?*Job = null;
         while (true) {
@@ -316,6 +321,20 @@ pub const LaneHost = struct {
             }
             h.prefilled(job, job.began);
             if (h.deliver(job)) h.remove(job);
+        }
+    }
+
+    /// Idle with requests queued: waits up to accept_wait_ms for more, until every lane would be taken.
+    fn gather(h: *LaneHost) void {
+        if (h.accept_wait_ms == 0) return;
+        h.lock();
+        defer h.unlock();
+        if (h.queued.items.len == 0 or h.admitted.items.len != 0 or h.core.activeCount() != 0) return;
+        const until = std.Io.Clock.awake.now(h.io).toNanoseconds() + @as(i96, h.accept_wait_ms) * std.time.ns_per_ms;
+        while (h.queued.items.len < h.info_.lanes and !h.closing and h.cancels.items.len == 0) {
+            const left = until - std.Io.Clock.awake.now(h.io).toNanoseconds();
+            if (left <= 0) break;
+            h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromNanoseconds(left), .clock = .awake } }) catch {};
         }
     }
 
