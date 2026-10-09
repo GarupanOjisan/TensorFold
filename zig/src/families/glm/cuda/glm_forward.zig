@@ -256,7 +256,7 @@ pub const GraphKey = struct {
     cur: u8,
     np: u32,
 
-    pub const Head = enum(u8) { main, mtp, dtaps, dblock }; // DFlash2's context update and block pass (glm_dflash.zig)
+    pub const Head = enum(u8) { main, mtp, dtaps, dblock, seg }; // DFlash2's context update and block pass (glm_dflash.zig)
 };
 const GraphEntry = struct { key: GraphKey, exec: cuda.graph.Exec };
 
@@ -403,6 +403,7 @@ pub const State = struct {
     kv_fp8: bool, // the latent caches and pooled keys as e4m3 rows with a scale each (Engine.kv_fp8)
     last_logits: u64 = 0, // a prompt's last row's logits, kept past the MTP absorb that reuses pbuf
     last_hidden: u64 = 0, // and its final-normed hidden row, the first draft's input
+    seg: bool = false, // the last verify window was segmented (forwardSeg): the commit takes commitSeg
     row0: usize = 0, // the lane's first row in the last verify window (a shared window's segment), which drafts read
     slot: usize = 0, // the lane's slot of Engine.pool (its arena extent starts at slot x Pool.extent_rows)
 
@@ -588,6 +589,11 @@ pub const Engine = struct {
     lane_mem: [max_lanes]cuda.DeviceBuffer = undefined, // each lane's own part (all of lane 0's until `addLanes` pools them)
     /// Every lane's KDA states and DSA caches once `addLanes` made several (null: lane 0 alone, all in lane_mem[0]).
     pool: ?Pool = null,
+    /// The segmented window's tables on the host (uploaded into the pool's), its selection buffers, TF_GLM_SEG (default on).
+    seg_host: [segments.SegRows.words]i32 = undefined,
+    kseg_host: [max_lanes]kern.SegRow = undefined,
+    seg_sel: ?cuda.DeviceBuffer = null,
+    seg_enabled: bool = true,
     n_lanes: usize = 1,
     lane: u8 = 0,
     draft_head: kern.Q4, // weights.draft_head: the head quantized to 4 bits, read by draft steps only
@@ -692,6 +698,8 @@ pub const Engine = struct {
         var a0: Arena = .{ .base = e.lane_mem[0].ptr, .size = lane0 };
         e.st = State.carveIn(&a0, w, capacity, long_context, kv_fp8, false);
         e.pool = null;
+        e.seg_sel = null;
+        e.seg_enabled = envOn("TF_GLM_SEG");
         e.sproj = a.take(max_rows * width * bf);
         e.sout = a.take(max_rows * ll * 128 * bf);
         e.n_lanes = 1;
@@ -833,6 +841,7 @@ pub const Engine = struct {
     pub fn deinit(e: *Engine) void {
         for (e.lane_mem[0..e.n_lanes]) |*m| m.free();
         if (e.pool) |*p| p.mem.free();
+        if (e.seg_sel) |*b| b.free();
         for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
         if (e.l2pf) |*p| p.deinit();
         e.full_dev.free();
@@ -906,6 +915,7 @@ pub const Engine = struct {
         try e.zero(e.st.conv, e.st.kda_layers * 3 * 3 * ll * 128 * bf);
         try e.zero(e.st.rec, 2 * e.st.kda_layers * ll * 128 * 128 * f4);
         e.st.cur = 0;
+        e.st.seg = false;
         try e.setPos(0);
         try e.setMtpLen(0);
         e.st.mtp_drafted = 0;
@@ -1468,6 +1478,7 @@ pub const Engine = struct {
     pub fn forward(e: *Engine, tokens_in: []const u32) !void {
         const rows = try e.stage(&e.buf, tokens_in);
         e.st.row0 = 0;
+        e.st.seg = false; // a lone window: its commit is the lone one (a segmented window left uncommitted, e.g. timing, is dropped)
         if (e.graphKey(.main, rows, e.st.pos)) |key| return e.replay(key, compute, .{ e, &e.buf, rows });
         try e.compute(&e.buf, rows);
     }
@@ -1480,6 +1491,7 @@ pub const Engine = struct {
     /// buf.logits: the row-independent parts on the whole window, each lane's KDA and DSA on its own state with the
     /// kernels its window alone would take (its row count). Eager; each lane then commits on its own (bind, commit).
     pub fn forwardShared(e: *Engine, segs: []const Seg, tokens: []const u32) !void {
+        if (e.pool != null and e.seg_enabled) return e.forwardSeg(segs, tokens);
         var rows: usize = 0;
         for (segs) |g| {
             const st = e.laneState(g.lane);
@@ -1642,9 +1654,206 @@ pub const Engine = struct {
         return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
     }
 
+    // -- segmented shared windows (v1.10 verify.BatchedVerify) -------------------------------------------------------
+    // Every lane's rows back to back through the segmented kernels (KDA chain_segments, latent.seg_*, sparse.seg_*): each
+    // row's position, arena base and sparseness and each segment's slot and parity live in the pool's device tables, so one
+    // CUDA graph a row count serves every mix of lanes and positions. Each segment's rows get the bits of its lane's window
+    // alone (the kernels' contract); the commit replays and shifts one lane's segment at a time (commitSeg).
+
+    /// The segmented selection's buffers (segments.SelectScratch): scores [max_rows, seg_pools], tokens, counts and the
+    /// split selection's scratch, allocated at the first segmented window of a long-context engine (outside any capture).
+    fn segSelBuffers(e: *Engine) !void {
+        if (e.seg_sel != null) return;
+        const np = tri.Tri.seg_pools;
+        const bytes = max_rows * np * f4 + max_rows * tri.select_width * 4 + max_rows * 4 + tri.Tri.splitInts(max_rows, np) * 4 + 4 * 256;
+        e.seg_sel = try cuda.DeviceBuffer.alloc(e.d, bytes);
+    }
+
+    const SegSel = struct { scores: u64, tokens: u64, counts: u64, split: u64 };
+
+    fn segSel(e: *const Engine) SegSel {
+        const base = e.seg_sel.?.ptr;
+        const np = tri.Tri.seg_pools;
+        const tokens = std.mem.alignForward(u64, base + max_rows * np * f4, 256);
+        const counts = std.mem.alignForward(u64, tokens + max_rows * tri.select_width * 4, 256);
+        const split = std.mem.alignForward(u64, counts + max_rows * 4, 256);
+        return .{ .scores = base, .tokens = tokens, .counts = counts, .split = split };
+    }
+
+    /// forwardShared through the segmented kernels (TF_GLM_SEG, default on once lanes share a pool).
+    fn forwardSeg(e: *Engine, segs: []const Seg, tokens: []const u32) !void {
+        const pl = &e.pool.?;
+        var spans: [max_lanes]segments.Span = undefined;
+        var ks: [max_lanes]kern.SegRow = undefined;
+        if (segs.len > max_lanes) return error.TooManySegments;
+        var rows: usize = 0;
+        for (segs, 0..) |g, i| {
+            const st = e.laneState(g.lane);
+            if (st.pos + g.rows > denseLimit(e.w) and !st.long_context) return error.PastDenseLimit;
+            if (st.pos + g.rows > st.capacity) return error.PastCacheCapacity;
+            st.row0 = rows;
+            st.seg = true;
+            spans[i] = .{ .base = st.slot * pl.extent_rows, .pos = st.pos, .rows = g.rows };
+            ks[i] = .{ .row0 = 0, .rows = @intCast(g.rows), .slot = @intCast(st.slot), .parity = @intCast(st.cur), .conv = @intCast(st.slot), .keep = @intCast(g.rows) };
+            rows += g.rows;
+        }
+        if (rows != tokens.len or rows > max_rows) return error.WindowTooWide;
+        const long = e.st.long_context;
+        _ = try segments.SegRows.fill(spans[0..segs.len], if (long) denseLimit(e.w) else null, &e.seg_host);
+        try kern.segmentTable(ks[0..segs.len], &e.kseg_host);
+        try e.upload(pl.segrows, std.mem.sliceAsBytes(&e.seg_host));
+        try e.upload(pl.kseg, std.mem.sliceAsBytes(&e.kseg_host));
+        try e.upload(e.buf.ids, std.mem.sliceAsBytes(tokens));
+        if (long) try e.segSelBuffers();
+        if (e.use_graphs) return e.replay(.{ .lane = 0, .head = .seg, .rows = @intCast(rows), .cur = 0, .np = 0 }, segBody, .{ e, rows });
+        try e.segBody(rows);
+    }
+
+    /// The segmented window's forward on e.buf: logits of every row (capturable: nothing reads a host position).
+    fn segBody(e: *Engine, rows: usize) !void {
+        const b = &e.buf;
+        const prefetch = !e.l2pf_active and if (e.l2pf) |pf| rows <= pf.s.rows else false;
+        if (prefetch) e.l2pf_active = true;
+        defer e.l2pf_active = false;
+        const c = e.w.cfg;
+        const d: usize = c.hidden;
+        try e.t.embed(b.ids, e.w.embed, b.x, rows, d, c.hc);
+        for (e.w.layers) |*l| {
+            try e.hcPre(b, l.attn_hc.?, l.in_norm, rows);
+            const g = switch (l.kind) {
+                .kda => try e.kdaSeg(l, b, rows),
+                .mla => try e.dsaSeg(l, b, rows),
+            };
+            try e.t.hcPost(b.x, b.x, g, b.post, b.comb, wt.world, rows, d, c.hc);
+            try e.hcPre(b, l.ffn_hc.?, l.post_norm, rows);
+            const g2 = if (l.mlp) |m| try e.mlpBlock(m, b, rows, l.index, null) else try e.moeBlock(l.moe.?, b, rows, l.index, null);
+            try e.t.hcPost(b.x, b.x, g2, b.post, b.comb, wt.world, rows, d, c.hc);
+            for (e.tap_layers, 0..) |tl, slot| if (tl == l.index and b.taps[slot] != 0) try e.t.streamMean(b.x, b.taps[slot], rows, d, c.hc);
+        }
+        try e.t.streamMean(b.x, b.hidden, rows, d, c.hc);
+        try e.t.rmsnorm(b.hidden, d, e.w.norm, b.fnormed, d, b.fxs, rows, d, c.eps);
+        try e.mm(b, b.fnormed, d, b.fxs, e.w.head, b.logits, rows, false);
+        if (prefetch) try e.l2pf.?.join(e.s);
+    }
+
+    /// forward.kda_segments: the projections on every row (into the pool's [layers, max_rows, width] rows the commit's conv
+    /// shift reads), then kda.chain_segments, each segment from its slot's state into its other parity.
+    fn kdaSeg(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize) !u64 {
+        const c = e.w.cfg;
+        const kw = l.kda.?;
+        const pl = &e.pool.?;
+        const li: usize = e.st.kda_index[l.index];
+        const ll: usize = c.kda_heads / wt.world;
+        const p = pl.proj + li * max_rows * e.width * bf;
+        try e.mm(b, b.normed, c.hidden, b.xs, kw.proj, p, rows, false);
+        const fa = p + kw.fa_off * bf;
+        const ga = p + kw.ga_off * bf;
+        try e.t.groupSums(fa, e.width, b.xs_fa, rows, 128);
+        try e.mm(b, fa, e.width, b.xs_fa, kw.fb, b.ka, rows, false);
+        try e.t.groupSums(ga, e.width, b.xs_ga, rows, 128);
+        try e.mm(b, ga, e.width, b.xs_ga, kw.gb, b.kg, rows, false);
+        try e.pfSite(l.index, 2);
+        const rec_layer = ll * 128 * 128 * f4;
+        const conv_layer = 3 * 3 * ll * 128 * bf;
+        const out = pl.scr.out + li * max_rows * ll * 128 * bf;
+        try kern.chainSegments(e.k, e.s, .{
+            .heads = ll,
+            .seg = pl.kseg,
+            .nseg = max_lanes,
+            .p = p,
+            .p_stride = e.width,
+            .b_off = kw.b_off,
+            .a = b.ka,
+            .a_stride = ll * 128,
+            .g = b.kg,
+            .g_stride = ll * 128,
+            .conv = pl.conv + li * conv_layer,
+            .conv_slot_stride = pl.conv_slot / bf,
+            .conv_w = kw.conv,
+            .rec = pl.rec + li * rec_layer,
+            .slot_stride = pl.rec_slot / f4,
+            .parity_stride = pl.rec_slot / (2 * f4),
+            .a_log = kw.a_log,
+            .dt_bias = kw.dt_bias,
+            .norm_w = kw.norm,
+            .eps = c.eps,
+            .lower = c.lower_bound,
+            .rows = rows,
+            .out = out,
+            .k_save = pl.scr.k + li * max_rows * ll * 128 * f4,
+            .v_save = pl.scr.v + li * max_rows * ll * 128 * bf,
+            .g_save = pl.scr.g + li * max_rows * ll * 128 * f4,
+            .b_save = pl.scr.b + li * max_rows * ll * f4,
+            .q_tmp = b.q_tmp,
+            .y_tmp = b.y_tmp,
+        });
+        try e.t.groupSums(out, ll * 128, b.kxs, rows, ll * 128);
+        return e.outProj(b, out, b.kxs, kw.o, rows, .{ l.index, 0 });
+    }
+
+    /// forward.dsa_segments: the front on every row, each row's latent and index key into its lane's arena extent, the
+    /// segmented selection (every row: dense rows ignore it, as v1.10's graphs run it), absorb, segmented attention, expand.
+    fn dsaSeg(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize) !u64 {
+        const c = e.w.cfg;
+        const a = l.dsa.?;
+        const pl = &e.pool.?;
+        const hl: usize = c.mla_heads / wt.world;
+        const qk: usize = c.nope;
+        const lw: usize = c.kv_lora;
+        const di: usize = e.st.dsa_index[l.index];
+        const S = segments.SegRows;
+        const tab = pl.segrows;
+        const pos = tab + S.pos_at * 4;
+        const base = tab + S.base_at * 4;
+        const sparse = tab + S.sparse_at * 4;
+        try e.dsaFront(l, b, 0, rows);
+        try e.t.segLatWrite(b.lat, c.kv_lora, pl.kc[di], pos, base, rows, lw);
+        var toks: ?u64 = null;
+        var cnts: ?u64 = null;
+        if (e.st.long_context) {
+            const ix = a.index;
+            const iw = c.i_dim + c.i_heads;
+            try e.mm(b, b.normed, c.hidden, b.xs, ix.kw, b.ikr, rows, false);
+            try e.t.router(b.normed, c.hidden, ix.gate, b.rpart, b.igr, rows, c.hidden, c.i_dim);
+            try e.t.segIndexUpdate(b.ikr, iw, b.igr, ix.ln_w, ix.ln_b, ix.ape, pl.ik[di], pl.ig[di], pl.pk[di], pos, base, tab + S.ibase_at * 4, 1 << 30, rows); // no ring: a 16-divisible RING past every position, the captured specialization
+            try e.mm(b, b.qr, c.q_lora, b.xs_qr, ix.qb, b.qi, rows, false);
+            const sel = e.segSel();
+            try e.t.segSelect(b.qi, b.ikr + c.i_dim * bf, iw, pl.pk[di], sel.scores, sel.split, sel.tokens, sel.counts, pos, sparse, tab + S.start_at * 4, tab + S.rows_at * 4, tab + S.pbase_at * 4, tab + S.pools_at * 4, rows, segments.max_segs, c.i_heads, c.i_dim);
+            toks = sel.tokens;
+            cnts = sel.counts;
+        }
+        try e.t.absorbQ(b.q, a.wk, b.qa, rows, hl, qk, lw);
+        try e.pfSite(l.index, 2);
+        const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(qk), -0.5));
+        try e.t.segAttention(b.qa, pl.kc[di], pos, base, sparse, toks, cnts, b.lat_s, b.ol, rows, hl, lw, scale);
+        try e.t.expandV(b.ol, a.wv, b.vn, rows, hl, c.v_dim, lw);
+        try e.t.groupSums(b.vn, hl * c.v_dim, b.xs_ao, rows, hl * c.v_dim);
+        return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
+    }
+
+    /// verify.BatchedVerify.commit for the bound lane's segment of the last segmented window: its KDA states replayed to
+    /// `keep` rows (when it keeps fewer), its conv window shifted, its parity flipped, its position advanced.
+    fn commitSeg(e: *Engine, rows: usize, keep: usize) !void {
+        const pl = &e.pool.?;
+        const st = &e.st;
+        st.seg = false;
+        const n = st.kda_layers;
+        if (n > 0) {
+            const ll: usize = e.w.cfg.kda_heads / wt.world;
+            e.kseg_host = @splat(.{ .row0 = 0, .rows = 0, .slot = 0, .parity = 0, .conv = 0, .keep = 0 });
+            e.kseg_host[0] = .{ .row0 = @intCast(st.row0), .rows = @intCast(rows), .slot = @intCast(st.slot), .parity = @intCast(st.cur), .conv = @intCast(st.slot), .keep = @intCast(keep) };
+            try e.upload(pl.kseg, std.mem.sliceAsBytes(&e.kseg_host));
+            if (keep < rows) try kern.replayLayersSegments(e.k, e.s, pl.kseg, 1, n, ll, pl.rec, pl.rec_slot / f4, pl.rec_slot / (2 * f4), pl.scr.k, pl.scr.v, pl.scr.g, pl.scr.b, max_rows);
+            try e.t.convShiftSeg(pl.conv, pl.proj, pl.kseg, 1, n, 3 * ll * 128, pl.conv_slot / bf, 3 * 3 * ll * 128, max_rows * e.width, e.width);
+            st.cur = 1 - st.cur;
+        }
+        try e.setPos(st.pos + keep);
+    }
+
     /// forward.commit: keep the last decode window's first `keep` rows.
     pub fn commit(e: *Engine, rows: usize, keep: usize) !void {
         if (keep < 1 or keep > rows) return error.BadKeep;
+        if (e.st.seg) return e.commitSeg(rows, keep);
         const c = e.w.cfg;
         const ll: usize = c.kda_heads / wt.world;
         const n = e.st.kda_layers;
@@ -1688,6 +1897,7 @@ pub const Engine = struct {
         const rec = e.st.kda_layers * ll * 128 * 128 * f4;
         try e.copyDev(e.st.rec + e.st.cur * rec, src, rec);
         try e.copyDev(e.st.conv, src + rec, e.st.kda_layers * 3 * 3 * ll * 128 * bf);
+        e.st.seg = false;
         try e.setPos(at);
         try e.setMtpLen(at);
         e.st.mtp_drafted = 0;
