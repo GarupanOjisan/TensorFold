@@ -839,6 +839,11 @@ fn ceilShare(p: f64, total: u64) u64 {
     return @intCast((prod + ((@as(u128, 1) << sh) - 1)) >> sh);
 }
 
+test {
+    _ = @import("glm_segments.zig");
+    _ = @import("glm_kernels.zig");
+}
+
 test "ceilShare is ceil(p * total) over the double's exact value" {
     try std.testing.expectEqual(@as(u64, 95), ceilShare(0.95, 100)); // 0.95's double sits just below 0.95
     try std.testing.expectEqual(@as(u64, 50), ceilShare(0.5, 100));

@@ -6,6 +6,7 @@ const cuda = @import("cuda");
 const wt = @import("glm_weights.zig");
 const tri = @import("glm_triton.zig");
 const kern = @import("glm_kernels.zig");
+const segments = @import("glm_segments.zig");
 const l2pf = @import("glm_l2pf.zig");
 const roce_mod = @import("glm_roce.zig");
 
@@ -403,13 +404,15 @@ pub const State = struct {
     last_logits: u64 = 0, // a prompt's last row's logits, kept past the MTP absorb that reuses pbuf
     last_hidden: u64 = 0, // and its final-normed hidden row, the first draft's input
     row0: usize = 0, // the lane's first row in the last verify window (a shared window's segment), which drafts read
+    slot: usize = 0, // the lane's slot of Engine.pool (its arena extent starts at slot x Pool.extent_rows)
 
     pub fn recBytes(st: *const State, ll: usize) usize {
         return st.kda_layers * ll * 128 * 128 * f4;
     }
 
-    /// One sequence's state for `w`'s layers, carved out of `a` (a.size 0: count only).
-    fn carveIn(a: *Arena, w: *const Weights, capacity: usize, long_context: bool, kv_fp8: bool) State {
+    /// One sequence's state for `w`'s layers, carved out of `a` (a.size 0: count only). `pooled`: its KDA states and DSA
+    /// layers' caches are left to Pool.view (the MTP layer's stay here).
+    fn carveIn(a: *Arena, w: *const Weights, capacity: usize, long_context: bool, kv_fp8: bool, pooled: bool) State {
         const c = w.cfg;
         const ll: usize = c.kda_heads / wt.world;
         const width = 3 * ll * 128 + 2 * 128 + ll;
@@ -428,15 +431,20 @@ pub const State = struct {
         const mr = Engine.max_rows;
         st.pos_dev = a.take(16);
         st.mtp_pos_dev = a.take(16);
-        st.conv = a.take(n_kda * 3 * 3 * ll * 128 * bf);
-        st.rec = a.take(2 * n_kda * ll * 128 * 128 * f4);
+        if (!pooled) {
+            st.conv = a.take(n_kda * 3 * 3 * ll * 128 * bf);
+            st.rec = a.take(2 * n_kda * ll * 128 * 128 * f4);
+        }
         st.proj = a.take(n_kda * mr * width * bf);
         st.scr = .{ .out = a.take(n_kda * mr * ll * 128 * bf), .k = a.take(n_kda * mr * ll * 128 * f4), .v = a.take(n_kda * mr * ll * 128 * bf), .g = a.take(n_kda * mr * ll * 128 * f4), .b = a.take(n_kda * mr * ll * f4) };
-        for (0..st.dsa_layers) |i| st.kc[i] = a.take(capacity * st.latentRow(c));
+        if (!pooled) for (0..st.dsa_layers) |i| {
+            st.kc[i] = a.take(capacity * st.latentRow(c));
+        };
         st.mtp_kc = a.take(capacity * st.latentRow(c));
         st.last_logits = a.take(w.head.n * bf);
         st.last_hidden = a.take(c.hidden * bf);
-        if (long_context) for (0..st.dsa_layers + 1) |i| {
+        const own_from: usize = if (pooled) st.dsa_layers else 0; // the MTP layer's indexer stays a lane's own
+        if (long_context) for (own_from..st.dsa_layers + 1) |i| {
             st.index[i] = .{ a.take(capacity * c.i_dim * bf), a.take(capacity * c.i_dim * bf), a.take((capacity / 4 + 2) * st.pooledRow(c)) };
         };
         return st;
@@ -453,10 +461,110 @@ pub const State = struct {
     }
 
     /// carveIn's bytes, its alignment included.
-    fn bytes(w: *const Weights, capacity: usize, long_context: bool, kv_fp8: bool) usize {
+    fn bytes(w: *const Weights, capacity: usize, long_context: bool, kv_fp8: bool, pooled: bool) usize {
         var count: Arena = .{ .base = 0, .size = 0 };
-        _ = carveIn(&count, w, capacity, long_context, kv_fp8);
+        _ = carveIn(&count, w, capacity, long_context, kv_fp8, pooled);
         return count.used + 256;
+    }
+};
+
+/// A lane's DSA extent starts at a multiple of this many tokens (v1.10 segments.EXTENT; its pooled keys at base / 4).
+pub const extent = 2048;
+
+/// Every lane's KDA states and DSA layers' caches in one allocation, laid out as v1.10's slots and arenas (multi.py's
+/// slots, segments.py) so the segmented kernels reach any lane from one base: KDA rec [slots, 2, layers, LL, 128, 128] f32
+/// and conv [slots, layers, 3, 3 LL 128] bf16; a DSA layer's latents [slots x extent_rows, row], index keys and gates
+/// [slots x extent_rows, 128] bf16 (no rings: token t of slot s at s x extent_rows + t, segments.SegRows' ibase = base),
+/// pooled keys [slots x extent_rows / 4 + 2, row]. Each lane's State points into its slot (Pool.view), so its own calls
+/// run as before. Also the segmented window's KDA scratch (one layer set of `max_rows` rows) and tables.
+pub const Pool = struct {
+    mem: cuda.DeviceBuffer,
+    slots: usize,
+    extent_rows: usize, // a slot's tokens in the DSA arenas: the lane capacity rounded up to `extent`
+    rec: u64,
+    rec_slot: usize, // bytes; parity stride rec_slot / 2, layer stride LL x 128 x 128 x 4
+    conv: u64,
+    conv_slot: usize, // bytes; layer stride 3 x 3 LL 128 x 2
+    kc: [16]u64 = @splat(0), // a DSA layer's latent arena
+    ik: [16]u64 = @splat(0), // index keys, gates and pooled keys (long contexts only)
+    ig: [16]u64 = @splat(0),
+    pk: [16]u64 = @splat(0),
+    lat_row: usize,
+    pk_row: usize,
+    /// The segmented window's KDA projection rows and replay saves, [layers, max_rows, ...] as a State's (kda.KDAScratchSet).
+    proj: u64,
+    scr: KdaScratch,
+    /// kda.segment_table [max_lanes, kern.seg_cols] i32 and segments.SegRows' tables (glm_segments.zig), device copies.
+    kseg: u64,
+    segrows: u64,
+
+    /// A slot's tokens in the arenas for lanes of `capacity`: capacity rounded up to `extent`, with room for the pooled
+    /// keys' two rows past capacity / 4 (a slot's pooled keys must end before the next slot's begin).
+    pub fn extentRows(capacity: usize) usize {
+        var n = std.mem.alignForward(usize, capacity, extent);
+        if (capacity / 4 + 2 > n / 4) n += extent;
+        return n;
+    }
+
+    /// Carves a pool of `slots` lanes out of `a` (a.size 0: count only).
+    fn carvePool(a: *Arena, w: *const Weights, capacity: usize, long_context: bool, kv_fp8: bool, slots: usize) Pool {
+        const c = w.cfg;
+        const ll: usize = c.kda_heads / wt.world;
+        const width = 3 * ll * 128 + 2 * 128 + ll;
+        var n_kda: usize = 0;
+        var n_dsa: usize = 0;
+        for (w.layers) |l| switch (l.kind) {
+            .kda => n_kda += 1,
+            .mla => n_dsa += 1,
+        };
+        const ext = extentRows(capacity);
+        const mr = Engine.max_rows;
+        var p: Pool = undefined;
+        p.mem = undefined;
+        p.slots = slots;
+        p.extent_rows = ext;
+        p.rec_slot = std.mem.alignForward(usize, 2 * n_kda * ll * 128 * 128 * f4, 256);
+        p.conv_slot = std.mem.alignForward(usize, n_kda * 3 * 3 * ll * 128 * bf, 256);
+        p.lat_row = if (kv_fp8) c.kv_lora + 16 else c.kv_lora * bf;
+        p.pk_row = if (kv_fp8) c.i_dim + 16 else c.i_dim * bf;
+        p.rec = a.take(slots * p.rec_slot);
+        p.conv = a.take(slots * p.conv_slot);
+        p.kc = @splat(0);
+        p.ik = @splat(0);
+        p.ig = @splat(0);
+        p.pk = @splat(0);
+        for (0..n_dsa) |i| {
+            p.kc[i] = a.take(slots * ext * p.lat_row);
+            if (long_context) {
+                p.ik[i] = a.take(slots * ext * c.i_dim * bf);
+                p.ig[i] = a.take(slots * ext * c.i_dim * bf);
+                p.pk[i] = a.take((slots * ext / 4 + 2) * p.pk_row);
+            }
+        }
+        p.proj = a.take(n_kda * mr * width * bf);
+        p.scr = .{ .out = a.take(n_kda * mr * ll * 128 * bf), .k = a.take(n_kda * mr * ll * 128 * f4), .v = a.take(n_kda * mr * ll * 128 * bf), .g = a.take(n_kda * mr * ll * 128 * f4), .b = a.take(n_kda * mr * ll * f4) };
+        p.kseg = a.take(Engine.max_lanes * kern.seg_cols * 4);
+        p.segrows = a.take(segments.SegRows.words * 4);
+        return p;
+    }
+
+    /// Bytes of a pool of `slots` lanes.
+    pub fn bytes(w: *const Weights, capacity: usize, long_context: bool, kv_fp8: bool, slots: usize) usize {
+        var count: Arena = .{ .base = 0, .size = 0 };
+        _ = carvePool(&count, w, capacity, long_context, kv_fp8, slots);
+        return count.used + 256;
+    }
+
+    /// Points `st`'s KDA states and DSA caches at slot `slot`.
+    fn view(p: *const Pool, st: *State, slot: usize, i_dim: usize) void {
+        st.slot = slot;
+        st.rec = p.rec + slot * p.rec_slot;
+        st.conv = p.conv + slot * p.conv_slot;
+        const base = slot * p.extent_rows;
+        for (0..st.dsa_layers) |i| {
+            st.kc[i] = p.kc[i] + base * p.lat_row;
+            if (st.long_context) st.index[i] = .{ p.ik[i] + base * i_dim * bf, p.ig[i] + base * i_dim * bf, p.pk[i] + base / 4 * p.pk_row };
+        }
     }
 };
 
@@ -477,7 +585,9 @@ pub const Engine = struct {
     /// Every lane's state but the bound one's, which `st` holds (bind swaps them); lane 0 lives in `mem`, the others
     /// in `lane_mem` from `addLanes`.
     lanes: [max_lanes]State = undefined,
-    lane_mem: [max_lanes]cuda.DeviceBuffer = undefined,
+    lane_mem: [max_lanes]cuda.DeviceBuffer = undefined, // each lane's own part (all of lane 0's until `addLanes` pools them)
+    /// Every lane's KDA states and DSA caches once `addLanes` made several (null: lane 0 alone, all in lane_mem[0]).
+    pool: ?Pool = null,
     n_lanes: usize = 1,
     lane: u8 = 0,
     draft_head: kern.Q4, // weights.draft_head: the head quantized to 4 bits, read by draft steps only
@@ -565,7 +675,7 @@ pub const Engine = struct {
         _ = carve(&count, w, mtp_rows, capacity, false, np_max, 0);
         const kv_fp8 = try kvFp8();
         const shared_bytes = max_rows * width * bf + max_rows * ll * 128 * bf + 512;
-        const total = count.used + State.bytes(w, capacity, long_context, kv_fp8) + shared_bytes + 4096;
+        const total = count.used + shared_bytes + 4096;
         e.mem = try cuda.DeviceBuffer.alloc(d, total);
         errdefer e.mem.free();
         try e.mem.fill8(0, null);
@@ -574,7 +684,14 @@ pub const Engine = struct {
         e.pbuf = carve(&a, w, prefill_rows, capacity, true, np_max, tap_n);
         e.mbuf = carve(&a, w, mtp_rows, capacity, false, np_max, 0);
         e.tap_layers = taps orelse @splat(std.math.maxInt(u32));
-        e.st = State.carveIn(&a, w, capacity, long_context, kv_fp8);
+        // lane 0 apart, so `addLanes` can give its room to the pool
+        const lane0 = State.bytes(w, capacity, long_context, kv_fp8, false);
+        e.lane_mem[0] = try cuda.DeviceBuffer.alloc(d, lane0);
+        errdefer e.lane_mem[0].free();
+        try e.lane_mem[0].fill8(0, null);
+        var a0: Arena = .{ .base = e.lane_mem[0].ptr, .size = lane0 };
+        e.st = State.carveIn(&a0, w, capacity, long_context, kv_fp8, false);
+        e.pool = null;
         e.sproj = a.take(max_rows * width * bf);
         e.sout = a.take(max_rows * ll * 128 * bf);
         e.n_lanes = 1;
@@ -623,27 +740,64 @@ pub const Engine = struct {
 
     // -- lanes ------------------------------------------------------------------------------------------------
     /// One more lane's device bytes (its caches at this engine's window).
+    /// One more lane's device bytes once pooled: its own part and its share of the pool (the pool's segmented scratch
+    /// and tables come with the first lane).
     pub fn laneBytes(e: *const Engine) usize {
-        return State.bytes(e.w, e.st.capacity, e.st.long_context, e.st.kv_fp8);
+        const st = &e.st;
+        return State.bytes(e.w, st.capacity, st.long_context, st.kv_fp8, true) + Pool.bytes(e.w, st.capacity, st.long_context, st.kv_fp8, 2) - Pool.bytes(e.w, st.capacity, st.long_context, st.kv_fp8, 1);
     }
 
-    /// Lanes up to `total` (at most max_lanes), each zeroed: how many there are now. Stops at the first allocation
-    /// that fails, so a short count is not an error.
+    /// Lanes up to `total` (at most max_lanes), all zeroed, their KDA states and DSA caches in one Pool: how many there
+    /// are now. Called once, before serving (lane 0's state is dropped: a load's timings left nothing to keep). Lane 0's
+    /// own buffer is freed first, so the pool takes its room; a pool that does not fit is tried with fewer lanes.
     pub fn addLanes(e: *Engine, total: usize) !usize {
         const want = @min(total, max_lanes);
-        while (e.n_lanes < want) {
-            const size = e.laneBytes();
-            var m = cuda.DeviceBuffer.alloc(e.d, size) catch break;
+        if (want <= e.n_lanes) return e.n_lanes;
+        if (e.n_lanes != 1 or e.pool != null) return error.LanesAlreadyPooled;
+        const st0 = e.st;
+        const cap = st0.capacity;
+        // the captured graphs hold lane 0's old addresses
+        for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
+        e.n_graphs = 0;
+        e.lane_mem[0].free();
+        e.n_lanes = 0; // until the pool's lanes are made (deinit frees lane_mem[0 .. n_lanes])
+        var pool: Pool = blk: {
+            var n = want;
+            while (n >= 1) : (n -= 1) {
+                const size = Pool.bytes(e.w, cap, st0.long_context, st0.kv_fp8, n);
+                var m = cuda.DeviceBuffer.alloc(e.d, size) catch continue;
+                m.fill8(0, null) catch {
+                    m.free();
+                    continue;
+                };
+                var a: Arena = .{ .base = m.ptr, .size = size };
+                var p = Pool.carvePool(&a, e.w, cap, st0.long_context, st0.kv_fp8, n);
+                p.mem = m;
+                break :blk p;
+            }
+            return error.OutOfMemory;
+        };
+        errdefer pool.mem.free();
+        const own = State.bytes(e.w, cap, st0.long_context, st0.kv_fp8, true);
+        var made: usize = 0;
+        while (made < pool.slots) : (made += 1) {
+            var m = cuda.DeviceBuffer.alloc(e.d, own) catch break;
             m.fill8(0, null) catch {
                 m.free();
                 break;
             };
-            var a: Arena = .{ .base = m.ptr, .size = size };
-            e.lane_mem[e.n_lanes] = m;
-            e.lanes[e.n_lanes] = State.carveIn(&a, e.w, e.st.capacity, e.st.long_context, e.st.kv_fp8);
-            e.n_lanes += 1;
+            var a: Arena = .{ .base = m.ptr, .size = own };
+            var st = State.carveIn(&a, e.w, cap, st0.long_context, st0.kv_fp8, true);
+            pool.view(&st, made, e.w.cfg.i_dim);
+            e.lane_mem[made] = m;
+            e.lanes[made] = st;
         }
-        return e.n_lanes;
+        if (made == 0) return error.OutOfMemory;
+        e.pool = pool;
+        e.n_lanes = made;
+        e.st = e.lanes[0];
+        e.lane = 0;
+        return made;
     }
 
     /// Makes lane `i`'s state the one every call reads and writes (`st`).
@@ -677,7 +831,8 @@ pub const Engine = struct {
     }
 
     pub fn deinit(e: *Engine) void {
-        for (e.lane_mem[1..e.n_lanes]) |*m| m.free();
+        for (e.lane_mem[0..e.n_lanes]) |*m| m.free();
+        if (e.pool) |*p| p.mem.free();
         for (e.graphs[0..e.n_graphs]) |*g| g.exec.deinit();
         if (e.l2pf) |*p| p.deinit();
         e.full_dev.free();

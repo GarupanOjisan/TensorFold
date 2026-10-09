@@ -122,6 +122,12 @@ pub const kda_out = "_ZN10tf_glm_kda10out_kernelEiPK13__nv_bfloat16S2_iS2_fPS0_"
 pub const kda_replay = "_ZN10tf_glm_kda13replay_kernelEiPKfS1_PK13__nv_bfloat16S1_S1_iPf";
 /// kda.replay_layers: every KDA layer's state after the kept rows, from commit (kda.cu:391, forward.py:545).
 pub const kda_replay_layers = "_ZN10tf_glm_kda20replay_layers_kernelEiPKfmS1_PK13__nv_bfloat16S1_S1_mmiPf";
+/// kda.chain_segments (v1.8 kda.cu:613-627), launch 1 of 3: prep_kernel with each row's conv taps from its segment's slot.
+pub const kda_prep_seg = "_ZN10tf_glm_kda15prep_seg_kernelEiPKiiPK13__nv_bfloat16iiS4_iS4_mS4_PKfS6_fPfS7_PS2_S7_S7_";
+/// kda.chain_segments, launch 2 of 3: step_seg_kernel<4, 16>, block (segment x head, part).
+pub const kda_step_seg = "_ZN10tf_glm_kda15step_seg_kernelILi4ELi16EEEviPKiPfmmPKfS5_PK13__nv_bfloat16S5_S5_PS6_";
+/// kda.replay_layers_segments (v1.8 kda.cu:629-634): block (segment, layer, head).
+pub const kda_replay_layers_seg = "_ZN10tf_glm_kda24replay_layers_seg_kernelEiiPKiPfmmmPKfPK13__nv_bfloat16S4_S4_mm";
 
 // glm_exl3.fatbin
 /// ext.group: distinct experts and their members (experts.cu:306).
