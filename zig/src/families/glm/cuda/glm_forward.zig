@@ -256,7 +256,7 @@ pub const GraphKey = struct {
     cur: u8,
     np: u32,
 
-    pub const Head = enum(u8) { main, mtp, dtaps, dblock, seg }; // DFlash2's context update and block pass (glm_dflash.zig)
+    pub const Head = enum(u8) { main, mtp, dtaps, dblock, seg, dbatch }; // DFlash2's context update, block pass and the lanes' batched block pass (glm_dflash.zig)
 };
 const GraphEntry = struct { key: GraphKey, exec: cuda.graph.Exec };
 

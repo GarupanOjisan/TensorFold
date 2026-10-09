@@ -854,11 +854,7 @@ pub const Batch = struct {
         const S = ds.len;
         if (S == 0 or S > b.lanes or pend.len != S) return error.BadDraftBatch;
         const n = dr.block;
-        const nb = n - 1;
-        const D = dr.d;
-        const k = dr.top_k;
         const R = S * n;
-        const M = S * nb;
         var ids: [8 * max_block]i32 = undefined;
         for (0..S) |s| {
             @memset(ids[s * n ..][0..n], @intCast(dr.mask_id));
@@ -874,10 +870,28 @@ pub const Batch = struct {
             }
             try e.upload(b.slots, std.mem.sliceAsBytes(slot[0..S]));
         }
+        // with the pool every address below is fixed for a lane count (the positions come from `meta`): one graph each
+        if (b.pool != null and e.use_graphs) {
+            try e.replay(.{ .lane = 0, .head = .dbatch, .rows = @intCast(S), .cur = 0, .np = 0 }, pass, .{ b, e, ds });
+        } else try b.pass(e, ds);
+        if (!read) return;
+        try b.readBack(e, ds);
+    }
+
+    /// Batch.blocks' device work, from the embedded block rows to the gathered candidates and the selector rows.
+    fn pass(b: *Batch, e: *Engine, ds: []const *Drafter) !void {
+        const dr = b.dr;
+        const S = ds.len;
+        const n = dr.block;
+        const nb = n - 1;
+        const D = dr.d;
+        const k = dr.top_k;
+        const R = S * n;
+        const M = S * nb;
         try e.t.embed(b.ids, b.w.embed, b.x, R, D, 1);
         for (ds, 0..) |dft, s| {
             var a: cuda.Args = .{};
-            a.add(dft.pos_dev);
+            a.add(if (b.pool != null) b.meta + 8 * s else dft.pos_dev);
             a.add(dr.inv_freq);
             a.add(int(n));
             a.add(int(dr.hd / 2));
@@ -909,7 +923,14 @@ pub const Batch = struct {
         p.add(int(dr.sel_rank));
         p.add(int(D));
         try cuda.launch.launch(e.k.df_proj, .{ .grid = .{ .x = @intCast((dr.sel_rank + 7) / 8), .y = @intCast(M) }, .block = .{ .x = 256 } }, e.s, &p);
-        if (!read) return;
+    }
+
+    /// Rank 0: each drafter's merged candidates and selector rows from the last pass.
+    fn readBack(b: *Batch, e: *Engine, ds: []const *Drafter) !void {
+        const dr = b.dr;
+        const nb = dr.block - 1;
+        const k = dr.top_k;
+        const M = ds.len * nb;
         // v1.10 patch 0092 as Drafter.block: a bad id is a copy read early; copy again once the device is idle
         for (0..2) |attempt| {
             try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(b.cand_host.ptr, b.cand_all, wt.world * M * 2 * k * 4, e.s.handle), "cuMemcpyDtoHAsync");
@@ -926,7 +947,7 @@ pub const Batch = struct {
             }
             if (good) return;
             if (attempt == 1) return error.BadDrafterCandidates;
-            std.log.warn("drafter: a candidate id outside the vocabulary ({d} lanes); copying the rows again once the device is idle", .{S});
+            std.log.warn("drafter: a candidate id outside the vocabulary ({d} lanes); copying the rows again once the device is idle", .{ds.len});
             try e.d.check(e.d.api.cuCtxSynchronize(), "cuCtxSynchronize");
         }
     }
