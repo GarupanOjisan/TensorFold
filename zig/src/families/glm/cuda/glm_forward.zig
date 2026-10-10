@@ -976,7 +976,8 @@ pub const Engine = struct {
             },
             .f8 => {
                 // the captured _fmm shapes stop at a lane window (16 rows): a shared window past that in 16-row pieces
-                const step = if (b.prefill) rows else max_rows;
+                const one = !wide and rows <= 32 and !envOn("TF_GLM_F8_PIECES"); // 17 to 32 rows: one 32-row pass
+                const step = if (b.prefill or one) rows else max_rows;
                 const ob: usize = if (wide) f4 else bf;
                 var r: usize = 0;
                 while (r < rows) : (r += step) {

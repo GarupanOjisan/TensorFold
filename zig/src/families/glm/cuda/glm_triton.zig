@@ -267,8 +267,10 @@ pub const Tri = struct {
     pub fn matmulF8(t: Tri, x: u64, x_stride: usize, w: u64, sc: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
         _ = part;
         if (k % 128 != 0) return error.KNotMultipleOf128;
-        if (m > 16 or b16SplitK(n, k) != 1) return error.F8ShapeNotCaptured;
+        if (m > 32 or (m > 16 and wide) or b16SplitK(n, k) != 1) return error.F8ShapeNotCaptured;
         const ot = if (wide) "*fp32" else "*bf16";
+        if (m > 16) // a shared window of 17 to 32 rows: the 32-row specialization, each weight read once
+            return t.run("_fmm", .{ 1, cdiv(n, 64), 1 }, &.{ p("X", "*bf16", x), p("W", "*fp8e4nv", w), p("S", "*fp32", sc), p("OUT", ot, out), p("PART", ot, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", 1), ci("BM", 32), ci("BLOCK_N", 64), ci("BK", b16_bk), flag("F32", wide), flag("SEQ", false) });
         try t.run("_fmm", .{ 1, cdiv(n, f8_bn_decode), 1 }, &.{ p("X", "*bf16", x), p("W", "*fp8e4nv", w), p("S", "*fp32", sc), p("OUT", ot, out), p("PART", ot, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", 1), ci("BM", 16), ci("BLOCK_N", f8_bn_decode), ci("BK", b16_bk), flag("F32", wide), flag("SEQ", false) });
     }
 
