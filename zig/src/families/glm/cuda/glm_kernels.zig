@@ -46,14 +46,14 @@ pub const Kernels = struct {
     /// v1.8's routed-expert kernels (glm_exl3d: glm5_next/cuda/exl3.cu) and the plan kernels of experts.cu.
     rot_rows: cuda.Function,
     rot_pairs: cuda.Function,
-    dec_gu_rows: [3]cuda.Function, // by launch order (TF_GLM_EXL3_DEC_ORDER, v1.10 patch 0090)
-    dec_gu: [3]cuda.Function,
-    dec_down: [3]cuda.Function,
+    dec_gu_rows: [2][3]cuda.Function, // by tile bits (0: 4-bit, 1: 3-bit), then launch order (TF_GLM_EXL3_DEC_ORDER, v1.10 patch 0090)
+    dec_gu: [2][3]cuda.Function,
+    dec_down: [2][3]cuda.Function,
     gu_epilogue18: cuda.Function,
     prompt_order: cuda.Function,
-    prompt_gu_rows: cuda.Function,
-    prompt_gu: cuda.Function,
-    prompt_down: cuda.Function,
+    prompt_gu_rows: [2]cuda.Function, // by tile bits (0: 4-bit, 1: 3-bit)
+    prompt_gu: [2]cuda.Function,
+    prompt_down: [2]cuda.Function,
     plan_small: cuda.Function,
     plan_rank: cuda.Function,
     plan_offsets: cuda.Function,
@@ -159,19 +159,21 @@ pub const Kernels = struct {
         };
         k.rot_rows = try k.mods[7].function(e18.rot_rows);
         k.rot_pairs = try k.mods[7].function(e18.rot_pairs);
-        inline for (0..3) |o| {
-            k.dec_gu_rows[o] = try k.mods[7].function(e18.dec(0, true, o));
-            k.dec_gu[o] = try k.mods[7].function(e18.dec(0, false, o));
-            k.dec_down[o] = try k.mods[7].function(e18.dec(1, false, o));
-        }
+        inline for (.{ 4, 3 }, 0..) |bits, v| inline for (0..3) |o| {
+            k.dec_gu_rows[v][o] = try k.mods[7].function(e18.dec(0, true, o, bits));
+            k.dec_gu[v][o] = try k.mods[7].function(e18.dec(0, false, o, bits));
+            k.dec_down[v][o] = try k.mods[7].function(e18.dec(1, false, o, bits));
+        };
         k.gu_epilogue18 = try k.mods[7].function(e18.gu_epilogue);
         k.prompt_order = try k.mods[7].function(e18.prompt_order);
-        k.prompt_gu_rows = try k.mods[7].function(e18.prompt_gu_rows);
-        k.prompt_gu = try k.mods[7].function(e18.prompt_gu);
-        k.prompt_down = try k.mods[7].function(e18.prompt_down);
-        try k.prompt_gu_rows.allowDynamicShared(prompt_smem_rows);
-        try k.prompt_gu.allowDynamicShared(prompt_smem);
-        try k.prompt_down.allowDynamicShared(prompt_smem);
+        inline for (.{ 4, 3 }, 0..) |bits, v| {
+            k.prompt_gu_rows[v] = try k.mods[7].function(e18.promptGu(true, bits));
+            k.prompt_gu[v] = try k.mods[7].function(e18.promptGu(false, bits));
+            k.prompt_down[v] = try k.mods[7].function(e18.promptDown(bits));
+            try k.prompt_gu_rows[v].allowDynamicShared(prompt_smem_rows);
+            try k.prompt_gu[v].allowDynamicShared(prompt_smem);
+            try k.prompt_down[v].allowDynamicShared(prompt_smem);
+        }
         k.plan_small = try k.mods[8].function(e18.plan_small);
         k.plan_rank = try k.mods[8].function(e18.plan_rank);
         k.plan_offsets = try k.mods[8].function(e18.plan_offsets);
@@ -220,9 +222,17 @@ const qmm_cfgs = [_]QmmCfg{ .{ .bn = 64, .wn = 4, .stages = 4 }, .{ .bn = 128, .
 const e18 = struct {
     const rot_rows = "_ZN12tf_glm_exl3d13rot_in_kernelILb1EEEvPK13__nv_bfloat16iPKiPK6__halfS8_PS6_S9_ii";
     const rot_pairs = "_ZN12tf_glm_exl3d13rot_in_kernelILb0EEEvPK13__nv_bfloat16iPKiPK6__halfS8_PS6_S9_ii";
-    /// dec_kernel<8, 4, 16, fuse, xrow, 1, 1, swz>'s mangled name.
-    fn dec(comptime fuse: u8, comptime xrow: bool, comptime swz: u8) [:0]const u8 {
-        return std.fmt.comptimePrint("_ZN12tf_glm_exl3d10dec_kernelILi8ELi4ELi16ELi{d}ELb{d}ELi1ELi1ELi{d}EEEvPK6__halfS3_PKjS5_PKiS7_S7_PfiiiiiiS3_S3_S3_PvfPi", .{ fuse, @intFromBool(xrow), swz });
+    /// dec_kernel<8, 4, 16, fuse, xrow, 1, 1, swz, bits>'s mangled name.
+    fn dec(comptime fuse: u8, comptime xrow: bool, comptime swz: u8, comptime bits: u8) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN12tf_glm_exl3d10dec_kernelILi8ELi4ELi16ELi{d}ELb{d}ELi1ELi1ELi{d}ELi{d}EEEvPK6__halfS3_PKjS5_PKiS7_S7_PfiiiiiiS3_S3_S3_PvfPi", .{ fuse, @intFromBool(xrow), swz, bits });
+    }
+    /// prompt_gateup_kernel<64, 8, shx, bits>'s mangled name.
+    fn promptGu(comptime shx: bool, comptime bits: u8) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN12tf_glm_exl3d20prompt_gateup_kernelILi64ELi8ELb{d}ELi{d}EEEvPK6__halfS3_PKjS5_PKiS7_S7_S3_S3_S3_PS1_iiifiS7_", .{ @intFromBool(shx), bits });
+    }
+    /// prompt_down_kernel<64, 8, bits>'s mangled name.
+    fn promptDown(comptime bits: u8) [:0]const u8 {
+        return std.fmt.comptimePrint("_ZN12tf_glm_exl3d18prompt_down_kernelILi64ELi8ELi{d}EEEvPK6__halfPKjPKiS7_S7_S3_PfiiiS7_", .{bits});
     }
     const gu_epilogue = "_ZN12tf_glm_exl3d22gateup_epilogue_kernelEPKfPKiPK6__halfS6_S6_PS4_iiiif";
     const prompt_order = "_ZN12tf_glm_exl3d19prompt_order_kernelEPKiS1_Piii";
@@ -880,6 +890,11 @@ pub fn route(k: *const Kernels, s: cuda.Stream, picks: u64, pairs: usize, expert
 /// items of 16) the `dec` kernels with TF_GLM_EXL3_FUSE 1 (the down epilogue fused) and the 16-byte loads
 /// (TF_GLM_EXL3_LOADS=nc). `ex.shared_suh` (0: none) is the one gate/up suh of a layer whose experts all share it.
 pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick: u64, ex: anytype, sc: Exl3Scratch, rows: usize, limit: f32, prompt: bool) !void {
+    const bv: usize = switch (ex.k2) {
+        8 => 0,
+        6 => 1,
+        else => return error.Exl3Bits, // 4- and 3-bit tiles only
+    };
     const slots = sc.slots;
     const p = rows * slots;
     const e_n = ex.count;
@@ -930,12 +945,12 @@ pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick
         g.add(limit);
         g.add(int(slots));
         g.add(pl.order);
-        try go(if (rows_in) k.prompt_gu_rows else k.prompt_gu, s, .{ i_w / 128, items, 1 }, 256, if (rows_in) prompt_smem_rows else prompt_smem, &g);
+        try go(if (rows_in) k.prompt_gu_rows[bv] else k.prompt_gu[bv], s, .{ i_w / 128, items, 1 }, 256, if (rows_in) prompt_smem_rows else prompt_smem, &g);
         var dn: cuda.Args = .{};
         for ([_]u64{ sc.xd, ex.down_base, pl.items, pl.counts, pl.members, ex.svh_d, sc.y }) |v| dn.add(v);
         for ([_]usize{ i_w, d, e_n }) |v| dn.add(int(v));
         dn.add(pl.order);
-        return go(k.prompt_down, s, .{ d / 256, items, 1 }, 256, prompt_smem, &dn);
+        return go(k.prompt_down[bv], s, .{ d / 256, items, 1 }, 256, prompt_smem, &dn);
     }
     const sk_gu = Exl3Scratch.gu_sk;
     var g: cuda.Args = .{};
@@ -944,7 +959,7 @@ pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick
     for ([_]u64{ ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| g.add(v);
     g.add(limit);
     g.add(@as(u64, 0)); // done: only the gate/up epilogue fused into the kernel (TF_GLM_EXL3_FUSE 2) counts blocks
-    try go(if (rows_in) k.dec_gu_rows[dec_order] else k.dec_gu[dec_order], s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
+    try go(if (rows_in) k.dec_gu_rows[bv][dec_order] else k.dec_gu[bv][dec_order], s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
     var e: cuda.Args = .{};
     for ([_]u64{ sc.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| e.add(v);
     for ([_]usize{ p, i_w, sk_gu, slots }) |v| e.add(int(v));
@@ -956,7 +971,7 @@ pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick
     for ([_]u64{ ex.svh_d, ex.svh_d, ex.svh_d, sc.y }) |v| dn.add(v);
     dn.add(@as(f32, 0));
     dn.add(@as(u64, 0));
-    try go(k.dec_down[dec_order], s, .{ items, d / 128, 1 }, 128, 0, &dn);
+    try go(k.dec_down[bv][dec_order], s, .{ items, d / 128, 1 }, 128, 0, &dn);
 }
 
 fn grouped(k: *const Kernels, s: cuda.Stream, x0: u64, x1: u64, tp0: u64, tp1: u64, k2_0: u64, k2_1: u64, sc: Exl3Scratch, mats: usize, kk: usize, n: usize, p: usize, sk: usize, maxm: usize, maxu: usize, mt: usize) !void {

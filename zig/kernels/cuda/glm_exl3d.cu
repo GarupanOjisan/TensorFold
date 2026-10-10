@@ -14,6 +14,8 @@
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
+#include "exl3_decode.cuh"
+
 namespace tf_glm_exl3d {
 
 constexpr float HAD_SCALE = 0.08838834764831845f;   // 1 / sqrt(128)
@@ -346,7 +348,7 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
 //      ld.global.nc.L1::no_allocate.v4 (lane l: bytes 16 l .. of each 512 B of a step, NT / 4 loads a lane), PD
 //      steps in flight, through a 1 KB staging area in the warp's own slice of `red` (two __syncwarp a step), read
 //      back as word `lane` of each tile.
-template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1, int SWZ = 0>
+template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1, int SWZ = 0, int B = 4>
 __global__ void __launch_bounds__(W * 32) dec_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
     const uint32_t* __restrict__ T1, const int* __restrict__ items, const int* __restrict__ counts,
@@ -355,6 +357,8 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
     float limit, int* __restrict__ done) {
     static_assert(FUSE == 0 || NT * 16 == 128, "a fused epilogue needs one 128-column Hadamard block a program");
     static_assert(LD == 0 || (NT % 4 == 0 && PD >= 1 && STEPS % PD == 0), "LD 1: NT a multiple of 4, PD | STEPS");
+    static_assert(B == 4 || (B == 3 && LD == 1 && tf_exl3::lane_words<2 * B>() == 2), "3-bit tiles: 16-byte loads");
+    constexpr int TW = 8 * B;                            // 32-bit words a tile
     int item = blockIdx.x, nblock = blockIdx.y, zz = blockIdx.z;
     if constexpr (SWZ != 0) {                            // launch order only (v1.10 patch 0090): the blocks of one k slice run together
         const unsigned lid = blockIdx.x + gridDim.x * (blockIdx.y + gridDim.y * blockIdx.z);
@@ -382,15 +386,15 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
 
     __shared__ int rows_sh[16];
     __shared__ __align__(16) float red[W][16][NT * 16];
-    constexpr int NV = NT / 4;                           // LD 1: 16-byte loads a lane a k step
+    constexpr int NV = (NT * TW + 127) / 128;            // LD 1: 16-byte loads a lane a k step
     uint4 rv[LD == 1 ? PD : 1][LD == 1 ? NV : 1];
-    const uint32_t* tbase = T + (((size_t)e * KT + split * (KT / SK) + warp * STEPS) * NTILES + nblock * NT) * 32;
-    const size_t kstep = (size_t)NTILES * 32;            // words from one k tile to the next
+    const uint32_t* tbase = T + (((size_t)e * KT + split * (KT / SK) + warp * STEPS) * NTILES + nblock * NT) * TW;
+    const size_t kstep = (size_t)NTILES * TW;            // words from one k tile to the next
     if constexpr (LD == 1) {
 #pragma unroll
         for (int d = 0; d < PD; ++d)
 #pragma unroll
-            for (int v = 0; v < NV; ++v) rv[d][v] = ldg_nc_v4(tbase + d * kstep + 128 * v + 4 * lane);
+            for (int v = 0; v < NV; ++v) if (B == 4 || 128 * v + 4 * lane < NT * TW) rv[d][v] = ldg_nc_v4(tbase + d * kstep + 128 * v + 4 * lane);
     }
     if (threadIdx.x < 16) rows_sh[threadIdx.x] = (int)threadIdx.x < cnt ? members[first + threadIdx.x] : -1;
     __syncthreads();
@@ -419,32 +423,44 @@ __global__ void __launch_bounds__(W * 32) dec_kernel(
             ra[d][2] = load_pair(x0 + k + 8, r0 >= 0); ra[d][3] = load_pair(x1 + k + 8, r1 >= 0);
         }
         uint32_t* stage = reinterpret_cast<uint32_t*>(&red[warp][0][0]);
+        int lw0 = lane, lw1 = 0, loff = 0;               // 3-bit: the lane's two words of a tile
+        if constexpr (B != 4) { tf_exl3::lane_start<2 * B>(lane, lw0, loff); lw1 = (lw0 + 1) % TW; }
+        (void)lw1; (void)loff;
         for (int kb = 0; kb < STEPS; kb += PD) {
 #pragma unroll
             for (int d = 0; d < PD; ++d) {
                 const int s = kb + d;
                 const bool more = s + PD < STEPS;
-                uint32_t a[4], words[NT];
+                uint32_t a[4], words[NT], words1[B == 4 ? 1 : NT];
 #pragma unroll
                 for (int c = 0; c < 4; ++c) a[c] = ra[d][c];
                 __syncwarp();                            // every lane has read the previous step back
 #pragma unroll
-                for (int v = 0; v < NV; ++v) *reinterpret_cast<uint4*>(stage + 128 * v + 4 * lane) = rv[d][v];
+                for (int v = 0; v < NV; ++v) if (B == 4 || 128 * v + 4 * lane < NT * TW) *reinterpret_cast<uint4*>(stage + 128 * v + 4 * lane) = rv[d][v];
                 if (more) {                              // the slot's registers are free again
 #pragma unroll
                     for (int v = 0; v < NV; ++v)
-                        rv[d][v] = ldg_nc_v4(tbase + (size_t)(s + PD) * kstep + 128 * v + 4 * lane);
+                        if (B == 4 || 128 * v + 4 * lane < NT * TW) rv[d][v] = ldg_nc_v4(tbase + (size_t)(s + PD) * kstep + 128 * v + 4 * lane);
                     const int k = (kt0 + s + PD) * 16;
                     ra[d][0] = load_pair(x0 + k, r0 >= 0); ra[d][1] = load_pair(x1 + k, r1 >= 0);
                     ra[d][2] = load_pair(x0 + k + 8, r0 >= 0); ra[d][3] = load_pair(x1 + k + 8, r1 >= 0);
                 }
                 __syncwarp();
 #pragma unroll
-                for (int i = 0; i < NT; ++i) words[i] = stage[i * 32 + lane];
+                for (int i = 0; i < NT; ++i) words[i] = stage[i * TW + lw0];
+                if constexpr (B != 4) {
+#pragma unroll
+                    for (int i = 0; i < NT; ++i) words1[i] = stage[i * TW + lw1];
+                }
 #pragma unroll
                 for (int i = 0; i < NT; ++i) {
                     uint32_t b0[2], b1[2];
-                    decode_tile(words[i], lane, b0, b1);
+                    if constexpr (B == 4) {
+                        decode_tile(words[i], lane, b0, b1);
+                    } else {
+                        const uint32_t w2[2] = {words[i], words1[i]};
+                        tf_exl3::decode_lane<2 * B, tf_exl3::CB_MCG>(w2, lane, b0, b1);
+                    }
                     mma16816(acc[i][0], a, b0);
                     mma16816(acc[i][1], a, b1);
                 }
@@ -634,13 +650,17 @@ __device__ __forceinline__ void prompt_tile(int q, int cb, int& mat, int& nt) {
     nt = MATS == 2 ? cb * 8 + (q & 7) : cb * 16 + q;
 }
 
-template <int MATS, int PM, int NW, bool SHX = false>
+template <int MATS, int PM, int NW, bool SHX = false, int B = 4>
 __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, const half* __restrict__ X1,
                                                 const uint32_t* __restrict__ T0, const uint32_t* __restrict__ T1,
                                                 const int* rows_sh, int cnt, int e, int K, int NTILES, int cb,
                                                 half* stage, float (&acc)[16 / NW][PM / 8][4]) {
     using C = PromptCfg<MATS, PM, NW, SHX>;
+    constexpr int TW = 8 * B, TP = TW / 4;           // words and 16-byte pieces a tile (stage tiles stay 32 words apart)
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    int lw0 = lane, lw1 = 0, loff = 0;
+    if constexpr (B != 4) { tf_exl3::lane_start<2 * B>(lane, lw0, loff); lw1 = (lw0 + 1) % TW; }
+    (void)lw1; (void)loff;
     int mat, nt_unused;
     prompt_tile<MATS>(warp * C::MT, cb, mat, nt_unused);
     const int KT = K >> 4, chunks = K / PBK;
@@ -664,11 +684,11 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
             cp_async16(dst + ((size_t)m * PM + i) * PXS + j * 8, src, r >= 0);
         }
         uint32_t* wdst = reinterpret_cast<uint32_t*>(dst + (size_t)C::XM * PM * PXS);
-        for (int idx = threadIdx.x; idx < 16 * PKT * 8; idx += C::T) {       // 16 B pieces of 128-B tile words
-            const int q = idx / (PKT * 8), kk = (idx / 8) % PKT, part = idx % 8;
+        for (int idx = threadIdx.x; idx < 16 * PKT * TP; idx += C::T) {      // 16 B pieces of the tiles' words
+            const int q = idx / (PKT * TP), kk = (idx / TP) % PKT, part = idx % TP;
             int wm, nt;
             prompt_tile<MATS>(q, cb, wm, nt);
-            const uint32_t* src = (wm ? T1 : T0) + (((size_t)e * KT + chunk * PKT + kk) * NTILES + nt) * 32 + part * 4;
+            const uint32_t* src = (wm ? T1 : T0) + (((size_t)e * KT + chunk * PKT + kk) * NTILES + nt) * TW + part * 4;
             cp_async16(wdst + ((size_t)q * PKT + kk) * 32 + part * 4, src, true);
         }
     };
@@ -691,7 +711,13 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
 #pragma unroll
             for (int i = 0; i < C::MT; ++i) {
                 uint32_t b0[2], b1[2];
-                decode_tile_p(ws[((size_t)(warp * C::MT + i) * PKT + kk) * 32 + lane], lane, b0, b1);
+                const uint32_t* tw = ws + ((size_t)(warp * C::MT + i) * PKT + kk) * 32;
+                if constexpr (B == 4) {
+                    decode_tile_p(tw[lane], lane, b0, b1);
+                } else {
+                    const uint32_t w2[2] = {tw[lw0], tw[lw1]};
+                    tf_exl3::decode_lane<2 * B, tf_exl3::CB_MCG>(w2, lane, b0, b1);
+                }
                 a[i][0] = b0[0]; a[i][1] = b1[0]; a[i][2] = b0[1]; a[i][3] = b1[1];
             }
 #pragma unroll
@@ -807,7 +833,7 @@ __global__ void __launch_bounds__(1024) prompt_order_kernel(const int* __restric
 }
 
 // SHX: Xg = Xu = Xh [rows, K], one row a token (pair p reads row p / slots); otherwise Xg, Xu [pairs, K].
-template <int PM, int NW, bool SHX>
+template <int PM, int NW, bool SHX, int B = 4>
 __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
     const half* __restrict__ Xg, const half* __restrict__ Xu, const uint32_t* __restrict__ Tg,
     const uint32_t* __restrict__ Tu, const int* __restrict__ items, const int* __restrict__ counts,
@@ -832,7 +858,7 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[MT][PM / 8][4];
-    prompt_mainloop<2, PM, NW, SHX>(Xg, Xu, Tg, Tu, SHX ? xrows_sh : rows_sh, cnt, e, K, N >> 4, cb,
+    prompt_mainloop<2, PM, NW, SHX, B>(Xg, Xu, Tg, Tu, SHX ? xrows_sh : rows_sh, cnt, e, K, N >> 4, cb,
                                     reinterpret_cast<half*>(smem_raw), acc);
     float* Eg = reinterpret_cast<float*>(smem_raw);
     int mat, nt;
@@ -873,7 +899,7 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_gateup_kernel(
     }  // halves
 }
 
-template <int PM, int NW>
+template <int PM, int NW, int B = 4>
 __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
     const half* __restrict__ Xd, const uint32_t* __restrict__ Td, const int* __restrict__ items,
     const int* __restrict__ counts, const int* __restrict__ members, const half* __restrict__ svh_d,
@@ -891,7 +917,7 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
     __syncthreads();
     const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     float acc[MT][PM / 8][4];
-    prompt_mainloop<1, PM, NW>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, reinterpret_cast<half*>(smem_raw),
+    prompt_mainloop<1, PM, NW, false, B>(Xd, Xd, Td, Td, rows_sh, cnt, e, K, D >> 4, cb, reinterpret_cast<half*>(smem_raw),
                                acc);
     float* Ed = reinterpret_cast<float*>(smem_raw);
     for (int hf = 0; hf < 2 && hf * PH < cnt; ++hf) {
@@ -922,19 +948,28 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
 // The instantiations GLM-5.3-Flash at two ranks launches (glm5_next/cuda/exl3_mm.py routed): a decode window's gate/up
 // and down projections (NT 8, 4 warps, 16 k steps a warp, 16-byte loads one step ahead: TF_GLM_EXL3_LOADS=nc; the
 // down projection with its epilogue fused), the row rotation, and a prompt chunk's passes of 64 pairs.
-#define TF_DEC(FUSE, XROW, SWZ)                                                                                     \
-    template __global__ void tf_glm_exl3d::dec_kernel<8, 4, 16, FUSE, XROW, 1, 1, SWZ>(                             \
+#define TF_DEC(FUSE, XROW, SWZ, B)                                                                                  \
+    template __global__ void tf_glm_exl3d::dec_kernel<8, 4, 16, FUSE, XROW, 1, 1, SWZ, B>(                          \
         const half*, const half*, const uint32_t*, const uint32_t*, const int*, const int*, const int*, float*,   \
         int, int, int, int, int, int, const half*, const half*, const half*, void*, float, int*);
-TF_DEC(0, true, 0)
-TF_DEC(0, false, 0)
-TF_DEC(1, false, 0)
-TF_DEC(0, true, 1)
-TF_DEC(0, false, 1)
-TF_DEC(1, false, 1)
-TF_DEC(0, true, 2)
-TF_DEC(0, false, 2)
-TF_DEC(1, false, 2)
+TF_DEC(0, true, 0, 4)
+TF_DEC(0, true, 0, 3)
+TF_DEC(0, false, 0, 4)
+TF_DEC(0, false, 0, 3)
+TF_DEC(1, false, 0, 4)
+TF_DEC(1, false, 0, 3)
+TF_DEC(0, true, 1, 4)
+TF_DEC(0, true, 1, 3)
+TF_DEC(0, false, 1, 4)
+TF_DEC(0, false, 1, 3)
+TF_DEC(1, false, 1, 4)
+TF_DEC(1, false, 1, 3)
+TF_DEC(0, true, 2, 4)
+TF_DEC(0, true, 2, 3)
+TF_DEC(0, false, 2, 4)
+TF_DEC(0, false, 2, 3)
+TF_DEC(1, false, 2, 4)
+TF_DEC(1, false, 2, 3)
 #undef TF_DEC
 
 #define TF_ROT(ROWS)                                                                                               \
@@ -944,12 +979,21 @@ TF_ROT(true)
 TF_ROT(false)
 #undef TF_ROT
 
-template __global__ void tf_glm_exl3d::prompt_gateup_kernel<64, 8, true>(
+template __global__ void tf_glm_exl3d::prompt_gateup_kernel<64, 8, true, 4>(
     const half*, const half*, const uint32_t*, const uint32_t*, const int*, const int*, const int*, const half*,
     const half*, const half*, half*, int, int, int, float, int, const int*);
-template __global__ void tf_glm_exl3d::prompt_gateup_kernel<64, 8, false>(
+template __global__ void tf_glm_exl3d::prompt_gateup_kernel<64, 8, false, 4>(
     const half*, const half*, const uint32_t*, const uint32_t*, const int*, const int*, const int*, const half*,
     const half*, const half*, half*, int, int, int, float, int, const int*);
-template __global__ void tf_glm_exl3d::prompt_down_kernel<64, 8>(const half*, const uint32_t*, const int*, const int*,
+template __global__ void tf_glm_exl3d::prompt_down_kernel<64, 8, 4>(const half*, const uint32_t*, const int*, const int*,
+                                                                 const int*, const half*, float*, int, int, int,
+                                                                 const int*);
+template __global__ void tf_glm_exl3d::prompt_gateup_kernel<64, 8, true, 3>(
+    const half*, const half*, const uint32_t*, const uint32_t*, const int*, const int*, const int*, const half*,
+    const half*, const half*, half*, int, int, int, float, int, const int*);
+template __global__ void tf_glm_exl3d::prompt_gateup_kernel<64, 8, false, 3>(
+    const half*, const half*, const uint32_t*, const uint32_t*, const int*, const int*, const int*, const half*,
+    const half*, const half*, half*, int, int, int, float, int, const int*);
+template __global__ void tf_glm_exl3d::prompt_down_kernel<64, 8, 3>(const half*, const uint32_t*, const int*, const int*,
                                                                  const int*, const half*, float*, int, int, int,
                                                                  const int*);
