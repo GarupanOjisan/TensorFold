@@ -341,6 +341,7 @@ fn carve(a: *Arena, w: *const Weights, rows: usize, capacity: usize, prefill: bo
             .rank = a.take(if (bs > 1024) bs * 4 else 4),
             .hist = a.take(if (bs > 1024) (bs + 1023) / 1024 * (e_n + 1) * 4 else 4),
             .order = a.take((bs / 16 + 1024) * 4),
+            .done = a.take(kern.maxItems(bs, e_n + 1, 16) * 8 * 4),
         },
     };
     b.sgu = a.take(rows * 2 * sl * bf);
@@ -693,6 +694,7 @@ pub const Engine = struct {
         e.buf = carve(&a, w, shared_rows, capacity, false, np_max, tap_n);
         e.pbuf = carve(&a, w, prefill_rows, capacity, true, np_max, tap_n);
         e.mbuf = carve(&a, w, mtp_rows, capacity, false, np_max, 0);
+        kern.fuse_gu = if (std.c.getenv("TF_GLM_EXL3_FUSE2")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
         e.tap_layers = taps orelse @splat(std.math.maxInt(u32));
         // lane 0 apart, so `addLanes` can give its room to the pool
         const lane0 = State.bytes(w, capacity, long_context, kv_fp8, false);

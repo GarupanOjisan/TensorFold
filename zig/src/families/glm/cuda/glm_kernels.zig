@@ -49,6 +49,7 @@ pub const Kernels = struct {
     dec_gu_rows: [2][3]cuda.Function, // by tile bits (0: 4-bit, 1: 3-bit), then launch order (TF_GLM_EXL3_DEC_ORDER, v1.10 patch 0090)
     dec_gu: [2][3]cuda.Function,
     dec_down: [2][3]cuda.Function,
+    dec_gu_fused: [2][2][3]cuda.Function, // FUSE 2 by tile bits, rows_in, launch order
     gu_epilogue18: cuda.Function,
     prompt_order: cuda.Function,
     prompt_gu_rows: [2]cuda.Function, // by tile bits (0: 4-bit, 1: 3-bit)
@@ -163,6 +164,8 @@ pub const Kernels = struct {
             k.dec_gu_rows[v][o] = try k.mods[7].function(e18.dec(0, true, o, bits));
             k.dec_gu[v][o] = try k.mods[7].function(e18.dec(0, false, o, bits));
             k.dec_down[v][o] = try k.mods[7].function(e18.dec(1, false, o, bits));
+            k.dec_gu_fused[v][0][o] = try k.mods[7].function(e18.dec(2, false, o, bits));
+            k.dec_gu_fused[v][1][o] = try k.mods[7].function(e18.dec(2, true, o, bits));
         };
         k.gu_epilogue18 = try k.mods[7].function(e18.gu_epilogue);
         k.prompt_order = try k.mods[7].function(e18.prompt_order);
@@ -634,6 +637,8 @@ pub var wide_rows: usize = 1;
 /// TF_GLM_EXL3_DEC_ORDER (v1.10 patch 0090): the decode expert kernel's block launch order, 0 as launched, 1 or 2 (default) a k slice's
 /// blocks together; the same bits. The engine sets it from the environment.
 pub var dec_order: usize = 2;
+/// TF_GLM_EXL3_FUSE2 (default on; 0 off): the gate/up epilogue in the gate/up kernel's last block (the same bits). The engine sets it.
+pub var fuse_gu: bool = false;
 
 /// sizeof(Smem) of kda_chunk.cu's chunk_kernel (nvcc).
 const kda_chunk_smem: u32 = 98560;
@@ -850,6 +855,7 @@ pub const Plan = struct {
     rank: u64, // [pairs] i32 when the plan is wide (pairs > 1024), else one word
     hist: u64, // [ceil(pairs / 1024), experts] i32 when wide
     order: u64, // a prompt plan's launch order, [pairs / 16 + 1024] i32
+    done: u64, // TF_GLM_EXL3_FUSE 2: [max_items(pairs, experts, 16), 8] i32 finished gate/up blocks, zero between launches
 };
 
 /// experts.max_items: the items a plan of `pairs` can hold.
@@ -958,6 +964,10 @@ pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick
     for ([_]usize{ d, i_w, p, sk_gu, e_n, slots }) |v| g.add(int(v));
     for ([_]u64{ ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| g.add(v);
     g.add(limit);
+    if (fuse_gu) { // the last block of each (item, n block) runs the epilogue
+        g.add(pl.done);
+        try go(k.dec_gu_fused[bv][@intFromBool(rows_in)][dec_order], s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
+    } else {
     g.add(@as(u64, 0)); // done: only the gate/up epilogue fused into the kernel (TF_GLM_EXL3_FUSE 2) counts blocks
     try go(if (rows_in) k.dec_gu_rows[bv][dec_order] else k.dec_gu[bv][dec_order], s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
     var e: cuda.Args = .{};
@@ -965,6 +975,7 @@ pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick
     for ([_]usize{ p, i_w, sk_gu, slots }) |v| e.add(int(v));
     e.add(limit);
     try go(k.gu_epilogue18, s, .{ p, i_w / 128, 1 }, 32, 0, &e);
+    }
     var dn: cuda.Args = .{};
     for ([_]u64{ sc.xd, sc.xd, ex.down_base, ex.down_base, pl.items, pl.counts, pl.members, sc.z }) |v| dn.add(v);
     for ([_]usize{ i_w, d, p, 1, e_n, slots }) |v| dn.add(int(v));

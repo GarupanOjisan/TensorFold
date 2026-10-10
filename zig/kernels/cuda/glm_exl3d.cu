@@ -952,6 +952,18 @@ __global__ void __launch_bounds__(NW * 32, 16 / NW) prompt_down_kernel(
     template __global__ void tf_glm_exl3d::dec_kernel<8, 4, 16, FUSE, XROW, 1, 1, SWZ, B>(                          \
         const half*, const half*, const uint32_t*, const uint32_t*, const int*, const int*, const int*, float*,   \
         int, int, int, int, int, int, const half*, const half*, const half*, void*, float, int*);
+TF_DEC(2, true, 0, 4)
+TF_DEC(2, true, 0, 3)
+TF_DEC(2, false, 0, 4)
+TF_DEC(2, false, 0, 3)
+TF_DEC(2, true, 1, 4)
+TF_DEC(2, true, 1, 3)
+TF_DEC(2, false, 1, 4)
+TF_DEC(2, false, 1, 3)
+TF_DEC(2, true, 2, 4)
+TF_DEC(2, true, 2, 3)
+TF_DEC(2, false, 2, 4)
+TF_DEC(2, false, 2, 3)
 TF_DEC(0, true, 0, 4)
 TF_DEC(0, true, 0, 3)
 TF_DEC(0, false, 0, 4)
