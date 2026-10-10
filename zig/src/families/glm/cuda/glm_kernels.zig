@@ -631,9 +631,9 @@ pub fn l2Prefetch(k: *const Kernels, s: cuda.Stream, table: u64, first: usize, c
 /// and out (the same bits as the one-block chain). The engine sets it from the environment before it sizes its buffers.
 pub var wide_rows: usize = 1;
 
-/// TF_GLM_EXL3_DEC_ORDER (v1.10 patch 0090): the decode expert kernel's block launch order, 0 (default) as launched, 1 or 2 a k slice's
+/// TF_GLM_EXL3_DEC_ORDER (v1.10 patch 0090): the decode expert kernel's block launch order, 0 as launched, 1 or 2 (default) a k slice's
 /// blocks together; the same bits. The engine sets it from the environment.
-pub var dec_order: usize = 0;
+pub var dec_order: usize = 2;
 
 /// sizeof(Smem) of kda_chunk.cu's chunk_kernel (nvcc).
 const kda_chunk_smem: u32 = 98560;
