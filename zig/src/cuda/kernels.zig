@@ -25,6 +25,7 @@ pub const scan_rows: []const u8 = if (available) &Blob("fatbin_scan_rows").bytes
 pub const nemotron_ops: []const u8 = if (available) &Blob("fatbin_nemotron_ops").bytes else &.{};
 pub const lane_gemv: []const u8 = if (available) &Blob("fatbin_lane_gemv").bytes else &.{};
 pub const sample: []const u8 = if (available) &Blob("fatbin_sample").bytes else &.{};
+pub const fp8_lane: []const u8 = if (available) &Blob("fatbin_fp8_lane").bytes else &.{};
 pub const torch_argmax: []const u8 = if (available) &Blob("fatbin_torch_argmax").bytes else &.{};
 pub const torch_topk: []const u8 = if (available) &Blob("fatbin_torch_topk").bytes else &.{};
 pub const torch_pointwise: []const u8 = if (available) &Blob("fatbin_torch_pointwise").bytes else &.{};
@@ -39,6 +40,11 @@ pub const glm_l2pf: []const u8 = if (available) &Blob("fatbin_glm_l2pf").bytes e
 pub const glm_exl3: []const u8 = if (available) &Blob("fatbin_glm_exl3").bytes else &.{};
 pub const glm_exl3d: []const u8 = if (available) &Blob("fatbin_glm_exl3d").bytes else &.{};
 pub const glm_glue: []const u8 = if (available) &Blob("fatbin_glm_glue").bytes else &.{};
+pub const nemotron_norms: []const u8 = if (available) &Blob("fatbin_nemotron_norms").bytes else &.{};
+pub const nemotron_route: []const u8 = if (available) &Blob("fatbin_nemotron_route").bytes else &.{};
+pub const nemotron_mamba: []const u8 = if (available) &Blob("fatbin_nemotron_mamba").bytes else &.{};
+pub const nemotron_attention: []const u8 = if (available) &Blob("fatbin_nemotron_attention").bytes else &.{};
+pub const nemotron_keyed: []const u8 = if (available) &Blob("fatbin_nemotron_keyed").bytes else &.{};
 
 /// Symbols in the gdn image as cuobjdump lists them for the built fatbin (named namespace tf_gdn).
 pub const gdn_symbols = struct {
@@ -48,7 +54,7 @@ pub const gdn_symbols = struct {
 
 /// Every instantiation gdn.cu exports; tests resolve each one so a wrong name cannot hide behind an unused path.
 pub const gdn_variants = [_]TreeVariant{
-    tree(0, 8, 4, true), tree(1, 8, 4, false), tree(2, 8, 2, false), tree(2, 4, 4, false),
+    tree(0, 8, 4, true),  tree(1, 8, 4, false), tree(2, 8, 2, false),  tree(2, 4, 4, false),
     tree(4, 2, 4, false), tree(8, 2, 4, false), tree(16, 2, 2, false), tree(32, 2, 1, false),
 };
 

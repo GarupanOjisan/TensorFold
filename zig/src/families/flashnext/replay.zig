@@ -954,8 +954,8 @@ pub const Run = struct {
     dense16_pipe: mtl.Pipeline = undefined,
     tp_gdn: std.AutoHashMapUnmanaged(*Variant, mtl.Pipeline) = .empty, // TP: DeltaNet steps from value head 24
     tp_lane: std.AutoHashMapUnmanaged(u64, mtl.Pipeline) = .empty, // TP: recorded lane kernels over tile maps
-    lane_new: bool = false, // the target's lane projections on fz_lane (dense.zig): the recorded bits, weights read ahead
-    lane_pf: usize = 1, // groups a simdgroup reads ahead in fz_lane
+    lane_new: bool = false, // the target's lane projections on core lane (dense.zig): the recorded bits, weights read ahead
+    lane_pf: usize = 1, // groups a simdgroup reads ahead in core lane
     lane_pipes: std.AutoHashMapUnmanaged(u64, mtl.Pipeline) = .empty,
     lane_shape: std.AutoHashMapUnmanaged(*Variant, [3]usize) = .empty, // recorded lane kernels' N, K, SK
     gdn_pipe: ?mtl.Pipeline = null, // the DeltaNet window step on fz_gdn (gdn.zig) when set
@@ -3282,7 +3282,7 @@ pub const Prompt = struct {
             @memcpy(cin_old[0 .. PLE_TAIL * WIDE * 2], p.b.cin.b.contents()[p.b.cin.off + rows * WIDE * 2 ..][0 .. PLE_TAIL * WIDE * 2]);
             m.last = .{ .b = p.last.b, .off = p.last.off + (rows - 1) * WIDE * 2 };
         } else { // the peer's half of the chunk into place
-            tp.hostWait(tpm.BACK_FLAG, pr.call);
+            try tp.hostWait(tpm.BACK_FLAG, pr.call);
             const w = tp.window();
             const rows1 = n - rows0;
             const pos1 = m.pos + rows0;
@@ -3330,7 +3330,7 @@ pub const Prompt = struct {
             n += 1;
         }
         try tp.sendNow(ws[0..n], tpm.MTP_FLAG, tp.call);
-        tp.hostWait(tpm.MTP_FLAG, tp.call);
+        try tp.hostWait(tpm.MTP_FLAG, tp.call);
         if (theirs[1] == 0) return;
         const w = tp.window();
         const cb = r.queue.commandBuffer();

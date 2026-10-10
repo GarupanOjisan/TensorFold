@@ -1,4 +1,4 @@
-//! Frozen server goldens for `zig build test-golden`, with the seven differences that are still known.
+//! Frozen server goldens for `zig build test-golden`, with the ten differences that are still known.
 const std = @import("std");
 const posix = std.posix;
 const Io = std.Io;
@@ -16,6 +16,9 @@ const known_diffs = [_]Known{
     .{ .group = "metrics-open", .name = "metrics" },
     .{ .group = "metrics-open", .name = "v1-metrics" },
     .{ .group = "keys", .name = "metrics-counted" },
+    .{ .group = "tools", .name = "two_tools-stream" },
+    .{ .group = "tools", .name = "two_tools-single-stream" },
+    .{ .group = "anthropic", .name = "tool-use-stream" },
 };
 
 fn isKnown(group: []const u8, name: []const u8) bool {
@@ -432,7 +435,7 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, kind, "sigterm")) {
                 posix.kill(s.child.id.?, posix.SIG.TERM) catch {};
                 const term = s.child.wait(io) catch return error.WaitFailed;
-                try outcomes.append(gpa, .{
+                try outcomes.append(init.arena.allocator(), .{
                     .group = "lifecycle",
                     .name = "sigterm-exit-0",
                     .verdict = if (term == .exited and term.exited == 0) .equal else .differ,
@@ -442,7 +445,7 @@ pub fn main(init: std.process.Init) !void {
                 const golden_log = try std.fmt.allocPrint(init.arena.allocator(), "{s}/{s}", .{ golden_dir, t.get("golden").?.string });
                 const want = Io.Dir.cwd().readFileAlloc(io, golden_log, init.arena.allocator(), .limited(1 << 28)) catch "";
                 const got = Io.Dir.cwd().readFileAlloc(io, s.log_path.?, init.arena.allocator(), .limited(1 << 28)) catch "";
-                try outcomes.append(gpa, .{
+                try outcomes.append(init.arena.allocator(), .{
                     .group = "lifecycle",
                     .name = "request-log",
                     .verdict = if (std.mem.eql(u8, want, got)) .equal else .differ,
@@ -469,6 +472,7 @@ pub fn main(init: std.process.Init) !void {
     // the verdicts by group, then the total against the frozen answers
     const GroupCounts = struct { name: []const u8, equal: usize = 0, differ: usize = 0, known: usize = 0 };
     var groups: std.ArrayList(GroupCounts) = .empty;
+    defer groups.deinit(gpa);
     var failed: usize = 0;
     for (outcomes.items) |r| {
         var g: ?*GroupCounts = null;

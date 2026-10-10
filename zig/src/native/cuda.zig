@@ -12,6 +12,14 @@ const Pool = budget.Pool;
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
 const registry = .{ nemotron.native, glm };
 
+/// Nemotron's prompt-cache copies. A file-level value so the store's pointer stays valid for the process.
+const nemotron_snaps: api.prompt_cache.Snapshots.VTable = .{
+    .bytes = nemotron.native.snap_bytes,
+    .save = nemotron.native.snap_save,
+    .restore = nemotron.native.snap_restore,
+    .drop = nemotron.native.snap_drop,
+};
+
 pub const backends: []const []const u8 = &.{"cuda"};
 pub const families: []const api.Family = blk: {
     var out: [registry.len]api.Family = undefined;
@@ -76,13 +84,6 @@ fn contextWindow(requested: ?i64, native: i64, default: i64) error{ Negative, No
     return r;
 }
 
-/// The kernel set: TENSORFOLD_CUDA_KERNELS, else share/tensorfold/cuda/sm<capability> beside the binary.
-fn kernelDir(a: Allocator, io: std.Io, capability: u32) ![]const u8 {
-    if (getenv("TENSORFOLD_CUDA_KERNELS")) |dir| return a.dupe(u8, dir);
-    const exe = try std.process.executableDirPathAlloc(io, a);
-    return std.fs.path.join(a, &.{ exe, "..", "share", "tensorfold", "cuda", try std.fmt.allocPrint(a, "sm{d}", .{capability}) });
-}
-
 /// The bytes of the checkpoint's safetensors files: what its weights need on the device, near enough to refuse early.
 fn weightBytes(io: std.Io, dir: []const u8) u64 {
     var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
@@ -117,8 +118,8 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
     };
     const free = available.available;
     const total = available.total;
-    const reserve = budget.reserveBytes(getenv("TENSORFOLD_MEMORY_RESERVE_GIB"), total) catch {
-        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_MEMORY_RESERVE_GIB={s}: a number of GiB from 2 to the memory's size", .{getenv("TENSORFOLD_MEMORY_RESERVE_GIB").?});
+    const reserve = budget.reserveBytes(getenv("TENSORFOLD_MEMORY_RESERVE_GIB"), total, unified) catch {
+        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_MEMORY_RESERVE_GIB={s}: a number of GiB from {d} to the memory's size", .{ getenv("TENSORFOLD_MEMORY_RESERVE_GIB").?, budget.floor(unified).least });
         return null;
     };
     const limit = budget.limitBytes(getenv("TENSORFOLD_CUDA_MEMORY_LIMIT_GB")) catch {
@@ -130,7 +131,7 @@ fn pool(a: Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8
 
 fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
     const u = cuda.usage(reset_peak);
-    return .{ .active = u.device, .cache = 0, .peak = u.peak };
+    return .{ .active = u.device, .cache = 0, .peak = u.peak, .pinned = u.host };
 }
 
 /// A lone driver returns false at completion or true when yield hands it to the lane core.
@@ -155,7 +156,7 @@ const Host = struct {
     host: api.LaneHost,
     startup: []u8 = &.{},
     lone: ?LoneRun = null, // the family's driver for a lone drafted stream, called with `family`
-    cache: ?api.prompt_cache.Store = null, // kept prompt states, for a family with snapshots (`snapSave`)
+    store: ?*api.prompt_cache.Store = null, // kept Nemotron states; null when the budget is 0
 
     fn close(p: *anyopaque) void {
         const h: *Host = @ptrCast(@alignCast(p));
@@ -163,7 +164,10 @@ const Host = struct {
         h.core.deinit();
         h.cfg.deinit(h.gpa);
         if (h.gpu) |g| g.ctx.makeCurrent() catch {};
-        if (h.cache) |*store| store.deinit(); // drops every kept state through the family, before it goes
+        if (h.store) |s| {
+            s.deinit();
+            h.gpa.destroy(s);
+        }
         h.release(h.family);
         if (h.gpu) |g| {
             g.ctx.deinit();
@@ -193,7 +197,7 @@ const Host = struct {
         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
         h.host.explain = explain;
-        if (h.cache) |*store| h.host.cache = store;
+        h.host.cache = h.store;
         if (h.lone != null) h.host.lone = .{ .ctx = h, .run = loneRun, .sampled = true };
         try h.host.start();
     }
@@ -274,6 +278,12 @@ const Host = struct {
                     return x.inner.vtable.alternatives.?(x.inner.ptr, s, out);
                 }
             }.f else null,
+            .first_row = if (v.first_row != null) struct {
+                fn f(p: *anyopaque, s: *lanes.Stream) anyerror!lanes.LogprobRow {
+                    const x = bind(p);
+                    return x.inner.vtable.first_row.?(x.inner.ptr, s);
+                }
+            }.f else null,
             .release = struct {
                 fn f(p: *anyopaque, s: *lanes.Stream) void {
                     const x = bind(p);
@@ -337,10 +347,13 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const capability = try g.ctx.capability();
     var name_buf: [256]u8 = undefined;
     const name = g.ctx.name(&name_buf) catch "GPU";
-    const kernels = try kernelDir(a, io, capability);
-    std.Io.Dir.cwd().access(io, try std.fs.path.join(a, &.{ kernels, "aot.json" }), .{}) catch {
-        problem.* = try std.fmt.allocPrint(a, "no CUDA kernel set for sm_{d} at {s}: set TENSORFOLD_CUDA_KERNELS to a folder from aot_pack.py", .{ capability, kernels });
-        return null;
+    const kernels: ?[]const u8 = switch (try cuda.aot.pick(a, io, getenv("TENSORFOLD_CUDA_KERNELS"), capability)) {
+        .native => null,
+        .captured => |dir| dir,
+        .missing => |dir| {
+            problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_CUDA_KERNELS={s} holds no aot.json: give a captured set's folder, or native for our own kernels", .{dir});
+            return null;
+        },
     };
     const before = try pool(a, io, &g.ctx, problem) orelse return null;
     // a family split over ranks loads its rank's share
@@ -350,27 +363,30 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         problem.* = try std.fmt.allocPrint(a, "the checkpoint's {d:.1} GiB of weights do not fit the {d:.1} GiB the CUDA memory budget grants ({d:.1} GiB free less a {d:.1} GiB reserve{s}); free device memory or adjust TENSORFOLD_MEMORY_RESERVE_GIB / TENSORFOLD_CUDA_MEMORY_LIMIT_GB", .{ toGib(weights), toGib(before.room(held0)), toGib(before.free), toGib(before.reserve), if (before.limit != null) ", under TENSORFOLD_CUDA_MEMORY_LIMIT_GB" else "" });
         return null;
     }
-    const loaded = F.open(gpa, io, &g.ctx, o.dir, kernels, .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments }) catch |e| {
-        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with kernels {s} ({s})", .{ o.dir, kernels, @errorName(e) });
+    // a family that runs only on a captured kernel set (GLM) refuses to start without one
+    const family_kernels = if (@hasDecl(F, "captured_kernels")) kernels orelse {
+        problem.* = try std.fmt.allocPrint(a, "{s} runs only on a captured CUDA kernel set: set TENSORFOLD_CUDA_KERNELS to a folder from aot_pack.py", .{o.dir});
+        return null;
+    } else kernels;
+    const loaded = F.open(gpa, io, &g.ctx, o.dir, family_kernels, .{ .context = @intCast(window), .drafts = o.drafts, .segments = segments }) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load {s} with {s} glue kernels ({s})", .{ o.dir, kernels orelse "its own", @errorName(e) });
         return null;
     };
     defer if (!opened) loaded.deinit(loaded.ctx);
     const model = cuda.usage(false).device - held0;
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
-    // a family that grows its streams after loading already holds the first one's caches in `model`; the prompt
-    // states it keeps (--prompt-cache-gib) come out of the same room
-    const grows = @hasDecl(F, "grow");
-    const cache_bytes: u64 = if (grows and @hasDecl(F, "snapSave")) @intFromFloat(@max(0, o.prompt_cache_gib orelse 2) * gib) else 0;
-    const room = (after.room(model) + if (grows) loaded.stream_bytes else 0) -| cache_bytes;
+    const room = after.room(model);
+    const free = loaded.free_streams;
     // a family that allocates its streams at load serves at most that many
     const asked = if (@hasDecl(F, "max_lanes")) @min(o.lanes, F.max_lanes) else o.lanes;
-    const admitted = budget.admit(room, loaded.stream_bytes, asked, o.lanes_fixed and asked == o.lanes) catch |e| {
+    const admitted = budget.admit(room, loaded.stream_bytes, free, asked, o.lanes_fixed and asked == o.lanes) catch |e| {
         problem.* = switch (e) {
             error.NoStream => try std.fmt.allocPrint(a, "the CUDA memory budget fits no stream: one at a {d}-token window takes {d:.2} GiB, and {d:.2} GiB is left after the model's {d:.2} GiB and the {d:.1} GiB reserve; lower --context, or free device memory", .{ window, toGib(loaded.stream_bytes), toGib(room), toGib(model), toGib(after.reserve) }),
-            error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, and the CUDA memory budget leaves {d:.2} GiB: serve --parallel {d}, or lower --context", .{ o.lanes, toGib(loaded.stream_bytes * o.lanes), window, toGib(room), room / loaded.stream_bytes }),
+            error.TooMany => try std.fmt.allocPrint(a, "--parallel {d} needs {d:.2} GiB for its streams at a {d}-token window, and the CUDA memory budget leaves {d:.2} GiB: serve --parallel {d}, or lower --context", .{ o.lanes, toGib(loaded.stream_bytes * (o.lanes -| free)), window, toGib(room), free + room / loaded.stream_bytes }),
         };
         return null;
     };
+    const grows = @hasDecl(F, "grow");
     const streams = if (grows and admitted > 1) F.grow(loaded.ctx, admitted) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot allocate {d} streams ({s})", .{ admitted, @errorName(e) });
         return null;
@@ -378,21 +394,41 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
-    h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}", .{
-        capability, device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+    const cache = budget.cacheBytes(o.prompt_cache_gib, room, loaded.stream_bytes * (streams -| free));
+    h.startup = try std.fmt.allocPrint(gpa, "CUDA sm_{d} device {d} ({s}{s}): model {d:.2} GiB; {d} stream{s} at once, {d:.2} GiB each at a {d}-token window, of {d:.1} GiB left after a {d:.1} GiB reserve; prompts in {d}-row chunks{s}{s}; {s}", .{
+        capability,                                                                                                   device, name, if (after.unified) ", memory shared with the host" else "", toGib(model), streams, if (streams == 1) "" else "s", toGib(loaded.stream_bytes), window, toGib(room), toGib(after.reserve), F.prompt_rows, if (segments > 1) try std.fmt.allocPrint(a, ", {d} staggered segments a call", .{segments}) else "",
+        if (cache > 0) try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(cache)}) else ", no prompt cache",
+        if (kernels) |dir| try std.fmt.allocPrint(a, "glue kernels captured at {s}", .{dir}) else "own glue kernels",
     });
     errdefer gpa.free(h.startup);
-    // a family with snapshots keeps prompt states (--prompt-cache-gib, default 2 GiB) and cuts its prompt passes at
-    // the server's chunk starts, so a later turn resumes where an earlier one kept; the others cut their own grid
-    // from position 0, as `tensorfold run` does: prefill_step 0
-    const kept = @hasDecl(F, "snapSave");
-    if (kept) {
-        const want: u64 = @intFromFloat(@max(0, o.prompt_cache_gib orelse 2) * gib);
-        const vt = comptime snapshotTable(F);
-        if (want > 0) h.cache = api.prompt_cache.Store.init(gpa, .{ .ptr = loaded.ctx, .vtable = &vt }, .{ .lookahead = F.cache_lookahead, .planned = F.cache_planned }, want);
+    // a family with its own snapshots (GLM) keeps states at the server's chunk starts on its prompt grid; Nemotron
+    // keeps them on its own zero-anchored grid and cuts its prompts itself, as `tensorfold run` does: prefill_step 0
+    const own_snaps = @hasDecl(F, "snapSave");
+    if (cache > 0) {
+        const pc = api.prompt_cache;
+        const store = try gpa.create(pc.Store);
+        if (own_snaps) {
+            const vt = comptime snapshotTable(F);
+            store.* = pc.Store.init(gpa, .{ .ptr = loaded.ctx, .vtable = &vt }, .{ .lookahead = F.cache_lookahead, .planned = F.cache_planned }, cache);
+        } else {
+            // states kept and resumed on the family's grid, where a cache-off pass cuts; the head reads one token on
+            store.* = pc.Store.init(gpa, .{ .ptr = loaded.target, .vtable = &nemotron_snaps }, .{ .lookahead = 1, .planned = true, .grid = F.prompt_rows }, cache);
+        }
+        h.store = store;
     }
-    errdefer if (h.cache) |*store| store.deinit();
-    try h.serve(io, loaded.facts, loaded.rows, .{ .lanes = streams, .context_window = @intCast(window), .startup = h.startup, .prefill_step = if (kept) F.prompt_rows else 0, .prefill_grid = if (kept and @hasDecl(F, "promptGrid")) F.promptGrid() else 0 }, .{ .ctx = loaded.ctx, .text = F.explain });
+    errdefer if (h.store) |store| {
+        store.deinit();
+        gpa.destroy(store);
+    };
+    try h.serve(io, loaded.facts, loaded.rows, .{
+        .lanes = streams,
+        .context_window = @intCast(window),
+        .startup = h.startup,
+        .prompt_cache = h.store != null,
+        .logprobs = loaded.backend.vtable.first_row != null,
+        .prefill_step = if (own_snaps and h.store != null) F.prompt_rows else 0,
+        .prefill_grid = if (own_snaps and h.store != null and @hasDecl(F, "promptGrid")) F.promptGrid() else 0,
+    }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };
 }

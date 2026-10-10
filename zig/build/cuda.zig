@@ -8,6 +8,9 @@ const Kernel = struct { name: []const u8, flags: []const []const u8, src: ?[]con
 /// The torch-op replacements' qualification flags (runs/006): no contraction, no flush to zero.
 const torch_ops = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false" };
 
+/// IEEE division and square root, no contraction or flush: host glue references match bit for bit.
+const glue = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false", "--prec-div=true", "--prec-sqrt=true" };
+
 const kernels = [_]Kernel{
     .{ .name = "gdn", .flags = &.{ "-O3", "--fmad=false" } }, // cuda/kernels/gdn.py, tensorfold_gdn_v2
     .{ .name = "probe", .flags = &.{"-O3"} },
@@ -30,6 +33,12 @@ const kernels = [_]Kernel{
     .{ .name = "glm_exl3d", .flags = &.{"-O3"} }, // glm5_next/cuda/exl3.cu [v1.8], tensorfold_glm_exl3_v20
     .{ .name = "glm_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: GLM torch glue (copies, token lists, greedy)
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
+    .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
+    .{ .name = "nemotron_route", .flags = glue },
+    .{ .name = "nemotron_mamba", .flags = glue },
+    .{ .name = "nemotron_attention", .flags = glue },
+    .{ .name = "nemotron_keyed", .flags = glue },
+    .{ .name = "fp8_lane", .flags = &.{"-O3"} }, // nvfp4/qmmf.cu's FP8G device code, tensorfold_nvfp4_v3
     .{ .name = "torch_argmax", .src = "torch_ops/argmax", .flags = torch_ops },
     .{ .name = "torch_topk", .src = "torch_ops/topk", .flags = torch_ops },
     .{ .name = "torch_pointwise", .src = "torch_ops/pointwise", .flags = torch_ops },
@@ -66,24 +75,27 @@ fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
     return cuda;
 }
 
-fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module } {
+fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
     core.addImport("tokenizer", tokenizer);
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const heat = b.createModule(.{ .root_source_file = b.path("zig/src/core/heat.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const nemotron = b.createModule(.{ .root_source_file = b.path("zig/src/families/nemotron/cuda.zig"), .target = target, .optimize = optimize, .link_libc = true });
     nemotron.addImport("cuda", cuda);
     nemotron.addImport("core", core);
     nemotron.addImport("lanes", lanes);
+    nemotron.addImport("heat", heat);
     nemotron.addImport("nemotron_draft_ids", draft_ids);
-    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer };
+    return .{ .core = core, .lanes = lanes, .nemotron = nemotron, .tokenizer = tokenizer, .heat = heat };
 }
 
 /// Linux targets: fatbins (-Dnvcc builds them, -Dfatbins embeds prebuilt ones), `tensorfold` and `tf-cuda-test`.
 pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, draft_ids: *std.Build.Module, build_options: *std.Build.Step.Options) void {
     const nvcc = b.option([]const u8, "nvcc", "nvcc (or a wrapper) that builds the CUDA kernel fatbins");
     const prebuilt = b.option([]const u8, "fatbins", "absolute directory of prebuilt <name>.fatbin files to embed");
-    const sms = b.option([]const u8, "sm", "SASS targets, comma separated (121; later 120,89)") orelse "121";
+    const sms = b.option([]const u8, "sm", "SASS targets, comma separated (default 121; 80, 86, 89, 120 and 121 build)") orelse "121";
+    const strip = b.option(bool, "strip", "No debug info in the CUDA executables: no build machine paths leave with them") orelse false;
     // the compiler's version text is an input of every fatbin, so a new nvcc rebuilds them all
     const version: ?std.Build.LazyPath = if (prebuilt == null and nvcc != null) blk: {
         const run = b.addSystemCommand(&.{ nvcc.?, "--version" });
@@ -102,17 +114,18 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     }
     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
-    const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
     cli.addImport("lanes", mods.lanes);
     cli.addImport("nemotron", mods.nemotron);
     b.installArtifact(b.addExecutable(.{ .name = "tensorfold", .root_module = cli }));
-    const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const runner = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     runner.addImport("cuda", cuda);
     runner.addImport("lanes", mods.lanes);
+    runner.addImport("nemotron", mods.nemotron);
     b.installArtifact(b.addExecutable(.{ .name = "tf-cuda-test", .root_module = runner }));
-    _ = nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true);
+    nativeServer(b, target, optimize, cuda, mods.lanes, mods.nemotron, mods.tokenizer, build_options, true).root_module.strip = strip;
     b.installArtifact(glmCheck(b, target, optimize, cuda, mods.core));
 }
 
@@ -153,12 +166,27 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
 }
 
 /// Host unit tests of the CUDA runtime, the backend-neutral core, the lane core and the CUDA family (no GPU), on any host.
-pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, step: *std.Build.Step) void {
+pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, all: *std.Build.Step) void {
+    const step = b.step("test-cuda-host", "The CUDA side's host unit tests alone (no GPU work)");
+    all.dependOn(step);
     const host = b.graph.host;
     const cuda = runtime(b, host, .debug, &.{});
     const mods = family(b, host, .debug, cuda, draft_ids);
-    const native = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron).engines;
-    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, native, native.import_table.get("glm").?, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    const native_modules = engines(b, host, .debug, cuda, mods.lanes, mods.nemotron);
+    const native = native_modules.engines;
+    // the HTTP server's unit tests (zig/src/server/root.zig), which the macOS build runs, on Linux hosts too
+    const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = host, .optimize = .debug, .link_libc = true });
+    const server_tests = b.createModule(.{
+        .root_source_file = b.path("zig/src/server/root.zig"),
+        .target = host,
+        .optimize = .debug,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "engine_api", .module = native_modules.api }, .{ .name = "tokenizer", .module = mods.tokenizer }, .{ .name = "template", .module = template } },
+    });
+    const server_test = b.addRunArtifact(b.addTest(.{ .root_module = server_tests }));
+    step.dependOn(&server_test.step);
+    b.step("test-server-cpu", "The HTTP server's unit tests (routes, templates, tool parsing) without a GPU").dependOn(&server_test.step);
+    for ([_]*std.Build.Module{ cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, native, native.import_table.get("glm").?, stagger(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = host, .optimize = .debug, .link_libc = true });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);

@@ -44,8 +44,12 @@ pub const LaneHost = struct {
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     memory: ?api.MemorySource = null, // the backend's memory counts; null: Engine.memory reports none
     explain: ?api.Explain = null, // the backend's words for a request it refuses; null: the error's name
+    learner: ?api.Learner = null, // the family's Sliding Weights learner; null: learn requests are refused
+    lessons: std.ArrayList(Lesson) = .empty, // learn requests waiting for an idle engine
+    lesson_open: bool = false, // the learner holds a begun job (engine thread only)
 
     const Mark = struct { at: i96, tokens: u64 };
+    const Lesson = struct { request: *const api.LearnRequest, sink: api.LearnSink };
     const window_ns: i96 = 2 * std.time.ns_per_s;
 
     const Job = struct {
@@ -69,7 +73,7 @@ pub const LaneHost = struct {
         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
             const job: *Job = @ptrCast(@alignCast(ptr));
             job.reported(); // before a keep can evict the entry the pass restored
-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks);
+            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks, &.{});
         }
 
         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
@@ -102,6 +106,9 @@ pub const LaneHost = struct {
         h.mutex.unlock(h.io);
         if (h.thread) |t| t.join();
         h.thread = null;
+        const closed: api.LearnEvent = .{ .done = .{ .message = "the engine closed" } };
+        for (h.lessons.items) |l| l.sink.event(l.sink.ctx, &closed);
+        h.lessons.deinit(h.gpa);
         h.queued.deinit(h.gpa);
         h.admitted.deinit(h.gpa);
         h.cancels.deinit(h.gpa);
@@ -110,7 +117,41 @@ pub const LaneHost = struct {
     }
 
     pub fn engine(h: *LaneHost) Engine {
-        return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = statusFn, .memory = memoryFn, .keepalive = keepaliveFn } };
+        return .{ .ctx = h, .vtable = &.{ .info = infoFn, .submit = submitFn, .cancel = cancelFn, .status = statusFn, .memory = memoryFn, .keepalive = keepaliveFn, .learn = learnFn } };
+    }
+
+    fn learnFn(ctx: *anyopaque, request: *const api.LearnRequest, sink: api.LearnSink) api.LearnError!void {
+        const h = self(ctx);
+        h.lock();
+        defer h.unlock();
+        if (h.closing) return error.Closed;
+        if (h.learner == null) return error.Unsupported;
+        h.lessons.append(h.gpa, .{ .request = request, .sink = sink }) catch return error.Busy;
+        h.wake.signal(h.io);
+    }
+
+    /// Learning runs only when nothing else waits: no stream, queued request or cancel (called under the lock).
+    fn learnable(h: *const LaneHost) bool {
+        const work = h.lesson_open or h.lessons.items.len > 0;
+        return h.learner != null and work and h.queued.items.len == 0 and h.admitted.items.len == 0 and h.cancels.items.len == 0;
+    }
+
+    /// One unit of learning: open the next lesson if none is open, then step it; moved weights drop every kept prompt.
+    fn learnStep(h: *LaneHost) void {
+        const learner = h.learner.?;
+        if (!h.lesson_open) {
+            h.lock();
+            const lesson = h.lessons.orderedRemove(0);
+            h.unlock();
+            learner.begin(learner.ctx, lesson.request, lesson.sink) catch |e| {
+                const failed: api.LearnEvent = .{ .done = .{ .message = h.words(e) } };
+                return lesson.sink.event(lesson.sink.ctx, &failed);
+            };
+            h.lesson_open = true;
+        }
+        const s = learner.step(learner.ctx);
+        if (s.changed) if (h.cache) |store| store.clear();
+        h.lesson_open = !s.done;
     }
 
     /// The family's queue as a keepalive target, when it set one.
@@ -195,10 +236,11 @@ pub const LaneHost = struct {
         return job.host.closing or std.mem.indexOfScalar(Id, job.host.cancels.items, job.id) != null;
     }
 
-    /// Hands a stream the tokens its rounds committed since the last delivery.
+    /// Hands a stream the tokens its rounds committed since the last delivery (their logprob rows first).
     fn send(h: *LaneHost, job: *Job) void {
         const emitted = job.stream.emitted();
         if (emitted.len > job.delivered) {
+            if (job.stream.logprobs != null) emit(job, .{ .logprobs = job.stream.rows.items[job.delivered..emitted.len] });
             emit(job, .{ .tokens = emitted[job.delivered..] });
             h.noteDecoded(emitted.len - job.delivered);
             job.delivered = emitted.len;
@@ -365,7 +407,7 @@ pub const LaneHost = struct {
         const r = job.request;
         var reuse: lanes.stream.Reuse = .{};
         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
-        if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
+        if (h.cache) |store| if (store.lookupRewind(h.gpa, r.prompt, r.history_len, r.rewind_len, r.shared_prefixes, r.chunks, &.{})) |l| {
             job.entry = l.entry;
             job.kept0 = store.counts.kept;
             job.marks = l.marks;
@@ -388,6 +430,7 @@ pub const LaneHost = struct {
             .think_budget = r.think_budget,
             .think_close = r.think_close,
             .think_end = if (r.think_end) |t| t else -1,
+            .logprobs = r.logprobs,
             .loop_guard = r.loop_guard,
             .chunks = r.chunks,
             .reuse = reuse,
@@ -413,11 +456,11 @@ pub const LaneHost = struct {
         emit(job, .{ .prefilled = job.stream.cached });
     }
 
-    /// An idle backend driver takes a lone drafted request, including sampling when supported.
+    /// An idle backend driver takes a lone drafted request, sampled when supported; never one with logprobs.
     fn loneFits(h: *LaneHost, job: *Job) bool {
         const r = job.request;
         const lone = h.lone orelse return false;
-        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null) return false;
+        if ((r.sampling != null and !lone.sampled) or !r.drafts or r.think_budget > 0 or r.loop_guard or r.call != null or r.structure != null or r.logprobs != null) return false;
         h.lock();
         defer h.unlock();
         return h.admitted.items.len == 1 and h.queued.items.len == 0 and h.cancels.items.len == 0 and h.core.activeCount() == 0;
@@ -513,11 +556,20 @@ pub const LaneHost = struct {
             if (h.closing) {
                 const left = h.queued.items.len + h.admitted.items.len;
                 h.unlock();
+                if (h.lesson_open) {
+                    h.learner.?.abort(h.learner.?.ctx);
+                    h.lesson_open = false;
+                }
                 if (left == 0) return;
                 h.closeAll();
                 continue;
             }
             if (h.core.activeCount() == 0) {
+                if (h.learnable()) {
+                    h.unlock();
+                    h.learnStep();
+                    continue;
+                }
                 if (h.cancels.items.len == 0 and !h.anyFilling() and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
                 h.unlock();
@@ -562,108 +614,6 @@ pub const LaneHost = struct {
     }
 };
 
-test "a lane host serves the core's own tokens, in order, and cancels between rounds" {
-    const gpa = std.testing.allocator;
-    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
-    defer cfg.deinit(gpa);
-    var target: lanes.fake.Fake = .{ .gpa = gpa };
-    defer target.deinit();
-    var clock: lanes.fake.FixedClock = .{};
-    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
-    defer core.deinit();
-    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
-    try host.start();
-    defer host.stop();
-    const Box = struct {
-        mutex: std.Io.Mutex = .init,
-        tokens: std.ArrayList(u32) = .empty,
-        done: ?Reason = null,
-        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
-            const b: *@This() = @ptrCast(@alignCast(ctx));
-            b.mutex.lockUncancelable(std.testing.io);
-            defer b.mutex.unlock(std.testing.io);
-            switch (e.*) {
-                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
-                .finished => |f| b.done = f.reason,
-                else => {},
-            }
-        }
-        fn wait(b: *@This()) Reason {
-            while (true) {
-                b.mutex.lockUncancelable(std.testing.io);
-                const d = b.done;
-                b.mutex.unlock(std.testing.io);
-                if (d) |r| return r;
-                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
-            }
-        }
-    };
-    const prompt = [_]u32{ 3, 1, 4, 1, 5, 9, 2, 6 };
-    var box: Box = .{};
-    defer box.tokens.deinit(gpa);
-    const request: Request = .{ .prompt = &prompt, .max_tokens = 24 };
-    const e = host.engine();
-    try e.submit(1, &request, .{ .ctx = &box, .event = Box.event });
-    try std.testing.expectEqual(Reason.length, box.wait());
-    var history: std.ArrayList(u32) = .empty;
-    defer history.deinit(gpa);
-    try history.appendSlice(gpa, &prompt);
-    for (box.tokens.items) |t| {
-        try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
-        try history.append(gpa, t);
-    }
-    try std.testing.expectEqual(@as(usize, 24), box.tokens.items.len);
-    var gone: Box = .{};
-    defer gone.tokens.deinit(gpa);
-    const long: Request = .{ .prompt = &prompt, .max_tokens = 100000 };
-    try e.submit(2, &long, .{ .ctx = &gone, .event = Box.event });
-    e.cancel(2);
-    try std.testing.expectEqual(Reason.cancelled, gone.wait());
-
-    const CancelPrefill = struct {
-        engine: Engine,
-        id: Id,
-        at: usize,
-
-        fn call(ctx: *anyopaque, _: *lanes.Stream, chunk: usize) void {
-            const c: *@This() = @ptrCast(@alignCast(ctx));
-            if (chunk == c.at) c.engine.cancel(c.id);
-        }
-    };
-    const chunked_prompt = [_]u32{ 8, 6, 7, 5, 3, 0, 9, 2, 1, 4 };
-    var chunked: Box = .{};
-    defer chunked.tokens.deinit(gpa);
-    var prefill_cancel = CancelPrefill{ .engine = e, .id = 3, .at = 2 };
-    target.prefill_chunks = 10;
-    target.prefill_count = 0;
-    target.prefill_hook = CancelPrefill.call;
-    target.prefill_hook_ctx = &prefill_cancel;
-    const chunked_request: Request = .{ .prompt = &chunked_prompt, .max_tokens = 1 };
-    try e.submit(3, &chunked_request, .{ .ctx = &chunked, .event = Box.event });
-    try std.testing.expectEqual(Reason.cancelled, chunked.wait());
-    try std.testing.expect(target.prefill_count <= 3);
-    try std.testing.expectEqual(@as(usize, 0), target.lanes.count()); // its lane released
-
-    // the lone driver's prompt pass (gpu_round.run starts with Backend.opening), cancelled the same way
-    const Lone = struct {
-        be: lanes.backend.Backend,
-
-        fn run(ctx: *anyopaque, s: *lanes.Stream, _: api.LoneHooks) anyerror!bool {
-            const l: *@This() = @ptrCast(@alignCast(ctx));
-            _ = try l.be.opening(gpa, s);
-            return error.NotCancelled;
-        }
-    };
-    var lone: Box = .{};
-    defer lone.tokens.deinit(gpa);
-    var lone_driver = Lone{ .be = target.backend() };
-    host.lone = .{ .ctx = &lone_driver, .run = Lone.run };
-    prefill_cancel.id = 4;
-    target.prefill_count = 0;
-    try e.submit(4, &chunked_request, .{ .ctx = &lone, .event = Box.event });
-    try std.testing.expectEqual(Reason.cancelled, lone.wait());
-    try std.testing.expect(target.prefill_count <= 3);
-    try std.testing.expectEqual(@as(usize, 0), target.lanes.count());
+test {
+    _ = @import("lane_host_test.zig");
 }
-
-test { _ = @import("lane_host_test.zig"); }

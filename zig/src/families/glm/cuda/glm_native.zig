@@ -39,6 +39,8 @@ pub const promptGrid = fwd.promptGrid;
 /// Sequences' caches allocated at load (`grow`), a stream each.
 pub const max_lanes: u32 = fwd.Engine.max_lanes;
 pub const default_port: u16 = 29660;
+/// GLM runs on a captured Triton kernel set only (TENSORFOLD_CUDA_KERNELS), never on the built-in glue kernels.
+pub const captured_kernels = true;
 
 pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
 
@@ -49,6 +51,8 @@ pub const Loaded = struct {
     facts: lanes.Model,
     rows: u32,
     stream_bytes: usize,
+    /// Streams that allocate nothing: the first takes the engine's own sequence (grow adds the rest).
+    free_streams: u32 = 1,
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,

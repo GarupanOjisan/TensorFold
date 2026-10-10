@@ -16,6 +16,7 @@ const request_log = @import("request_log.zig");
 const sse = @import("sse.zig");
 const http_body = @import("http_body.zig");
 const routes = @import("routes.zig");
+const warm = @import("warm.zig");
 const Server = @import("server.zig").Server;
 const Conn = @import("http_conn.zig").Conn;
 const Value = json.Value;
@@ -118,7 +119,9 @@ const Plan = struct {
 fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const body = try fields.parseNumbers(cx, raw);
     try fields.validateModalities(cx, body);
-    try fields.probabilityOptions(cx, body);
+    // rows need each token's exact bytes: a tokenizer whose decoding depends on context (null) can't give them
+    const exact_bytes = json.truthyField(body, "logprobs") and srv.info.logprobs and (srv.text.tokenBytes(cx.a, 0) catch return error.OutOfMemory) != null;
+    const logprobs = try fields.probabilityOptions(cx, body, exact_bytes);
     if (srv.config.request_log) |path| request_log.append(cx.a, path, body);
     var input: chat.Input = .{ .fields = undefined };
     if (is_chat) {
@@ -147,6 +150,16 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     if (thinking.effort) |e| try sampling.put(cx.a, "reasoning_effort", .{ .string = e });
     if (thinking.enable) |on| try sampling.put(cx.a, "enable_thinking", .{ .bool = on });
     input.fields = .{ .object = sampling };
+    const streamed = if (body.get("stream")) |s| s.truthy() else false;
+    if (logprobs != null) {
+        // 0.6.6's set: the rows describe the plain reply text, so nothing may reshape or split it
+        if (!is_chat) return cx.refuse("logprobs are supported on /v1/chat/completions only");
+        var structured = false;
+        for (grammar.fields) |k| structured = structured or json.truthyField(body, k);
+        if (streamed or input.tools.len > 0 or json.truthyField(body, "stop") or structured or json.truthyField(body, "thinking_budget"))
+            return cx.refuse("logprobs support nonstreamed chat without tools, stop strings, structured output or a thinking budget");
+    }
+    input.logprobs = logprobs;
     var policy: tool_stream.Policy = .{};
     if (body.field("parallel_tool_calls")) |p| {
         if (p != .bool) return cx.refuse("parallel_tool_calls must be a boolean");
@@ -155,7 +168,7 @@ fn plan(srv: *Server, cx: *Cx, is_chat: bool, raw: Value) errors.Refused!Plan {
     const options = body.get("stream_options");
     return .{
         .input = input,
-        .stream = if (body.get("stream")) |s| s.truthy() else false,
+        .stream = streamed,
         .separate_usage = options != null and options.? == .object and json.truthyField(options.?, "include_usage"),
         .policy = policy,
         .named = replyModel(srv, body),
@@ -347,6 +360,17 @@ const Run = struct {
         const o = json.newObject(a) catch return;
         r.wholeBody(o, &reply, calls) catch return;
         r.out.vt.reply(r.out.ctx, 200, .{ .object = o });
+        r.warmNext(&reply, calls);
+    }
+
+    /// The next turn's prompt prefilled in the background, from the reply as its client got it (warm.zig).
+    fn warmNext(r: *Run, reply: *const chat.Reply, calls: ?[]Value) void {
+        if (!r.is_chat) return;
+        const message = json.newObject(r.a) catch return;
+        message.put(r.a, "role", .{ .string = "assistant" }) catch return;
+        message.put(r.a, "content", if (calls != null) .null else .{ .string = reply.content }) catch return;
+        if (calls) |c| message.put(r.a, "tool_calls", .{ .array = c }) catch return;
+        warm.reply(r.srv, r.plan.input, .{ .object = message }, reply.thinking, reply.effort);
     }
 
     fn wholeBody(r: *Run, o: *json.Object, reply: *const chat.Reply, calls: ?[]Value) Allocator.Error!void {
@@ -365,6 +389,7 @@ const Run = struct {
             if (calls) |c| try message.put(a, "tool_calls", .{ .array = c });
             try choice.put(a, "message", .{ .object = message });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
+            if (reply.logprobs) |lp| try choice.put(a, "logprobs", lp);
         } else {
             try choice.put(a, "text", .{ .string = reply.content });
             try choice.put(a, "finish_reason", .{ .string = reply.finish_reason });
@@ -472,8 +497,9 @@ const Run = struct {
             r.out.vt.event(r.out.ctx, null) catch {};
             return;
         };
+        var calls: ?[]Value = null;
         if (tools) {
-            const calls = r.attachCalls(&reply) catch return;
+            calls = r.attachCalls(&reply) catch return;
             const tail = r.plan.policy.flush();
             if (tail.len > 0) {
                 r.prose() catch return;
@@ -503,6 +529,7 @@ const Run = struct {
             r.emit(u) catch return;
         }
         r.out.vt.event(r.out.ctx, null) catch {};
+        r.warmNext(&reply, calls);
     }
 };
 

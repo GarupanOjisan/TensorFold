@@ -30,6 +30,8 @@ pub const Input = struct {
     fields: Value,
     /// The reply's id as its client gets it, so the server's lines for the request carry the same id.
     id: []const u8 = "",
+    /// ``logprobs: true`` with this many ``top_logprobs``; null: not asked.
+    logprobs: ?u8 = null,
 };
 
 /// A streamed piece: content text (a string) or a delta object (reasoning or tool calls).
@@ -50,6 +52,11 @@ pub const Reply = struct {
     reasoning_tokens: usize,
     runtime: Value,
     speculative: Value,
+    /// The template switches the prompt was rendered with (the next turn's prefill renders with them too).
+    thinking: bool = false,
+    effort: ?[]const u8 = null,
+    /// ``choices[0].logprobs`` (``{"content": [...]}``) for a request that asked; null otherwise.
+    logprobs: ?Value = null,
 };
 
 pub const Failure = error{ Refused, Cancelled, Failed, OutOfMemory };
@@ -62,6 +69,7 @@ const Mailbox = struct {
     cond: std.Io.Condition = .init,
     tokens: std.ArrayList(u32) = .empty,
     chunks: std.ArrayList(usize) = .empty, // where each round's tokens end
+    rows: std.ArrayList(api.LogprobRow) = .empty, // one a token of `tokens`, for requests with logprobs
     cached: ?u32 = null,
     prefilled_ns: ?i96 = null,
     finished: bool = false,
@@ -81,6 +89,7 @@ const Mailbox = struct {
                 m.cached = cached;
                 m.prefilled_ns = std.Io.Clock.awake.now(m.io).toNanoseconds();
             },
+            .logprobs => |r| m.rows.appendSlice(m.gpa, r) catch {},
             .tokens => |t| {
                 m.tokens.appendSlice(m.gpa, t) catch {};
                 m.chunks.append(m.gpa, m.tokens.items.len) catch {};
@@ -101,6 +110,7 @@ const Mailbox = struct {
     fn deinit(m: *Mailbox) void {
         m.tokens.deinit(m.gpa);
         m.chunks.deinit(m.gpa);
+        m.rows.deinit(m.gpa);
         m.gpa.free(m.widths);
         m.gpa.free(m.raised);
         m.gpa.free(m.telemetry);
@@ -177,9 +187,10 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
         .drafts = drafts,
         .background = background,
         .history_len = @intCast(rendered.history_len),
+        .rewind_len = @intCast(rendered.rewind_len),
         .shared_prefixes = shared.items,
-        // a cut just before the conversation's own text: fresh sessions resume their whole harness
-        .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk, srv.chunks.grid),
+        .chunks = try chunk_plan.withCut(a, try srv.chunks.starts(a, rendered.ids), if (srv.chunks.step > 0) @intCast(@max(system_len, 1) - 1) else 0, rendered.ids.len, srv.chunks.min_chunk, srv.chunks.grid), // a cut before the conversation's own text: fresh sessions resume their whole harness
+        .decode_spans = try prompt_mod.replySpans(srv, cx, rendered.ids), // from the tokens alone, for every request: cached states are keyed by tokens
         .tools_json = if (input.tools.len > 0) try json.stringify(a, .{ .array = @constCast(input.tools) }, .{ .ascii = false }) else "",
     };
     try srv.checkFeatures(cx, f, input.tools.len > 0, thinking, rendered.ids, input.tools, &request);
@@ -193,6 +204,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
             request.think_end = srv.think_close_end;
         }
     }
+    if (input.logprobs) |count| request.logprobs = try @import("logprobs.zig").admit(srv, cx, thinking, request.think_budget, count);
     return .{ .input = input, .request = request, .prompt_len = rendered.ids.len, .received = received, .thinking = thinking, .effort = effort, .sampled = sampling != null, .drafts = drafts, .stops = stops_opt, .preparing = preparing };
 }
 
@@ -229,11 +241,12 @@ pub fn generate(srv: *Server, cx: *Cx, prepared: Prepared, sink: ?Sink, gone: an
     srv.engine.submit(id, &request, .{ .ctx = &box, .event = Mailbox.onEvent }) catch |e| return switch (e) {
         error.Busy => cx.fail(.capacity, "the engine is busy; retry shortly", .{}),
         error.Closed => cx.fail(.other, "the scheduler is closed", .{}),
+        error.InvalidSpans => cx.fail(.request, "the prompt span layout is invalid", .{}),
     };
     release(srv, preparing); // a background request waits only while a foreground one prepares
     preparing = false;
-    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools };
-    defer srv.noteRequest(prepared.prompt_len, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
+    var gen: Generation = .{ .srv = srv, .a = a, .box = &box, .id = id, .reply_id = input.id, .sink = sink, .thinking = thinking or reply_text.isChannel(srv.markers), .stops = .{ .strings = stops_opt.strings }, .ignore_eos = stops_opt.ignore_eos, .max_tokens = request.max_tokens, .tools = input.tools, .logprobs = request.logprobs != null };
+    defer srv.noteRequest(prepared.prompt_len, box.cached orelse 0, gen.collected.items.len, box.stats.drafted, box.stats.accepted, box.stats.rounds, received, gen.first_ns, gen.last_ns, box.stats.prefill_seconds);
     errdefer if (!gen.engine_done) gen.cancel(); // the engine writes to the mailbox until it says finished
     const result: Failure!Reply = blk: {
         if (sink != null and input.tools.len > 0) gen.calls = tool_stream.Streamer.init(a, input.tools) catch |e| break :blk e;
@@ -321,6 +334,7 @@ const Generation = struct {
     engine_done: bool = false,
     consumed: usize = 0,
     chunk_index: usize = 0,
+    logprobs: bool = false, // the request asked for logprobs: the mailbox holds a row a token
 
     fn eos(g: *const Generation, t: u32) bool {
         return !g.ignore_eos and std.mem.indexOfScalar(u32, g.srv.eos, t) != null;
@@ -385,7 +399,7 @@ const Generation = struct {
             answer = split.answer;
         }
         const shown = if (g.calls != null) try reply_text.hideInto(g.a, &g.hidden, answer, false) else answer;
-        const vis = reply_text.streamingVisible(shown);
+        const vis = reply_text.heldBack(reply_text.streamingVisible(shown), g.calls != null);
         const copied = @intFromPtr(vis.ptr) >= @intFromPtr(g.hidden.items.ptr) and @intFromPtr(vis.ptr) <= @intFromPtr(g.hidden.items.ptr) + g.hidden.items.len;
         const delta = g.streamed.after(vis, !copied);
         if (delta.len > 0) {
@@ -486,7 +500,7 @@ const Generation = struct {
             const thought = g.streamed_reasoning.text.items;
             if (reasoning) |r| if (std.mem.startsWith(u8, r, thought) and r.len > thought.len)
                 try g.emit(sink, try deltaOf(a, "reasoning_content", r[thought.len..]));
-            const shown = if (g.calls != null) try reply_text.hideToolCalls(a, content, true) else content;
+            const shown = if (g.calls != null) try reply_text.finishedProse(a, content) else content;
             const sent = g.streamed.text.items;
             if (std.mem.startsWith(u8, shown, sent) and shown.len > sent.len) try g.emit(sink, .{ .string = shown[sent.len..] });
             if (g.calls) |*c| if (close.len > 0) {
@@ -516,7 +530,7 @@ const Generation = struct {
         try runtime.put(a, "time_to_first_token", if (g.first_ns) |t| .{ .float = seconds(t - received) } else .null);
         try runtime.put(a, "sampling", .{ .string = if (exact) "exact" else "greedy" });
         try runtime.put(a, "drafts", .{ .bool = drafts });
-        const sha = tokenSha(g.collected.items);
+        const sha = @import("tokens.zig").tokenSha(g.collected.items);
         try runtime.put(a, "token_sha", .{ .string = try a.dupe(u8, &sha) });
         try runtime.put(a, "min_rows", try json.intValue(a, m.stats.min_rows));
         if (m.stats.loop_period) |period| {
@@ -545,6 +559,9 @@ const Generation = struct {
             .reasoning_tokens = reply_text.reasoningCount(g.collected.items, think_end),
             .runtime = .{ .object = runtime },
             .speculative = .{ .object = spec },
+            .thinking = thinking,
+            .effort = effort,
+            .logprobs = if (g.logprobs) try @import("logprobs.zig").value(g.srv, cx, a, g.thinking, content_tokens, m.rows.items) else null,
         };
         if (std.mem.eql(u8, reason, "length") and thinking and reply_text.pyStrip(content).len == 0)
             log.line("warning: a reply reached max_tokens while still thinking, so its content is empty and its text is all in reasoning_content; raise max_tokens, or send chat_template_kwargs {{\"enable_thinking\": false}} (server: --no-thinking)", .{});
@@ -580,20 +597,4 @@ pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!
     const o = try json.newObject(a);
     try o.put(a, key, .{ .string = text });
     return .{ .object = o };
-}
-
-/// The reply's token ids hashed: drafted and ``"draft": false`` replies must match.
-pub fn tokenSha(tokens: []const u32) [12]u8 {
-    var h = std.crypto.hash.sha2.Sha256.init(.{});
-    var buf: [16]u8 = undefined;
-    for (tokens, 0..) |t, i| {
-        if (i > 0) h.update(",");
-        h.update(std.fmt.bufPrint(&buf, "{d}", .{t}) catch unreachable);
-    }
-    var d: [32]u8 = undefined;
-    h.final(&d);
-    var out: [12]u8 = undefined;
-    const hex = std.fmt.bytesToHex(d[0..6].*, .lower);
-    @memcpy(&out, &hex);
-    return out;
 }
