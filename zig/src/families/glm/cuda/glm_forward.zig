@@ -661,7 +661,7 @@ pub const Engine = struct {
     pub const max_lanes = 8;
     /// The most candidates a rank gives a sampled row (top_k + exact_sampling.MARGIN).
     pub const max_k = 1024;
-    pub const prefill_rows = 2048; // geometry.PREFILL_ROWS
+    pub const prefill_rows = 4096; // geometry.PREFILL_ROWS
 
     /// Buffers for windows of max_rows rows, prompt chunks of prefill_rows and the MTP head, and one sequence's state.
     pub fn init(w: *const Weights, d: *const cuda.Driver, s: cuda.Stream, t: tri.Tri, k: *const kern.Kernels, comm: Comm, capacity: usize, long_context: bool, taps: ?[5]u32) !Engine {

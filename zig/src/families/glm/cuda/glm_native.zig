@@ -132,6 +132,7 @@ const Glm = struct {
     policy: dflash.Policy = .{},
     nucleus_first: usize = 1024, // TF_GLM_NUCLEUS: the candidates a rank sends first for a top_k-off draw (sampling.NUCLEUS)
     nucleus_union: bool = true, // TENSORFOLD_NUCLEUS_UNION
+    busy_rows: usize = fwd.Engine.prefill_rows / 2, // TF_GLM_BUSY_ROWS: a filling round's rows while other lanes decode
     copy_cfg: copy.Settings,
     lanes: [max_lanes]Lane = undefined,
     n_lanes: usize = 1,
@@ -173,6 +174,14 @@ const Glm = struct {
             return ln;
         };
         return error.NoLane;
+    }
+
+    /// Whether a lane other than `filling` holds a stream.
+    fn othersDecode(g: *const Glm, filling: []const usize) bool {
+        for (g.lanes[0..g.n_lanes], 0..) |*ln, li| {
+            if (ln.stream != null and std.mem.indexOfScalar(usize, filling, li) == null) return true;
+        }
+        return false;
     }
 
     fn laneOf(g: *Glm, s: *const lanes.Stream) ?*Lane {
@@ -354,7 +363,7 @@ const Glm = struct {
         var next: usize = 0; // the planned chunk starts: a resumed pass cuts where a fresh one does
         while (at < ids.len) {
             if (s.isCancelled()) return error.Cancelled;
-            const rows = nextCut(s, at, &next);
+            const rows = nextCut(s, at, &next, fwd.Engine.prefill_rows);
             try g.n.chunk(at, rows);
             try ln.live.appendSlice(g.gpa, ids[at..][0..rows]);
             at += rows;
@@ -364,11 +373,11 @@ const Glm = struct {
         try g.firstOf(s, ln);
     }
 
-    /// The rows of the prompt chunk from `at`: to its next planned start (`next` walks s.chunks) or its end, at most a chunk.
-    fn nextCut(s: *const lanes.Stream, at: usize, next: *usize) usize {
+    /// The rows of the prompt chunk from `at`: to its next planned start (`next` walks s.chunks) or its end, at most `cap`.
+    fn nextCut(s: *const lanes.Stream, at: usize, next: *usize, cap: usize) usize {
         while (next.* < s.chunks.len and s.chunks[next.*] <= at) next.* += 1;
         const end: usize = if (next.* < s.chunks.len) s.chunks[next.*] else s.prompt().len;
-        return @min(end - at, fwd.Engine.prefill_rows);
+        return @min(end - at, cap);
     }
 
     /// The first token after the bound lane's prompt.
@@ -435,7 +444,9 @@ const Glm = struct {
     /// prompt, its next cut exactly as its own pass takes it (nextCut), the fewest rows left first, while the prompt
     /// buffers hold them (each piece at a multiple of 64 rows), in one chunk (Node.chunkLanes; one piece: Node.chunk); a
     /// prompt that does not fit waits. The streams whose prompt is in (their first token drawn) or that were cancelled
-    /// move to the front; their count is returned. With the MTP head each prompt fills whole, alone.
+    /// move to the front; their count is returned. With the MTP head each prompt fills whole, alone. While a lane outside
+    /// `streams` holds a stream (it decodes between these calls) a round takes at most busy_rows rows, so its pause stays
+    /// short; otherwise the whole prompt buffers.
     fn prefillManyFn(p: *anyopaque, streams: []*lanes.Stream) anyerror!usize {
         const g = of(p);
         if (g.drafts and !g.dflash) {
@@ -475,6 +486,7 @@ const Glm = struct {
             }
         };
         std.sort.insertion(usize, order[0..m], Left{ .s = streams, .l = &g.lanes, .ln = lane[0..streams.len] }, Left.less);
+        const cap = if (g.othersDecode(lane[0..streams.len])) g.busy_rows else fwd.Engine.prefill_rows;
         var items: [max_lanes][3]usize = undefined;
         var picked: [max_lanes]usize = undefined;
         var n: usize = 0;
@@ -482,9 +494,9 @@ const Glm = struct {
         for (order[0..m]) |i| {
             const ln = &g.lanes[lane[i]];
             var nx = ln.fill_next;
-            const rows = nextCut(streams[i], ln.fill_at, &nx);
+            const rows = nextCut(streams[i], ln.fill_at, &nx, cap);
             const lo = std.mem.alignForward(usize, used, 64);
-            if (lo + rows > fwd.Engine.prefill_rows) continue;
+            if (lo + rows > cap) continue;
             ln.fill_next = nx;
             items[n] = .{ lane[i], ln.fill_at, rows };
             picked[n] = i;
@@ -1083,6 +1095,14 @@ fn envCount(name: [*:0]const u8, default: usize) usize {
     return if (n >= 1 and n <= fwd.Engine.max_nucleus) n else default;
 }
 
+/// TF_GLM_BUSY_ROWS: a multiple of 64 up to Engine.prefill_rows (that one turns the cap off), else half of it.
+fn envBusyRows() usize {
+    const half = fwd.Engine.prefill_rows / 2;
+    const v = std.c.getenv("TF_GLM_BUSY_ROWS") orelse return half;
+    const n = std.fmt.parseInt(usize, std.mem.span(v), 10) catch return half;
+    return if (n >= 64 and n <= fwd.Engine.prefill_rows and n % 64 == 0) n else half;
+}
+
 fn envPort() u16 {
     const v = std.c.getenv("TF_GLM_PORT") orelse return default_port;
     return std.fmt.parseInt(u16, std.mem.span(v), 10) catch default_port;
@@ -1094,7 +1114,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     errdefer n.deinit();
     const g = try gpa.create(Glm);
     errdefer gpa.destroy(g);
-    g.* = .{ .nucleus_union = !envOff("TENSORFOLD_NUCLEUS_UNION"), .nucleus_first = envCount("TF_GLM_NUCLEUS", 1024), .gpa = gpa, .n = n, .drafts = o.drafts and (n.w.mtp != null or n.dflash != null), .dflash = n.dflash != null, .policy = try dflash.Policy.fromEnv(), .copy_cfg = try copy.Settings.fromEnv(n.e.wide_graph) };
+    g.* = .{ .nucleus_union = !envOff("TENSORFOLD_NUCLEUS_UNION"), .nucleus_first = envCount("TF_GLM_NUCLEUS", 1024), .busy_rows = envBusyRows(), .gpa = gpa, .n = n, .drafts = o.drafts and (n.w.mtp != null or n.dflash != null), .dflash = n.dflash != null, .policy = try dflash.Policy.fromEnv(), .copy_cfg = try copy.Settings.fromEnv(n.e.wide_graph) };
     for (&g.lanes) |*ln| ln.* = .{ .copy = .{ .cfg = g.copy_cfg } };
     if (g.dflash and g.drafts) std.log.info("GLM drafts: DFlash2 (block {d}, up to {d} drafts a round, stop at {d:.2} of the noisy chain, beta {d:.1}); the MTP head is not loaded", .{ n.w.draft.?.block, g.policy.most, g.policy.confidence, g.policy.beta });
     if (g.drafts and g.copy_cfg.on) std.log.info("GLM copy drafts: up to {d} a round, match {d} tokens, {d} inside the reply, windows of 9 to 15 rows padded to {d}", .{ g.copy_cfg.most, g.copy_cfg.match, g.copy_cfg.reply_match, g.copy_cfg.pad });
