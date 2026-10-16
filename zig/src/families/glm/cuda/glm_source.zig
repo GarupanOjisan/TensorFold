@@ -1,5 +1,4 @@
-//! Checkpoint bytes read with O_DIRECT through io_uring, then copied to the GPU: Nemotron's cuda_source.zig with its
-//! own upload in place of Nemotron's kernel set.
+//! Checkpoint bytes read with O_DIRECT through io_uring and copied to the GPU (Nemotron's cuda_source.zig, own upload).
 
 const std = @import("std");
 const linux = std.os.linux;

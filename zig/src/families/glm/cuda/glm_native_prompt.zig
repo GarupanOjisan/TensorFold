@@ -74,8 +74,7 @@ pub fn admitPrompt(g: *Glm, s: *lanes.Stream) !usize {
     const ids = s.prompt();
     if (ids.len == 0 or ids.len + s.max_new + max_rows > e.st.capacity) return error.PromptTooLong;
     s.cached = 0;
-    // a kept state of this prompt's prefix resumes in a lane whose rows hold it, or in a free lane they are
-    // copied to; without one the pass starts at 0 in the free lane used longest ago
+    // where a kept state of this prompt's prefix resumes, else a fresh pass; notes/glm_native.md#admit
     const kept: ?*const Snap = if (s.reuse.saved) |saved| @ptrCast(@alignCast(saved)) else null;
     var views: [max_lanes]View = undefined;
     for (g.lanes[0..g.n_lanes], views[0..g.n_lanes]) |*l, *v| v.* = .{
@@ -118,14 +117,7 @@ pub fn admitPrompt(g: *Glm, s: *lanes.Stream) !usize {
     return at;
 }
 
-/// One prompt-chunk round over `streams` (Backend.prefill_many; v1.10 multi_prefill with FILL's alternation, the host
-/// running a decode round between calls): a stream not on a lane yet is admitted (admitPrompt); then one piece a
-/// prompt, its next cut exactly as its own pass takes it (nextCut), the fewest rows left first, while the prompt
-/// buffers hold them (each piece at a multiple of 64 rows), in one chunk (Node.chunkLanes; one piece: Node.chunk); a
-/// prompt that does not fit waits. The streams whose prompt is in (their first token drawn) or that were cancelled
-/// move to the front; their count is returned. With the MTP head each prompt fills whole, alone. While a lane outside
-/// `streams` holds a stream (it decodes between these calls) a round takes at most busy_rows rows, so its pause stays
-/// short; otherwise the whole prompt buffers.
+/// One prompt-chunk round over `streams` (Backend.prefill_many); notes/glm_native.md#prefill-many
 pub fn prefillManyFn(p: *anyopaque, streams: []*lanes.Stream) anyerror!usize {
     const g = of(p);
     if (g.drafts and !g.dflash) {

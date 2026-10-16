@@ -26,12 +26,10 @@ const pickLane = native.pickLane;
 const liveHolds = native.liveHolds;
 const candidateCount = glm_sample.candidateCount;
 
-/// v1.10 verify.timing_tokens(vocab, 32): numpy default_rng(1234).choice(150000, 32, replace=False), the distinct ids its
-/// startup timings run (one token repeated, or a run of neighbours, routes to a few experts and times light).
+/// v1.10 verify.timing_tokens(vocab, 32): the distinct ids its start-up timings run; notes/glm_native.md#timing-ids
 pub const timing_ids = [_]u32{ 47774, 77768, 138462, 36260, 39247, 129560, 129538, 101230, 47857, 119011, 91475, 96893, 143736, 144598, 39544, 20813, 80395, 148162, 119363, 146872, 117894, 57018, 98981, 17711, 66146, 83336, 25699, 134558, 15731, 143261, 38205, 146475 };
 
-/// Shared windows of 2 to max_rows rows over lanes 0 and 1 (half each), timed on whatever their caches hold (both
-/// ranks run them; no commit, so the lanes stay where they were). Serving overwrites the rows they wrote.
+/// Times shared windows of 2 to max_rows rows over lanes 0 and 1; notes/glm_native.md#measure-shared
 pub fn measureShared(g: *Glm) !void {
     const ids = timing_ids;
     var out: [max_rows]u32 = undefined;
@@ -51,9 +49,7 @@ pub fn measureShared(g: *Glm) !void {
     try g.compareOne(8);
 }
 
-/// v1.10 multi._compare_paths: one lane's window of `rows` rows on the one-stream graphs (verify) and on the shared ones
-/// (verifyShared over a single segment), the same tokens, timed by GPU events (fastest of 5, after a warm-up), each
-/// with its greedy pick; logged only.
+/// v1.10 multi._compare_paths: one lane's window on both graph sets, logged; notes/glm_native.md#compare-one
 pub fn compareOne(g: *Glm, rows: usize) !void {
     const e = &g.n.e;
     try g.n.bind(0);
@@ -82,9 +78,7 @@ pub fn compareOne(g: *Glm, rows: usize) !void {
     std.log.info("GLM one lane, {d} rows (v1.10 _compare_paths; forward and greedy pick, GPU events): one-stream graphs {d:.1} ms, shared (segmented) {d:.1} ms", .{ rows, solo, shared });
 }
 
-/// TF_GLM_SHARED_FLAT (default on; 0 off): every shared width costs as 2 rows, so the core keeps every draft in a
-/// shared round, as v1.10 does (its multi-stream rounds take each stream's drafts with no depth policy): +1.7% at
-/// four streams, the same replies.
+/// TF_GLM_SHARED_FLAT (default on; 0 off): every shared width costs as 2 rows; notes/glm_native.md#shared-flat
 pub fn flatten(g: *Glm) void {
     if (std.c.getenv("TF_GLM_SHARED_FLAT")) |v| if (std.mem.eql(u8, std.mem.span(v), "0")) return;
     for (g.shared[1..g.sharedRows()]) |*c| c.ms = g.shared[1].ms;
@@ -125,8 +119,7 @@ pub fn measure(g: *Glm, io: std.Io) !void {
     };
     g.mtp_ms = if (g.dflash) 0.1 else @max(0.1, (three - one) / 2);
     if (g.dflash) {
-        // DFlash2's pieces (Engine._calibrate's "block" and "taps8"): the block pass with its candidates read back, the
-        // chain on the host, and a context update of the last window's first 8 rows
+        // DFlash2's pieces (Engine._calibrate's "block" and "taps8"); notes/glm_native.md#dflash-timing
         var blk: f64 = std.math.inf(f64);
         var chn: f64 = std.math.inf(f64);
         var tap: f64 = std.math.inf(f64);

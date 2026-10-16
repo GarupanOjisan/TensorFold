@@ -27,13 +27,11 @@ const liveHolds = native.liveHolds;
 const now = glm_timing.now;
 const ms = glm_timing.ms;
 
-/// Each row's draw over the vocabulary (Node.whole_vocabulary): top_k off: sampling.nucleus_rows, its candidates a rank first
-/// (`nucleus_first`, then `nucleus_wider`: TENSORFOLD_NUCLEUS_UNION, v1.10 patch 0034's rule), whole shards when a row's nucleus
-/// runs past them; else choose_rows over every token (a top_k past the candidates a rank gives). Row r keyed at position0 + r.
+/// Each row's draw over the whole vocabulary (Node.whole_vocabulary); notes/glm_native.md#choose-whole
 pub fn chooseWhole(g: *Glm, sm: lanes.sampling.Sampling, which: Node.Rows, rows: usize, position0: u64, out: []u32) !void {
     if (sm.top_k == 0) {
         const stages = [_]usize{ g.nucleus_first, nucleus_wider };
-        // without the union rule (stock v1.8) a row whose nucleus is not inside one rank's candidates goes straight to the shards
+        // without the union rule (stock v1.8) a row not covered by one rank's candidates goes to the shards
         for (stages[0..if (g.nucleus_union) 2 else 1]) |count| {
             const words = try g.n.nucleus(which, rows, sm.temperature, count);
             if (try g.drawNucleus(sm, rows, position0, words, count, out)) return;
@@ -62,10 +60,7 @@ pub fn chooseWhole(g: *Glm, sm: lanes.sampling.Sampling, which: Node.Rows, rows:
     }
 }
 
-/// sampling._draw over the ranks' `count` best candidates (`words`, Engine.nucleusGather's layout): false when some row's nucleus
-/// is not inside them (a wider gather or the whole shards decide it). With the union rule (TENSORFOLD_NUCLEUS_UNION, default
-/// on) a row is covered when the merged walk to the cumulative mass ceil(top_p total) stops above every rank's last candidate:
-/// no token left out can be in the nucleus, so the draw is the whole vocabulary's.
+/// sampling._draw over the ranks' `count` best candidates, false if not covered; notes/glm_native.md#draw-nucleus
 pub fn drawNucleus(g: *Glm, sm: lanes.sampling.Sampling, rows: usize, position0: u64, words: []const u64, count: usize, out: []u32) !bool {
     const per_row = 3 * count + 2;
     const cut = sm.top_p > 0.0 and sm.top_p < 1.0;
@@ -189,9 +184,7 @@ pub const NucEnt = struct {
     }
 };
 
-/// A stream's candidates a rank (top_k + MARGIN); 0 for greedy. top_k 0 (the full-vocabulary nucleus) is not ported.
-/// k candidates a rank (top_k + exact_sampling.MARGIN), 0 for greedy, or the whole vocabulary: top_k off
-/// (sampling.nucleus_rows) or past the candidates a rank gives.
+/// A stream's candidates a rank (top_k + MARGIN), 0, or the whole vocabulary; notes/glm_native.md#candidate-count
 pub fn candidateCount(s: *const lanes.Stream) !usize {
     const sm = s.sampling orelse return 0;
     if (sm.temperature <= 0) return 0;
@@ -200,13 +193,7 @@ pub fn candidateCount(s: *const lanes.Stream) !usize {
     return k;
 }
 
-/// sampling.nucleus_rows for one row over the whole vocabulary `row` (bf16 bits by token id). Python reads each
-/// rank's top 1,024 first and every whole shard when a row's nucleus runs past them, so its draw is this one: tokens
-/// in (value desc, id asc) order with v = logit / T in float64, mass floor(exp(v - top) 2^40); keep a token while the
-/// mass before it is below ceil(top_p total) (top_p in (0, 1)), and while v >= top + ln(min_p); the Gumbel race
-/// v - ln(-ln u(seed, position, id)) among them, the first maximum in that order. Both cuts keep a prefix of the
-/// order, so the kept set is found by selection (no sort). Tokens 42 or more below the top are left out: their mass
-/// is 0 (below 2^-40) and their race score stays under the top token's (the race's noise spans 41.1).
+/// sampling.nucleus_rows for one row over the whole vocabulary (bf16 bits by id); notes/glm_native.md#nucleus
 pub fn nucleus(gpa: std.mem.Allocator, row: []const u16, position: u64, s: lanes.sampling.Sampling) !u32 {
     const t = @max(s.temperature, 1e-6);
     var top = -std.math.inf(f64);
@@ -254,8 +241,7 @@ pub fn raceScore(c: Tok, position: u64, seed: u64) f64 {
     return c.v - libm_log(-libm_log(lanes.sampling.uniform(seed, position, c.id)));
 }
 
-/// Reorders `a` so its kept tokens come first and returns how many: a token is kept when the mass of the tokens
-/// before it in (value desc, id asc) order is below `need` (quickselect on that order, expected linear).
+/// Moves the tokens kept under mass `need` to the front, returns how many; notes/glm_native.md#prefix-within
 pub fn prefixWithin(a: []Tok, need: u64) usize {
     var lo: usize = 0;
     var hi: usize = a.len;

@@ -1,8 +1,4 @@
-//! GLM-5.3-Flash on two CUDA ranks behind the native family interface (native/cuda.zig): this process is rank 0
-//! and serves; rank 1 runs `tf-glm follow` on the other Spark. A stream a lane (each lane one sequence's caches and
-//! DFlash2 context), the lanes' rounds taking turns; an idle lane keeps its caches' rows, so a later turn of its
-//! conversation resumes there. Windows of up to 16 rows, MTP drafts or DFlash2's (TF_GLM_DRAFTER_DIR; glm_dflash.zig)
-//! and v1.8's prompt-lookup (copy) drafts (glm_copy.zig). TF_GLM_PORT (default 29660) is the port rank 0 listens on for rank 1.
+//! GLM-5.3-Flash's rank 0 of two CUDA ranks behind native/cuda.zig's family interface; notes/glm_native.md#overview
 const std = @import("std");
 const cuda = @import("cuda");
 const lanes = @import("lanes");
@@ -21,7 +17,7 @@ pub const max_rows = fwd.Engine.max_rows;
 /// Drafts the MTP head chains at most: the 8-row window of earlier builds (the rows past it serve copies).
 const head_drafts = 7;
 pub const dflash_max = 15;
-/// sampling.WIDER: the candidates a rank sends when a row's nucleus runs past the first (union rule); then the whole shards.
+/// sampling.WIDER: a rank's candidates when a row's nucleus runs past the first ones (union rule), then whole shards.
 pub const nucleus_wider = fwd.Engine.max_nucleus;
 
 pub const model_type = "glm5_next";
@@ -56,8 +52,7 @@ pub const Loaded = struct {
     target: *anyopaque, // the prompt cache keeps this family's states (snap_*): the same as ctx
 };
 
-/// Whether this port reads `dir`: an EXL3 checkpoint (config.json's quantization_config names quant_method "exl3");
-/// other glm5_next checkpoints (NVIDIA's NVFP4) go to families/glm/cuda_native.zig.
+/// Whether `dir` is an EXL3 checkpoint (quant_method "exl3"), the kind this port reads; notes/glm_native.md#reads
 pub fn reads(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
@@ -72,8 +67,7 @@ pub fn reads(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
     return m == .string and std.ascii.eqlIgnoreCase(m.string, "exl3");
 }
 
-/// This rank's share of the checkpoint (the routed experts and most projections halve, the embedding and the
-/// replicated layers do not): what the memory admission compares with the budget before loading.
+/// This rank's share of the checkpoint, for the memory admission; notes/glm_native.md#weight-share
 pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64) u64 {
     _ = a;
     _ = io;
@@ -87,8 +81,7 @@ fn weightBytes(total: u64) u64 {
 
 pub const ring = 64;
 
-/// glm_copy.zig as the lane core's proposer (lanes/proposer.zig): one a lane, reset by each prompt pass there. The core asks twice a round with the same context (the head's depth rule, then the next plan): the second
-/// answer is the first.
+/// glm_copy.zig as the lane core's proposer (lanes/proposer.zig), one a lane; notes/glm_native.md#copy-rule
 const CopyRule = struct {
     cfg: copy.Settings,
     prompt: usize = 0,
@@ -136,8 +129,7 @@ pub const Lane = struct {
     held_n: usize = 0,
     pending_rows: usize = 0, // the last verify's rows, until a keep or a draft commits them
     window: [max_rows]u32 = undefined, // the last verify's rows, the tokens a commit makes live
-    /// The tokens whose attention-cache rows are committed, from position 0: a kept state resumes only while the
-    /// rows below its position still hold its tokens (the caches are positional; only KDA's state is copied).
+    /// The tokens whose attention-cache rows are committed, from position 0; notes/glm_native.md#live-tokens
     live: std.ArrayList(u32) = .empty,
     first: u64 = 0, // the handle of the stream's first token
     used: u64 = 0, // when a stream last took the lane (least recently used goes first)
@@ -161,8 +153,7 @@ pub const Glm = struct {
     drawn: [ring]u32 = undefined,
     next: u64 = 0,
     costs: [max_rows]lanes.config.Cost = undefined,
-    /// Shared windows' ms by total rows: the lone windows' until `grow` times them over two lanes (the facts point here,
-    /// and the lane core reads them after `grow`).
+    /// Shared windows' ms by total rows (the facts point here); notes/glm_native.md#shared-costs
     shared: [fwd.Engine.shared_rows]lanes.config.Cost = undefined,
     io: std.Io = undefined,
     mtp_ms: f64 = 1.0,
@@ -265,8 +256,7 @@ pub const Glm = struct {
             .window_costs = &g.costs,
             .shared_costs = &g.shared,
             .mtp_step_ms = if (g.dflash) 0.1 else g.mtp_ms, // DFlash2's block pass costs the same at any depth
-            // several live streams share a forward (verifyShared), up to a window's rows; the lanes `grow` allocated cap
-            // how many streams are live, so one lane never shares
+            // several live streams share a forward (verifyShared); notes/glm_native.md#hidden-rows
             .hidden_rows = true,
             .draft_streams = true, // a shared round's drafts in one call: DFlash2's block passes share one (draftDflashLanes)
             .streams_exact = true,
@@ -325,8 +315,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = n.laneBytes(), .ctx = g, .target = g, .deinit = release };
 }
 
-/// Lanes up to `total` on both ranks, allocated now (native/cuda.zig calls this once, after the memory admission
-/// and before serving): how many there are.
+/// Allocates lanes up to `total` on both ranks and returns how many there are; notes/glm_native.md#grow
 pub fn grow(p: *anyopaque, total: u32) !u32 {
     const g = Glm.of(p);
     g.n_lanes = try g.n.grow(total);
@@ -337,8 +326,7 @@ pub fn grow(p: *anyopaque, total: u32) !u32 {
     return @intCast(g.n_lanes);
 }
 
-/// A lane's state for the pick: whether a stream uses it, when one last took it, and whether its rows hold the
-/// request's kept state.
+/// A lane's state for the pick: whether it is busy, when it was last taken, whether its rows hold the kept state.
 pub const View = struct { busy: bool, used: u64, holds: bool };
 /// The lane a prompt pass runs in, and the lane whose rows it copies first (null: none).
 const Pick = struct { lane: usize, from: ?usize = null };
@@ -366,8 +354,7 @@ test "lanes: a free holder first, else the oldest free lane, copying from a busy
     try t.expectEqual(Pick{ .lane = 0 }, pickLane(&.{.{ .busy = false, .used = 0, .holds = false }}).?); // one lane: as before
 }
 
-/// Whether lane `ln`'s attention caches' rows still hold kept state `sn`'s tokens: the `at` before it and the one
-/// its MTP rows read past it.
+/// Whether lane `ln`'s attention caches still hold kept state `sn`'s `at + 1` tokens; notes/glm_native.md#live-tokens
 pub fn liveHolds(ln: *const Lane, sn: *const Snap) bool {
     return ln.live.items.len > sn.at and std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ln.live.items[0 .. sn.at + 1])) == sn.key;
 }
@@ -383,12 +370,11 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
 }
 
 // -- kept prompt states (prompt_cache.Snapshots, wired by native/cuda.zig) ------------------------------------------
-/// A kept state: KDA's state after `at` prompt tokens on both ranks under `id`, and the hash of the `at + 1` tokens
-/// the attention caches must still hold for it (liveHolds).
+
+/// A kept state: KDA's state after `at` prompt tokens under `id`, and its tokens' hash; notes/glm_native.md#snapshots
 pub const Snap = struct { id: u32, at: u32, key: u64 };
 
-/// prompt_cache.Rules: the MTP head's row at-1 reads token at; prompt kernels change bits with a chunk's rows, so
-/// states are kept and resumed at the request's planned chunk starts only.
+/// prompt_cache.Rules: one lookahead token, states kept at planned chunk starts only; notes/glm_native.md#cache-rules
 pub const cache_lookahead: u32 = 1;
 pub const cache_planned = true;
 

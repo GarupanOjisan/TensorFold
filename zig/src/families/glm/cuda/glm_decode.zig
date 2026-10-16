@@ -1,5 +1,4 @@
-//! Prefill, serial decoding and MTP-drafted decoding over the forward (v0.6.6 glm5_next/cuda/decode.py): both ranks
-//! run the same calls, and every choice comes from the gathered greedy picks, so they agree without messages.
+//! Prefill, serial and drafted decoding over the forward (v0.6.6 decode.py), the same calls on both ranks.
 const std = @import("std");
 const fwd = @import("glm_forward.zig");
 const copy = @import("glm_copy.zig");
@@ -8,8 +7,7 @@ const Engine = fwd.Engine;
 
 const bf = 2;
 
-/// decode.prefill without a resume point: the prompt in chunks, each also absorbed by the MTP head (its rows from
-/// the chunk's second token on), then the first token. The last row's hidden stays in e.st.last_hidden for the first draft.
+/// decode.prefill without a resume point: the prompt's caches, then the first token; notes/glm_decode.md#prefill
 pub fn prefill(e: *Engine, prompt: []const u32, use_mtp: bool, drafter: ?*dflash.Drafter) !u32 {
     try prefillCaches(e, prompt, use_mtp, drafter);
     var first: [1]u32 = undefined;
@@ -28,8 +26,7 @@ pub fn prefillCaches(e: *Engine, prompt: []const u32, use_mtp: bool, drafter: ?*
     }
 }
 
-/// One prompt chunk, `rows` rows of `prompt` from `start` (the state's position): its caches, the MTP head's rows
-/// (each with its following token, the next chunk's first included), its last row's logits and hidden kept.
+/// One prompt chunk, `rows` rows of `prompt` from `start` (the state's position); notes/glm_decode.md#prefill-chunk
 pub fn prefillChunk(e: *Engine, prompt: []const u32, start: usize, rows: usize, use_mtp: bool, drafter: ?*dflash.Drafter) !void {
     const d: usize = e.w.cfg.hidden;
     if (rows == 0 or rows > Engine.prefill_rows or start + rows > prompt.len) return error.BadChunk;
@@ -67,8 +64,7 @@ fn isEos(e: *const Engine, t: u32) bool {
     return false;
 }
 
-/// decode.absorb: kept rows (hidden, next token) into the MTP cache, after trimming the last round's draft entries;
-/// the last row's draft logits in mbuf.logits.
+/// decode.absorb: kept rows into the MTP cache, after trimming the last round's drafts; notes/glm_decode.md#absorb
 fn absorb(e: *Engine, hidden: u64, next: []const u32) !void {
     const d: usize = e.w.cfg.hidden;
     if (e.st.mtp_drafted > 0) {
@@ -98,8 +94,7 @@ pub fn draft(e: *Engine, hidden: u64, next: []const u32, count: usize, out: []u3
     }
 }
 
-/// What a drafted decode did: rounds, drafts kept, the rounds that verified copied drafts (and their drafts and kept ones),
-/// and how many windows ran at each row count.
+/// What a drafted decode did: rounds, drafts kept, copy rounds and windows by row count; notes/glm_decode.md#run
 pub const Run = struct {
     rounds: usize = 0,
     accepted: usize = 0,
@@ -109,10 +104,7 @@ pub const Run = struct {
     windows: [Engine.max_rows + 1]usize = @splat(0),
 };
 
-/// decode.mtp_decode, greedy, `depth` drafts a round: verify the pending token and the drafts, keep through the
-/// first mismatch, draft again from the kept rows. With `copies` (v1.8's COPY_DRAFTS, glm_copy.zig; `prompt` is the
-/// prompt the pending token follows) a round whose context repeats earlier text verifies the copied continuation
-/// instead, and the MTP head only absorbs the kept rows.
+/// decode.mtp_decode, greedy, `depth` drafts a round, or copies with `copies`; notes/glm_decode.md#mtp-decode
 pub fn mtpDecode(e: *Engine, pending: u32, count: usize, depth: usize, stop_eos: bool, out: *std.ArrayList(u32), gpa: std.mem.Allocator, copies: ?copy.Settings, prompt: []const u32) !Run {
     if (depth + 1 > Engine.max_rows) return error.DepthPastWindow;
     try out.append(gpa, pending);
@@ -184,9 +176,7 @@ pub fn mtpDecode(e: *Engine, pending: u32, count: usize, depth: usize, stop_eos:
     return run;
 }
 
-/// decode.dflash_decode, greedy: each round verifies the pending token and either a copied continuation (v1.8's COPY_DRAFTS, when
-/// `copies` is given and the context repeats) or DFlash2's chain (`policy`), keeps through the first mismatch, then adds the kept
-/// rows' taps to DFlash2's context. `prompt` is the prompt the pending token follows.
+/// decode.dflash_decode, greedy: copies or DFlash2's chain each round; notes/glm_decode.md#dflash-decode
 pub fn dflashDecode(e: *Engine, drafter: *dflash.Drafter, pending: u32, count: usize, stop_eos: bool, out: *std.ArrayList(u32), gpa: std.mem.Allocator, copies: ?copy.Settings, prompt: []const u32, policy: dflash.Policy) !Run {
     try out.append(gpa, pending);
     var run: Run = .{};

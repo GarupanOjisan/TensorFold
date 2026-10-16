@@ -1,7 +1,4 @@
-//! The device tables of a shared verify window's DSA rows (v1.10 segments.SegRows, without index rings): several lanes'
-//! rows back to back, each lane's per-token caches in its extent of the layer arenas (fwd.Pool, extents at multiples of
-//! fwd.extent tokens; its index keys and gates in the same extent, so ibase = base). The segmented kernels
-//! (latent.seg_*, sparse.seg_*) read these tables; one CUDA graph a window size then covers every mix of lanes.
+//! The device tables of a shared verify window's DSA rows (v1.10 segments.SegRows); notes/glm_segments.md#overview
 const std = @import("std");
 
 /// segments.MAX_SEGS: lanes a window holds at most.
@@ -15,12 +12,10 @@ pub const extent = 2048;
 /// SegRows.NO_RING: the kernels' ring size without rings (positions stay below it).
 pub const no_ring: i32 = std.math.maxInt(i32);
 
-/// One lane's rows of a window: its extent's first arena row (`base`, a multiple of `extent`), the position of its first
-/// row, and its rows.
+/// One lane's rows of a window: its extent's first arena row, its first row's position, and its row count.
 pub const Span = struct { base: usize, pos: usize, rows: usize };
 
-/// SegRows' one int32 table: per row pos, base, seg, sparse, ibase (max_rows each), then per segment seg_start, seg_rows,
-/// seg_pbase, seg_pools (max_segs each).
+/// SegRows' one int32 table: five per-row columns, then four per-segment ones; notes/glm_segments.md#table
 pub const SegRows = struct {
     pub const words = 5 * max_rows + 4 * max_segs;
     pub const pos_at = 0;
@@ -33,8 +28,7 @@ pub const SegRows = struct {
     pub const pbase_at = 5 * max_rows + 2 * max_segs;
     pub const pools_at = 5 * max_rows + 3 * max_segs;
 
-    /// SegRows.fill: the host table of `spans` in window order into `t`; `sparse_from` the first position that attends
-    /// sparsely (null: no index, every row dense). Returns the window's rows.
+    /// SegRows.fill: the host table of `spans` into `t`, returning the window's rows; notes/glm_segments.md#fill
     pub fn fill(spans: []const Span, sparse_from: ?usize, t: *[words]i32) !usize {
         if (spans.len < 1 or spans.len > max_segs) return error.BadSegmentCount;
         var total: usize = 0;

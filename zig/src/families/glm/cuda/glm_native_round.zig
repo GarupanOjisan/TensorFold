@@ -99,8 +99,7 @@ pub fn verifyShared(g: *Glm, windows: []const be.Window, out: []be.Verified) !vo
     }
     const n = windows.len;
     try g.n.verifyShared(segs[0..n], ids[0..total]);
-    // one pick over every row when the lanes draw alike (greedy, or the same top-k), as v1.10's packed all-gather; a
-    // whole-vocabulary draw (top_k off) reads the bound lane's rows, so it picks lane by lane
+    // one pick over every row when the lanes draw alike, else lane by lane; notes/glm_native.md#shared-pick
     var one = n > 1 and ks[0] != Node.whole_vocabulary;
     for (ks[1..n]) |k| one = one and k == ks[0];
     var all: [fwd.Engine.shared_rows]u32 = undefined;
@@ -134,10 +133,7 @@ pub fn keepFn(p: *anyopaque, windows: []const be.Window, paths: []const []const 
     }
 }
 
-/// DFlash2 in place of the MTP head (v1.8's dflash_decode): the kept rows' taps join its context, then, unless a copy is
-/// ahead (v1.8 takes the copy first and runs no block), its block pass and chain (its own stop rule, not `r.depth`, up to
-/// TF_GLM_DFLASH_POLICY's most) give the next window's drafts as host tokens (`treeFn`). The first round after a prompt
-/// is taken as `r.depth` held drafts (the core does not ask for the chain there), filled up with the pending token.
+/// DFlash2's drafts for one lane in place of the MTP head (v1.8's dflash_decode); notes/glm_native.md#dflash-draft
 pub fn draftDflash(g: *Glm, ln: *Lane, r: be.DraftRequest) !void {
     const t = try g.dflashTaps(ln, r, true, true);
     g.dflashChain(ln, r, t, if (t.want > 0) &g.n.dflash.? else null);
@@ -146,8 +142,7 @@ pub fn draftDflash(g: *Glm, ln: *Lane, r: be.DraftRequest) !void {
 /// A DFlash2 turn's first half: the kept rows committed and joined to the lane's context, and how many drafts it wants.
 pub const Turn = struct { want: usize, pending: u32, kept: usize = 0 };
 
-/// The bound lane's DFlash2 turn up to its chain: commit, the context update and, with `block`, its own block pass.
-/// `turn` false: no DFlash2 turn here (the caller adds the kept rows to the context, Node.dflashTapsLanes).
+/// The bound lane's DFlash2 turn up to its chain (commit, context update, block pass); notes/glm_native.md#dflash-taps
 pub fn dflashTaps(g: *Glm, ln: *Lane, r: be.DraftRequest, block: bool, turn: bool) !Turn {
     const s = r.stream;
     var from: node.From = .prompt;
@@ -186,8 +181,7 @@ pub fn dflashChain(g: *Glm, ln: *Lane, r: be.DraftRequest, t: Turn, dft: ?*const
     ln.held_n = held;
 }
 
-/// A shared round's DFlash2 turns (facts.draft_streams): each lane's context update on its own, then the block passes of
-/// every lane that wants drafts in one (Node.dflashBlocks; one lane alone takes its own captured pass), then the chains.
+/// A shared round's DFlash2 turns (facts.draft_streams) with batched passes; notes/glm_native.md#dflash-lanes
 pub fn draftDflashLanes(g: *Glm, requests: []const be.DraftRequest) !void {
     if (requests.len > max_lanes) return error.TooManyWindows;
     var turns: [max_lanes]Turn = undefined;
@@ -196,7 +190,7 @@ pub fn draftDflashLanes(g: *Glm, requests: []const be.DraftRequest) !void {
     var ls: [max_lanes]usize = undefined;
     var pend: [max_lanes]u32 = undefined;
     var m: usize = 0;
-    // every lane's kept rows in one commit (Node.keepLanes), before the turns: each turn's own commit then finds nothing
+    // every lane's kept rows in one commit (Node.keepLanes), so each turn's own commit then finds nothing
     var keeps: [max_lanes]fwd.Engine.Keep = undefined;
     var nk: usize = 0;
     for (requests) |r| {
