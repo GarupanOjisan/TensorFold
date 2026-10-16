@@ -82,6 +82,7 @@ pub const Engine = struct {
     pub const opened = open.opened;
     pub const fills = open.fills;
     pub const fillStream = open.fillStream;
+    pub const fillStreams = open.fillStreams;
 
     /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
     pub fn adopt(e: *Engine, s: *Stream) !void {

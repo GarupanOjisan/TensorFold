@@ -6,6 +6,7 @@ const lanes = @import("lanes");
 const nemotron = @import("nemotron");
 const lfm2 = @import("lfm2.zig");
 const glm = @import("glm_cuda");
+const glm_exl3 = @import("glm"); // the EXL3 port (families/glm/cuda/glm_native.zig)
 const Allocator = std.mem.Allocator;
 const budget = @import("cuda_memory.zig");
 const lane_backend = @import("cuda_bound.zig");
@@ -15,7 +16,7 @@ const cuda_disk = @import("cuda_disk.zig");
 const vision_offer = @import("cuda_vision_offer.zig");
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, nemotron.omni, glm.native };
+const registry = .{ nemotron.native, nemotron.omni, glm_exl3, glm.native };
 
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
@@ -211,8 +212,10 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = why;
         return null;
     }
+    // families of one model_type in registry order: the first whose `reads` (if declared) takes the checkpoint
     inline for (registry) |F| {
-        if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
+        if (std.mem.eql(u8, o.model_type, F.model_type) and (!@hasDecl(F, "reads") or F.reads(gpa, io, o.dir)))
+            return openWith(F, a, gpa, io, o, problem);
     }
     if (std.mem.eql(u8, o.model_type, lfm2.family.model_type)) {
         if (refusals.lfm2(o)) |why| {
@@ -379,7 +382,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         low = try std.fmt.allocPrint(a, " on rank {d}, the smallest room of the ranks", .{pr.rank});
     };
     const free = loaded.free_streams;
-    const streams = budget.admit(room, loaded.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
+    // a family that allocates its streams at load serves at most that many
+    const asked = if (@hasDecl(F, "max_lanes")) @min(o.lanes, F.max_lanes) else o.lanes;
+    const admitted = budget.admit(room, loaded.stream_bytes, free, asked, o.lanes_fixed and asked == o.lanes) catch |e| {
         problem.* = switch (e) {
             error.NoStream => try std.fmt.allocPrint(a, no_stream, .{
                 window,
@@ -400,6 +405,11 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         };
         return null;
     };
+    const grows = @hasDecl(F, "grow");
+    const streams = if (grows and admitted > 1) F.grow(loaded.ctx, admitted) catch |e| {
+        problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot allocate {d} streams ({s})", .{ admitted, @errorName(e) });
+        return null;
+    } else admitted;
     const h = try gpa.create(Host);
     errdefer gpa.destroy(h);
     h.* = .{ .gpa = gpa, .gpu = g, .family = loaded.ctx, .release = loaded.deinit, .inner = loaded.backend, .vtable = undefined, .cfg = undefined, .clock = undefined, .core = undefined, .host = undefined, .lone = loaded.lone };
@@ -416,7 +426,9 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         // rules and budget from the family's snap_* declarations (cuda_snaps.zig)
         const image: ?*const pc.rows.Image = if (F == nemotron.native) &cuda_disk.image else null; // its disk rows
         const copies: pc.Snapshots = .{ .ptr = loaded.target, .vtable = &snaps.Snaps(F, image).vtable };
-        store.* = pc.Store.init(gpa, copies, snaps.cacheRules(F), try snaps.cacheBudget(F, loaded.target, cache));
+        // a family whose prompts the server cuts (prefill_step below) keeps states at those chunk starts only
+        const rules: pc.Rules = if (@hasDecl(F, "cache_planned")) .{ .lookahead = F.cache_lookahead, .planned = F.cache_planned } else snaps.cacheRules(F);
+        store.* = pc.Store.init(gpa, copies, rules, try snaps.cacheBudget(F, loaded.target, cache));
         h.store = store;
         if (F == nemotron.native and o.learn_conversations) {
             if (o.learn) |root| try cuda_disk.attach(a, io, &g.ctx, o, root, kernels, loaded, store);
@@ -453,7 +465,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         std.log.info("recording each stream's rows under {s}/{s}", .{ dir, r.recorder.name });
     }
     errdefer if (h.recording) |r| r.free(gpa);
-    // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0
+    // the family cuts its prompts from 0 (prefill_step 0), or the server cuts a `promptGrid` family's on its grid
+    const server_cuts = @hasDecl(F, "promptGrid") and h.store != null;
     try h.serve(io, loaded.facts, loaded.rows, .{
         .lanes = streams,
         .context_window = @intCast(window),
@@ -464,6 +477,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         .prompt_logprobs = loaded.backend.vtable.prompt_rows,
         .structures = loaded.backend.vtable.first_masked != null,
         .vision = if (@hasField(@TypeOf(loaded), "vision")) vision_offer.offer(loaded.vision) else null,
+        .prefill_step = if (server_cuts) F.prompt_rows else 0,
+        .prefill_grid = if (server_cuts) F.promptGrid() else 0,
     }, .{ .ctx = loaded.ctx, .text = F.explain });
     opened = true;
     return .{ .engine = h.host.engine(), .close = Host.close, .ctx = h };

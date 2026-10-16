@@ -116,6 +116,12 @@ pub fn vtable(comptime H: type, v: be.Backend.VTable) be.Backend.VTable {
                 x.inner.vtable.release(x.inner.ptr, s);
             }
         }.f,
+        .prefill_many = if (v.prefill_many != null) struct {
+            fn f(p: *anyopaque, streams: []*lanes.Stream) anyerror!usize {
+                const x = H.bind(p);
+                return x.inner.vtable.prefill_many.?(x.inner.ptr, streams);
+            }
+        }.f else null,
     };
 }
 

@@ -13,6 +13,7 @@ pub const Plan = struct {
     openers: []const u32 = &.{}, // the special tokens that open any message
     assistant: []const u32 = &.{}, // the tokens that open an assistant message
     min_chunk: u32 = 256,
+    grid: u32 = 0, // starts are rounded down to multiples of it (0: as found)
 
     /// Resume points: every assistant message's start, and the second message's.
     fn points(p: Plan, a: Allocator, ids: []const u32) ![]u32 {
@@ -47,6 +48,7 @@ pub const Plan = struct {
             while (i < found.len and found[i] < last + p.min_chunk) i += 1; // too close to the last start: merged into its chunk
             var next = last + p.step;
             if (i < found.len and found[i] < next) next = found[i];
+            if (p.grid > 1 and next / p.grid * p.grid > last) next = next / p.grid * p.grid;
             if (next >= ids.len) return out.items;
             try out.append(a, @intCast(next));
             last = next;
@@ -55,7 +57,8 @@ pub const Plan = struct {
 };
 
 /// `starts` with `cut` too: a state kept just before a conversation's own text reads only shared tokens.
-pub fn withCut(a: Allocator, starts: []const u32, cut: u32, len: usize, min_chunk: u32) ![]const u32 {
+pub fn withCut(a: Allocator, starts: []const u32, cut_at: u32, len: usize, min_chunk: u32, grid: u32) ![]const u32 {
+    const cut = if (grid > 1) cut_at / grid * grid else cut_at;
     if (cut == 0 or cut >= len) return starts;
     var out: std.ArrayList(u32) = .empty;
     for (starts) |s| if (@max(s, cut) - @min(s, cut) >= min_chunk) try out.append(a, s); // starts too near the cut go
@@ -148,10 +151,10 @@ test "a harness cut joins the starts, nearer ones go" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try std.testing.expectEqualSlices(u32, &.{ 4096, 4648 }, try withCut(a, &.{ 4096, 4650 }, 4648, 4680, 256));
-    try std.testing.expectEqualSlices(u32, &.{ 4096, 4650 }, try withCut(a, &.{ 4096, 4650 }, 0, 4680, 256));
-    try std.testing.expectEqualSlices(u32, &.{ 4096, 4650 }, try withCut(a, &.{ 4096, 4650 }, 4680, 4680, 256));
-    try std.testing.expectEqualSlices(u32, &.{ 600, 4096 }, try withCut(a, &.{4096}, 600, 4680, 256));
+    try std.testing.expectEqualSlices(u32, &.{ 4096, 4648 }, try withCut(a, &.{ 4096, 4650 }, 4648, 4680, 256, 0));
+    try std.testing.expectEqualSlices(u32, &.{ 4096, 4650 }, try withCut(a, &.{ 4096, 4650 }, 0, 4680, 256, 0));
+    try std.testing.expectEqualSlices(u32, &.{ 4096, 4650 }, try withCut(a, &.{ 4096, 4650 }, 4680, 4680, 256, 0));
+    try std.testing.expectEqualSlices(u32, &.{ 600, 4096 }, try withCut(a, &.{4096}, 600, 4680, 256, 0));
 }
 
 test "chunk starts match PrefillPlan.chunks" {
@@ -166,4 +169,16 @@ test "chunk starts match PrefillPlan.chunks" {
     try std.testing.expectEqualSlices(u32, &.{ 8, 14, 22, 28 }, try (Plan{ .step = 8, .openers = &.{10}, .assistant = &.{ 10, 7 }, .min_chunk = 4 }).starts(a, &talk));
     try std.testing.expectEqualSlices(u32, &.{ 8, 16 }, try (Plan{ .step = 8 }).starts(a, &ids));
     try std.testing.expectEqualSlices(u32, &.{}, try (Plan{}).starts(a, &ids));
+}
+
+test "a prompt grid rounds the cut down and keeps aligned steps" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    try std.testing.expectEqualSlices(u32, &.{ 960, 3000 }, try withCut(a, &.{3000}, 1000, 5000, 256, 64));
+    try std.testing.expectEqualSlices(u32, &.{ 1000, 3000 }, try withCut(a, &.{3000}, 1000, 5000, 256, 0));
+    const ids = [_]u32{ 10, 1, 2, 10, 3, 4, 5, 6, 1, 2, 3, 4, 5, 6, 1, 2, 3, 4, 10, 7, 9 };
+    try std.testing.expectEqualSlices(u32, &.{ 8, 16 }, try (Plan{ .step = 8, .grid = 4 }).starts(a, &ids));
+    // the reply opens at 18: a grid of 4 starts its chunk at 16
+    try std.testing.expectEqualSlices(u32, &.{16}, try (Plan{ .step = 32, .openers = &.{10}, .assistant = &.{ 10, 7 }, .min_chunk = 8, .grid = 4 }).starts(a, &ids));
 }

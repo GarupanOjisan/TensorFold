@@ -104,10 +104,15 @@ pub const Backend = struct {
         reports_fill: bool = false,
         /// The stream left the rounds: free its caches and held drafts.
         release: *const fn (ptr: *anyopaque, s: *Stream) void,
+        /// One prompt round over filling streams in one pass: done or cancelled ones first, their count returned.
+        prefill_many: ?*const fn (ptr: *anyopaque, streams: []*Stream) anyerror!usize = null,
     };
 
     pub fn prefill(b: Backend, s: *Stream) !void {
         return b.vtable.prefill(b.ptr, s);
+    }
+    pub fn prefillMany(b: Backend, streams: []*Stream) !usize {
+        return (b.vtable.prefill_many orelse return error.NoGroupedPrefill)(b.ptr, streams);
     }
     pub fn first(b: Backend, s: *Stream, position: u64) !u64 {
         return b.vtable.first(b.ptr, s, position);

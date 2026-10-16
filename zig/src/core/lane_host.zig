@@ -32,6 +32,8 @@ pub const LaneHost = struct {
     queued: std.ArrayList(*Job) = .empty,
     admitted: std.ArrayList(*Job) = .empty,
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
+    /// TENSORFOLD_ACCEPT_WAIT_MS: idle with a request in, wait this long for others so they prefill in one pass.
+    accept_wait_ms: u32 = 0,
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
     stale: bool = false, // the learner's last step: a put-back has not reached the device, so replies are refused
@@ -104,7 +106,8 @@ pub const LaneHost = struct {
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
         var enforced = info_;
         enforced.loop_guard = true;
-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced };
+        const wait: u32 = if (std.c.getenv("TENSORFOLD_ACCEPT_WAIT_MS")) |v| std.fmt.parseInt(u32, std.mem.span(v), 10) catch 0 else 0;
+        return .{ .gpa = gpa, .io = io, .core = core, .info_ = enforced, .accept_wait_ms = wait };
     }
 
     pub fn start(h: *LaneHost) !void {
@@ -367,6 +370,7 @@ pub const LaneHost = struct {
     /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
     fn fillOne(h: *LaneHost) void {
         if (h.filling.items.len == 0) return;
+        if (h.core.backend.vtable.prefill_many != null) return h.fillMany();
         const at = fill.next(h);
         const job = h.filling.items[at];
         const first = !job.fill_began;
@@ -413,6 +417,47 @@ pub const LaneHost = struct {
     /// A request's decoded prompt rows, for a backend that keeps their bits (`decoded_rows`); otherwise none.
     fn spans(h: *const LaneHost, r: *const Request) []const [2]u32 {
         return if (h.decoded_rows) r.decode_spans else &.{};
+    }
+
+    /// FILL's grouped round (Backend.prefill_many): every filling job's next chunk in one pass; done ones decode.
+    fn fillMany(h: *LaneHost) void {
+        const max = 16;
+        var streams: [max]*lanes.Stream = undefined;
+        var errs: [max]?anyerror = undefined;
+        const n = @min(h.filling.items.len, max);
+        for (h.filling.items[0..n], streams[0..n]) |job, *s| {
+            job.fill_began = true;
+            s.* = &job.stream;
+        }
+        const k = h.core.fillStreams(streams[0..n], errs[0..n]);
+        for (streams[0..k], errs[0..k]) |s, er| {
+            const job: *Job = @alignCast(@fieldParentPtr("stream", s));
+            fill.unfill(h, job);
+            if (er) |e| {
+                _ = switch (e) {
+                    error.Cancelled => h.cancel(job),
+                    error.LaneMemory => h.requeue(job),
+                    else => h.drop(job, h.words(e)),
+                };
+                continue;
+            }
+            h.prefilled(job, job.began);
+            _ = h.deliver(job);
+        }
+    }
+
+    /// Idle with requests queued: waits up to accept_wait_ms for more, until every lane would be taken.
+    fn gather(h: *LaneHost) void {
+        if (h.accept_wait_ms == 0) return;
+        h.lock();
+        defer h.unlock();
+        if (h.queued.items.len == 0 or h.admitted.items.len != 0 or h.core.activeCount() != 0) return;
+        const until = std.Io.Clock.awake.now(h.io).toNanoseconds() + @as(i96, h.accept_wait_ms) * std.time.ns_per_ms;
+        while (h.queued.items.len < h.info_.lanes and !h.closing and h.cancels.items.len == 0) {
+            const left = until - std.Io.Clock.awake.now(h.io).toNanoseconds();
+            if (left <= 0) break;
+            h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromNanoseconds(left), .clock = .awake } }) catch {};
+        }
     }
 
     /// A prompt-only pass on a `warm_turns` engine: the backend prefills, the cache keeps its end (a mark, if keyed on)
@@ -499,6 +544,7 @@ pub const LaneHost = struct {
             ends.takeCancels(h);
             rows_host.answer(h);
             learn.refuse(h);
+            h.gather();
             while (h.admitOne()) {}
             h.fillOne();
             status.noteLive(h);

@@ -18,6 +18,7 @@ const kernels = [_]Kernel{
     .{ .name = "probe", .flags = &.{"-O3"} },
     .{ .name = "qmm_group", .flags = &.{"-O3"} }, // cuda/kernels/qmm.py, tensorfold_qmm_v5
     .{ .name = "qmm_prefill", .flags = &.{"-O3"} },
+    .{ .name = "qmm", .flags = &.{"-O3"} }, // glm5_next/cuda: TF_GLM_DENSE=q4's decode matmul (v1.8 cuda/kernels/qmm.cu)
     .{ .name = "experts", .flags = &.{"-O3"} }, // cuda/experts.py, tensorfold_experts_v7
     .{ .name = "experts_prefill", .flags = &.{"-O3"} },
     .{ .name = "experts_pack", .flags = &.{"-O3"} },
@@ -31,6 +32,14 @@ const kernels = [_]Kernel{
     .{ .name = "nvfp4_experts", .flags = &.{"-O3"} }, // nvfp4/experts.cu's device code, the NVFP4 expert kernels
     .{ .name = "rank_sum", .flags = &.{"-O3"} }, // ours: the rank-order sum of a reduce-scatter (rank_scatter.zig)
     .{ .name = "lane_gemv", .flags = &.{"-O3"} }, // ours: qmm_group's arithmetic, a column tile's K slices in one CTA
+    .{ .name = "glm_port_kda", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda.py, tensorfold_glm_kda_v2
+    .{ .name = "glm_kda_chunk", .flags = &.{ "-O3", "--fmad=false" } }, // glm5_next/cuda/kda_chunked.py, tensorfold_glm_kda_chunk
+    .{ .name = "glm_hc", .flags = &.{"-O3"} }, // glm5_next/cuda/hc.cu, tensorfold_glm_hc_v2
+    .{ .name = "glm_roce", .flags = &.{"-O3"} }, // cuda/roce.cu, the one-shot RoCE all-gather (TF_GLM_COMM=roce)
+    .{ .name = "glm_l2pf", .flags = &.{"-O3"} }, // glm5_next/cuda/l2pf.cu, tensorfold_glm_l2pf_v2
+    .{ .name = "glm_exl3", .flags = &.{ "-O3", "-lineinfo" } }, // cuda/exl3/experts.py, tensorfold_exl3_experts_v1
+    .{ .name = "glm_exl3d", .flags = &.{"-O3"} }, // glm5_next/cuda/exl3.cu [v1.8], tensorfold_glm_exl3_v20
+    .{ .name = "glm_port_glue", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: GLM torch glue (copies, token lists, greedy)
     .{ .name = "sample", .flags = &.{ "-O3", "--fmad=false", "--ftz=false" } }, // ours: the Metal engine's keyed draws
     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' learning step (train.metal's kernels)
     .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
@@ -159,6 +168,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const controls = if (nvcc) |tool| fatbin(b, tool, version.?, .{ .name = "contract_controls", .flags = &.{"-O3"} }, sms) else null;
     @import("kernel_contract.zig").cuda(b, runner_exe, controls);
     nativeServer(b, target, optimize, cuda, mods.core, mods.lanes, mods.nemotron, mods.heat, mods.tokenizer, build_options, true).root_module.strip = strip;
+    b.installArtifact(glmCheck(b, target, optimize, cuda, mods.core));
 }
 
 /// The GLM-5.3-Flash CUDA family over the runtime, the core, the lane core, canon's shares and core/heat.zig.
@@ -186,6 +196,7 @@ fn radioModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
 fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const glm_cuda = glmCuda(b, target, optimize, cuda, core, lanes, heat);
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
@@ -198,9 +209,10 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .{ .name = "nemotron", .module = nemotron },
             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
             .{ .name = "core", .module = core },
-            .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat) },
+            .{ .name = "glm_cuda", .module = glm_cuda },
         },
     });
+    mod.addImport("glm", glmNative(b, target, optimize, cuda, lanes, core, glm_cuda));
     return .{ .api = api, .engines = mod };
 }
 
@@ -272,6 +284,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     // the GLM-5.3-Flash CUDA family's host side
     const glm = glmCuda(b, host, .debug, cuda, mods.core, mods.lanes, mods.heat);
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = glm })).step);
+    // the EXL3 port's host side (families/glm/cuda/glm_native.zig)
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = native.import_table.get("glm").? })).step);
     // the shares a GLM-5.3-Flash rank takes (cluster/canon.zig against the Python family's)
     const shares = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/canon_glm_test.zig"), .target = host, .optimize = .debug });
     step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = shares })).step);
@@ -330,4 +344,34 @@ pub fn checkDistFatbins(b: *std.Build, dir: []const u8) *std.Build.Step {
     check.addArg(release_sms);
     for (kernels) |k| check.addFileArg(b.graph.cwdRelativePath(b.pathJoin(&.{ dir, b.fmt("{s}.fatbin", .{k.name}) })));
     return &check.step;
+}
+
+/// `tf-glm`: GLM-5.3-Flash on two CUDA ranks (zig/src/families/glm/cuda) and its check against the Python engine.
+fn glmCheck(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module) *std.Build.Step.Compile {
+    const config = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/config.zig"), .target = target, .optimize = optimize });
+    const main = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda/glm_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    main.addImport("cuda", cuda);
+    main.addImport("core", core);
+    main.addImport("glm_config", config);
+    roceSources(b, main);
+    return b.addExecutable(.{ .name = "tf-glm", .root_module = main });
+}
+
+/// GLM-5.3-Flash's native family (rank 0 of two CUDA ranks), for native/cuda.zig's registry.
+fn glmNative(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, lanes: *std.Build.Module, core: *std.Build.Module, glm_cuda: *std.Build.Module) *std.Build.Module {
+    // config.zig is already glm_cuda's: a file belongs to one module
+    const config = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda/glm_config_shared.zig"), .target = target, .optimize = optimize, .imports = &.{.{ .name = "glm_cuda", .module = glm_cuda }} });
+    const m = b.createModule(.{ .root_source_file = b.path("zig/src/families/glm/cuda/glm_native.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    m.addImport("cuda", cuda);
+    m.addImport("core", core);
+    m.addImport("lanes", lanes);
+    m.addImport("glm_config", config);
+    roceSources(b, m);
+    return m;
+}
+
+/// The RoCE proxy thread (b12x's roce_proxy.c, as TensorFold v1.10 ships it) and its libibverbs-by-dlopen entry points.
+fn roceSources(b: *std.Build, m: *std.Build.Module) void {
+    m.addCSourceFile(.{ .file = b.path("zig/src/families/glm/cuda/roce_proxy.c"), .flags = &.{ "-O2", "-std=gnu11" } });
+    m.addCSourceFile(.{ .file = b.path("zig/src/families/glm/cuda/roce_dl.c"), .flags = &.{ "-O2", "-std=gnu11" } });
 }
