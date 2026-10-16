@@ -11,13 +11,16 @@ jobs:
   zig:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
+      # The EXL3 GLM port's RoCE proxy (roce_proxy.c, roce_dl.c) compiles against infiniband/verbs.h.
+      - name: libibverbs headers
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libibverbs-dev
       # zig build test is the host unit tests. No GPU. The Python suite is not this check.
       - name: zig build test
         run: zig build test

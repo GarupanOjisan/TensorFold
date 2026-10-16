@@ -292,4 +292,3 @@ __global__ void dequant_kernel(const uint32_t* __restrict__ T, half* __restrict_
     }
 }
 } // namespace tf_exl3x
-

@@ -205,4 +205,3 @@ Acceptance: `tf-glm check` against the production-setting captures `v18a` (6 pro
   code 85.5, 86.6 / 87.4, 88.0; facts 56.1, 56.8 / 59.1, 59.5; json 83.0, 83.7 / 87.0, 86.5; long 52.0, 52.7 / 54.6, 54.6; huge 65.1, 66.1 / 68.3, 68.1.
   The eager block pass (`TF_GLM_DF_PROF=1`) goes from 5.9 to 3.2 ms (the o and down projections' gathers 1.83 + 1.64 -> 0.36 + 0.58); the captured block's startup
   timing from 3.8-4.1 to 3.5-3.8 ms (v1.10: 3.0), a graph having hidden most of NCCL's launch cost already.
-
