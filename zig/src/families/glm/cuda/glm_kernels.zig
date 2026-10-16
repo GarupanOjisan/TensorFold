@@ -1,5 +1,4 @@
-//! GLM's raw CUDA kernels (the glm_port_kda, glm_exl3 and glm_port_glue fatbins) launched with the Python host code's geometry
-//! (glm_symbols.zig has the spec, with file:line references into v0.6.6).
+//! GLM's raw CUDA kernels (KDA, EXL3, glue fatbins) with the Python host geometry; spec in glm_symbols.zig.
 const std = @import("std");
 const cuda = @import("cuda");
 const sym = @import("glm_symbols.zig");
@@ -87,7 +86,7 @@ pub const Kernels = struct {
         errdefer k.mods[1].unload();
         k.mods[2] = try cuda.Module.load(d, cuda.kernels.glm_port_glue);
         errdefer k.mods[2].unload();
-        // the 4-bit draft head: Nemotron's copies of qmm_group.cu and qmm_prefill.cu, and its MLX -> tiled packing (affine4_pack)
+        // the 4-bit draft head: Nemotron's qmm_group.cu, qmm_prefill.cu and affine4_pack (MLX -> tiled packing)
         k.mods[3] = try cuda.Module.load(d, cuda.kernels.qmm_group);
         errdefer k.mods[3].unload();
         k.mods[4] = try cuda.Module.load(d, cuda.kernels.qmm_prefill);
@@ -184,7 +183,7 @@ pub const Kernels = struct {
         k.plan_rank = try k.mods[8].function(e18.plan_rank);
         k.plan_offsets = try k.mods[8].function(e18.plan_offsets);
         k.plan_scatter = try k.mods[8].function(e18.plan_scatter);
-        // group_kernel's members list grows with the rows (a prompt chunk's 2048 rows * 9 slots * 4 B): experts.cu:292-305
+        // group_kernel's members list grows with the rows (2048 rows * 9 slots * 4 B; experts.cu:292-305)
         try k.group.allowDynamicShared(96 << 10);
         return k;
     }
@@ -201,8 +200,7 @@ const q4_sym = struct {
     const prefill_f32 = "_ZN14tf_qmm_prefill14prefill_kernelILi64ELi128ELi128ELi2ELi4ELi3ELb1EEEvPK13__nv_bfloat16PKjS3_S3_Pviiiiii";
 };
 
-/// v1.8 qmm.cu's qmm_kernel<64, 16, bn, 1, wn, stages> for a decode window (rows <= 16). Config 0 is `qmm` with the
-/// 16-row tile; 1 and 2 are `qmm_cfg` 2 and 4. dec_tile (glm qmm.py DEC_TILES) picks one by the projection's shape.
+/// v1.8 qmm.cu's qmm_kernel<64, 16, bn, 1, wn, stages> for decode windows; notes/glm_kernels.md#qmm-configs
 const QmmCfg = struct {
     bm: u32 = 16,
     bn: u32,
@@ -223,8 +221,7 @@ const QmmCfg = struct {
 pub const qmm32: QmmCfg = .{ .bm = 32, .bn = 64, .wn = 4, .stages = 4 };
 pub const qmm_cfgs = [_]QmmCfg{ .{ .bn = 64, .wn = 4, .stages = 4 }, .{ .bn = 128, .wn = 8, .stages = 4 }, .{ .bn = 128, .wn = 4, .stages = 6 } };
 
-/// glm_exl3d.cu's and experts.cu's instantiations (cuobjdump -symbols), and the prompt kernels' dynamic shared memory
-/// (exl3.cu prompt_smem<64, XM>: three stages of the members' rows and the trellis words, or an epilogue half).
+/// glm_exl3d.cu's and experts.cu's kernel names and prompt shared memory; notes/glm_kernels.md#e18
 const e18 = struct {
     const rot_rows = "_ZN12tf_glm_exl3d13rot_in_kernelILb1EEEvPK13__nv_bfloat16iPKiPK6__halfS8_PS6_S9_ii";
     const rot_pairs = "_ZN12tf_glm_exl3d13rot_in_kernelILb0EEEvPK13__nv_bfloat16iPKiPK6__halfS8_PS6_S9_ii";
@@ -260,14 +257,12 @@ pub fn go(f: cuda.Function, s: cuda.Stream, grid: [3]usize, block: usize, shared
     try cuda.launch.launch(f, .{ .grid = .{ .x = u(grid[0]), .y = u(grid[1]), .z = u(grid[2]) }, .block = .{ .x = u(block) }, .shared = u(shared) }, s, args);
 }
 
-/// kda.py WIDE_ROWS (TF_GLM_KDA_WIDE_ROWS, v1.8's default 1; 64 was v0.6.6's): from this many rows a chain runs as prep, step
-/// and out (the same bits as the one-block chain). The engine sets it from the environment before it sizes its buffers.
+/// kda.py WIDE_ROWS: from this many rows a chain runs as prep, step and out; notes/glm_kernels.md#wide-rows
 pub var wide_rows: usize = 1;
 
-/// TF_GLM_EXL3_DEC_ORDER (v1.10 patch 0090): the decode expert kernel's block launch order, 0 as launched, 1 or 2 (default) a k slice's
-/// blocks together; the same bits. The engine sets it from the environment.
+/// TF_GLM_EXL3_DEC_ORDER: the decode expert kernel's block launch order; notes/glm_kernels.md#dec-order
 pub var dec_order: usize = 2;
-/// TF_GLM_EXL3_FUSE2 (default on; 0 off): the gate/up epilogue in the gate/up kernel's last block (the same bits). The engine sets it.
+/// TF_GLM_EXL3_FUSE2: the gate/up epilogue in the gate/up kernel's last block; notes/glm_kernels.md#fuse-gu
 pub var fuse_gu: bool = false;
 
 /// sizeof(Smem) of kda_chunk.cu's chunk_kernel (nvcc).
@@ -342,10 +337,7 @@ pub fn chain(k: *const Kernels, s: cuda.Stream, c: Chain) !void {
     try go(k.out, s, .{ c.rows, c.heads, 1 }, 128, 0, &o);
 }
 
-/// exl3_mm.routed for GLM at two ranks (D 4096, an expert width of 1024) on `plan` (route): Y per routed slot into
-/// `sc.y`. A prompt chunk (`prompt`: plan items of 64 pairs) runs the Y^T kernels, a decode window (under 64 rows,
-/// items of 16) the `dec` kernels with TF_GLM_EXL3_FUSE 1 (the down epilogue fused) and the 16-byte loads
-/// (TF_GLM_EXL3_LOADS=nc). `ex.shared_suh` (0: none) is the one gate/up suh of a layer whose experts all share it.
+/// exl3_mm.routed for GLM at two ranks on `plan`: Y per routed slot into `sc.y`; notes/glm_kernels.md#routed18
 pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick: u64, ex: anytype, sc: Exl3Scratch, rows: usize, limit: f32, prompt: bool) !void {
     const bv: usize = switch (ex.k2) {
         8 => 0,

@@ -30,12 +30,10 @@ pub fn q4Bytes(n: usize, k: usize) usize {
     return npad * k / 2 + 2 * (k / 64) * npad * 2 + 512;
 }
 
-/// Which ranges a group's 16 levels span: its min and max (qmm.quantize4, the draft head's), or the least-squares one
-/// of 16 clippings (qmm.quantize4_mse, TF_GLM_DENSE=q4's projections).
+/// A group's 16-level range: its min and max, or a least-squares clipping; notes/glm_kernels.md#quant
 pub const Quant = enum { minmax, mse };
 
-/// qmm.quantize4 or quantize4_mse, then qmm.make_q4, of a bf16 (n, k) matrix into `at` (q4Bytes), with `tmp` for the
-/// MLX arrays (n k / 2 + 4 n k / 64 bytes).
+/// qmm.quantize4(_mse) and make_q4 of a bf16 (n, k) matrix into `at`; `tmp` holds n k / 2 + 4 n k / 64 bytes.
 pub fn quantize4(k: *const Kernels, s: cuda.Stream, kind: Quant, w: u64, n: usize, kk: usize, at: u64, tmp: u64) !Q4 {
     const kg = kk / 64;
     const npad = (n + 127) / 128 * 128;
@@ -92,8 +90,7 @@ pub fn denseSplitK(n: usize, kk: usize) usize {
     return q4SplitK(n, kk);
 }
 
-/// qmm.matmul of 17 to 32 rows (a shared window): `qmm` on the 32-row tile, K slices as qmmDecode's (denseSplitK), so each
-/// row's bits are those of its lane's own window on a 16-row tile.
+/// qmm.matmul of 17 to 32 rows on the 32-row tile with qmmDecode's K slices; notes/glm_kernels.md#qmm-shared
 pub fn qmmShared(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, rows: usize, fp32: bool) !void {
     if (rows <= 16 or rows > 32) return error.WindowTooWide;
     if (x % 16 != 0 or x_stride % 8 != 0) return error.MisalignedInput;
@@ -110,8 +107,7 @@ pub fn qmmShared(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, xs:
     }, s, &a);
 }
 
-/// qmm.matmul of a 4-bit q for a decode window (shared.matmul -> `qmm` or, with dec_tile, `qmm_cfg`: v1.8's qmm_kernel):
-/// x (rows <= 16, k) bf16, rows `x_stride` elements apart, with its group sums xs -> out (rows, n), fp32 with `f32`.
+/// qmm.matmul of a 4-bit q for a decode window (rows <= 16), v1.8's qmm_kernel; notes/glm_kernels.md#qmm-decode
 pub fn qmmDecode(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, xs: u64, q: Q4, out: u64, rows: usize, fp32: bool) !void {
     if (rows > 16) return error.WindowTooWide;
     if (x % 16 != 0 or (rows > 1 and x_stride % 8 != 0)) return error.MisalignedInput; // Python would clone x (cp.async reads 16 bytes)
@@ -131,8 +127,7 @@ pub fn qmmDecode(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, xs:
     }, s, &a);
 }
 
-/// qmm.matmul of a 4-bit q on sm_12x (shared.matmul -> qmm_group, the kernel's own tile): x (rows, k) bf16 with
-/// its group sums xs -> out (rows, n) bf16.
+/// qmm.matmul of a 4-bit q on sm_12x via qmm_group: x (rows, k) bf16 and its group sums xs -> out (rows, n) bf16.
 pub fn q4Matmul(k: *const Kernels, s: cuda.Stream, x: u64, xs: u64, q: Q4, out: u64, rows: usize) !void {
     if (rows > 16) return error.WindowTooWide;
     const sk = q4SplitK(q.n, q.k);
@@ -166,7 +161,7 @@ pub fn q4Prefill(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, q: 
     try go(if (fp32) k.q4_prefill_f32 else k.q4_prefill, s, .{ rows_t * ((q.n + 127) / 128), 1, 1 }, 256, q4_prefill_smem, &a);
 }
 
-/// glm qmm.split_k for shapes outside its SHAPE_SK table (the draft head's): K slices until column tiles times slices reach 192.
+/// glm qmm.split_k off its SHAPE_SK table (the draft head's): K slices until tiles times slices reach 192.
 pub fn q4SplitK(n: usize, kk: usize) usize {
     const tiles = (n + 63) / 64;
     const groups = kk / 64;

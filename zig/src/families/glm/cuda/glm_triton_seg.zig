@@ -22,8 +22,7 @@ const topk_pools = tri.topk_pools;
 const select_width = tri.select_width;
 const split_blk = tri.split_blk;
 
-// -- segmented windows (v1.10 segments.py, latent.seg_*, sparse.seg_*): several lanes' rows back to back, each row's
-// position and arena base in the SegRows tables (glm_segments.zig), so one CUDA graph a row count serves every mix.
+// Segmented windows: several lanes' rows back to back in one CUDA graph; notes/glm_triton.md#segmented-windows
 
 /// latent.seg_latent_write: lat [R, LW] rows into the arena at each row's base + pos.
 pub fn segLatWrite(t: Tri, lat: u64, lat_stride: usize, cache: u64, pos: u64, base: u64, rows: usize, lw: usize) !void {
@@ -36,12 +35,10 @@ pub fn segIndexUpdate(t: Tri, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64,
     try t.run("_seg_pool_keys", .{ rows, 1, 1 }, &.{ p("IK", "*bf16", ik), p("IG", "*bf16", ig), p("APE", "*bf16", ape), t.kvv("PK", pk), t.kvs("PKS", pk), p("POS", "*i32", pos), p("BASE", "*i32", base), p("IBASE", "*i32", ibase), aot.int("RING", ring) }, &.{ ci("D", 128), ci("RS", t.kvRow(128)), flag("FP8", t.fp8) });
 }
 
-/// Scores a segmented selection's rows hold (segments.SelectScratch over a pool of up to 4,194,304 tokens: the
-/// split selection's CHS 4096 / CP 256, the shapes v1.10's captured graphs launch).
+/// Scores a segmented selection's rows hold (CHS 4096 / CP 256); notes/glm_triton.md#seg-pools
 pub const seg_pools = 1 << 20;
 
-/// sparse.seg_select_tokens: every segment's pools up to its device-side count scored by `_seg_scores` (`segs` programs,
-/// one a table segment), then the split selection over each sparse row's visible pools into tokens / counts.
+/// sparse.seg_select_tokens: each segment's pools scored, then the split selection; notes/glm_triton.md#seg-select
 pub fn segSelect(t: Tri, qi: u64, w: u64, w_stride: usize, pk: u64, scores: u64, split: u64, tokens: u64, counts: u64, pos: u64, sparse: u64, start: u64, nrows: u64, pbase: u64, pools: u64, rows: usize, segs: usize, heads: usize, dim: usize) !void {
     const np = seg_pools;
     const g = @min(256, cdiv(np, 64));
@@ -56,8 +53,7 @@ pub fn segSelect(t: Tri, qi: u64, w: u64, w_stride: usize, pk: u64, scores: u64,
     }
 }
 
-/// latent.seg_attention: dense rows over their stream's keys 0 .. pos, sparse rows over their selected tokens, each in its
-/// own arena extent; seg_chunks() = 5 chunk programs a row, `_merge` over them (a row's bits are its lone window's).
+/// latent.seg_attention: dense and sparse rows in their own arena extents; notes/glm_triton.md#seg-attention
 pub fn segAttention(t: Tri, qa: u64, lc: u64, pos: u64, base: u64, sparse: u64, tokens: ?u64, counts: ?u64, s: Scratch, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
     const nch = 5; // latent.seg_chunks: cdiv(max(SPARSE_FROM, TOKENS), CHUNK)
     if (rows > s.part_rows) return error.RowsPastScratch;
@@ -67,8 +63,7 @@ pub fn segAttention(t: Tri, qa: u64, lc: u64, pos: u64, base: u64, sparse: u64, 
     try t.run("_merge", .{ rows, heads, 1 }, &.{ p("PO", "*fp32", s.po), p("PM", "*fp32", s.pm), p("PL", "*fp32", s.pl), p("OUT", "*bf16", out), p("CNT", "*i32", s.dummy), int("R", rows) }, &.{ ci("H", heads), ci("LW", lw), ci("NCH", nch), flag("SPARSE", false) });
 }
 
-/// forward.conv_shift_segments: each table segment's conv slot takes rows keep .. keep + 2 of [conv; its projection rows].
-/// Strides in elements: conv slot and layer, projection layer and row.
+/// forward.conv_shift_segments: each segment's conv slot takes rows keep .. keep + 2; strides in elements.
 pub fn convShiftSeg(t: Tri, conv: u64, proj: u64, seg: u64, nseg: usize, layers: usize, c: usize, conv_slot: usize, conv_layer: usize, proj_layer: usize, proj_row: usize) !void {
     try t.run("_conv_shift_seg", .{ layers, cdiv(c, 1024), nseg }, &.{ p("CONV", "*bf16", conv), p("PROJ", "*bf16", proj), p("SEG", "*i32", seg), int("conv_slot", conv_slot), int("conv_layer", conv_layer), int("proj_layer", proj_layer), int("proj_row", proj_row) }, &.{ ci("C", c), ci("TAPS", 3), ci("COLS", 6), ci("BLOCK", 1024) });
 }

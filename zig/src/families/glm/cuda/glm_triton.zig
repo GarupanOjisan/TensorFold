@@ -1,6 +1,4 @@
-//! GLM-5.3-Flash's Triton kernels from the captured cubins (aot/c2): each launch has the Python 0.6.6 wrapper's grid,
-//! argument names and types, and constexprs (py: src/tensorfold/families/glm5_next/cuda/). num_warps and num_stages
-//! are baked into the cubins; `aot.Set.run` picks the specialization (ints equal to 1, 16-divisibility) itself.
+//! GLM-5.3-Flash's Triton launches from the captured cubins (aot/c2), as Python 0.6.6; notes/glm_triton.md#header
 
 const std = @import("std");
 const cuda = @import("cuda");
@@ -57,7 +55,7 @@ pub const topk_pools = 512;
 pub const select_width = topk_pools * pool + pool - 1;
 /// geometry.MLA_SELECT_ROWS (cuda/geometry.py:14): a prompt chunk's rows scored at once.
 pub const select_rows = 512;
-/// geometry.MLA_PROMPT_ATT_ROWS (cuda/geometry.py:13): a prompt chunk's rows a dense latent call takes (LatentScratch.part_rows in prefill).
+/// geometry.MLA_PROMPT_ATT_ROWS (cuda/geometry.py:13): a prompt chunk's rows a dense latent call takes.
 pub const prompt_att_rows = 512;
 /// latent.MMA_TILE (64, 128, 64): the prompt chunks' absorb and expand tiles.
 pub const mma_bm = 64;
@@ -89,23 +87,21 @@ pub fn headBlock(rows: usize) usize {
     return if (rows >= 64) hb_wide else hb;
 }
 
-/// latent.chunks_for (latent.py:351); forward.chunks_for (forward.py:489) is chunksFor(pos + R) (attention.CHUNK is 512 too).
+/// latent.chunks_for (latent.py:351); forward.chunks_for (forward.py:489) is chunksFor(pos + R).
 pub fn chunksFor(length: usize) usize {
     return cdiv(length, chunk);
 }
 
-/// sparse.py: decode rows' `_scores_rows` programs a row (ROW_SCORE_G), prompt rows a `_scores` program takes (TF_GLM_SCORE_RB,
-/// default 4), and where the decode selection splits a row's scores across programs (SPLIT_FROM scores, under SPLIT_ROWS rows).
+/// sparse.py ROW_SCORE_G, TF_GLM_SCORE_RB, SPLIT_FROM and SPLIT_ROWS; notes/glm_triton.md#score-split
 pub const row_score_g = 128;
 pub const score_rb = 4;
 pub const split_from = 8192;
 pub const split_rows = 64;
-/// sparse.SPLIT_BLK (v1.10 patch 0085): step 4's earlier chunks an iteration. And sparse.SCORE_LOOP (patch 0086): the pool blocks a
-/// `_scores` program takes (one row a program; speed only).
+/// sparse.SPLIT_BLK (patch 0085) and SCORE_LOOP (patch 0086); notes/glm_triton.md#split-blk
 pub const split_blk = 16;
 pub const score_loop = 32;
 
-/// sparse.split_chunk / split_chunks: scores a `_select_split` chunk program takes, and the chunk programs a row of np scores takes.
+/// sparse.split_chunk / split_chunks: scores a `_select_split` program takes, and the programs a row takes.
 pub fn splitChunk(np: usize) usize {
     return if (np <= 16384) 2048 else 4096;
 }
@@ -136,7 +132,7 @@ pub fn swigluBlock(w: usize) !usize {
     return b;
 }
 
-/// sparse.pool_bucket (sparse.py:174): pools scored for rows pos .. pos + R - 1, a power of two of at least 1024, at most np_max.
+/// sparse.pool_bucket (sparse.py:174): pools scored for rows pos .. pos + R - 1, a power of two in 1024 .. np_max.
 pub fn poolBucket(pos: usize, rows: usize, np_max: usize) usize {
     const visible = (pos + rows) / pool + 1;
     return @min(np_max, @max(1024, pow2(visible)));
@@ -145,11 +141,10 @@ pub fn poolBucket(pos: usize, rows: usize, np_max: usize) usize {
 pub const Tri = struct {
     set: *const aot.Set,
     s: cuda.Stream,
-    /// TF_GLM_KV=fp8 (kv8.py): the latent and pooled-key caches are e4m3 rows with a power-of-two scale (width + 16 bytes).
+    /// TF_GLM_KV=fp8 (kv8.py): latent and pooled-key caches as e4m3 rows with a power-of-two scale (width + 16 B).
     fp8: bool = false,
 
-    /// A cache's values / scales as the kernels take them (kv8.parts): the codes and the fp32 view of the same rows, or
-    /// the bf16 rows twice.
+    /// A cache's values / scales as the kernels take them (kv8.parts): codes and fp32 view, or bf16 rows twice.
     pub fn kvv(t: Tri, name: []const u8, addr: u64) aot.Arg {
         return p(name, if (t.fp8) "*fp8e4nv" else "*bf16", addr);
     }
@@ -172,19 +167,18 @@ pub const Tri = struct {
         try t.run("_embed_b16", .{ rows, dims / 64, 1 }, &.{ p("IDS", "*i32", ids), p("W", "*bf16", table), p("OUT", "*bf16", out) }, &.{ ci("D", dims), ci("COPIES", copies) });
     }
 
-    /// glue.rmsnorm (glue.py:75). Without `xs` Python passes OUT as XS (bf16) and SUMS=False. Rows of `out` must be contiguous.
+    /// glue.rmsnorm (glue.py:75); without `xs` Python passes OUT as XS (bf16), SUMS=False; `out` rows contiguous.
     pub fn rmsnorm(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, o_stride: usize, xs: ?u64, rows: usize, d: usize, eps: f32) !void {
         const sums = if (xs) |a| p("XS", "*fp32", a) else p("XS", "*bf16", out);
         try t.run("_rmsnorm", .{ rows, 1, 1 }, &.{ p("X", "*bf16", x), int("x_stride", x_stride), p("W", "*bf16", w), p("OUT", "*bf16", out), int("o_stride", o_stride), sums, aot.float("eps", eps) }, &.{ ci("D", d), ci("BLOCK", pow2(d)), flag("SUMS", xs != null) });
     }
 
-    /// glue.hc_pre (glue.py:162): x [R, S*D] streams -> out [R, D] normed and xs, post [R, S], comb [R, S, S]; part is [R, 16, 32] fp32.
-    /// `scale` is the layer's 3 fp32 mixing scales (a pointer, the kernel's SCALE parameter).
+    /// glue.hc_pre (glue.py:162), first half: the mixing dots into part [R, 16, 32] fp32; notes/glm_triton.md#hc-pre
     pub fn hcPartial(t: Tri, x: u64, fn_w: u64, part: u64, rows: usize, d: usize, streams: usize) !void {
         try t.run("_hc_partial", .{ rows, hc_blocks, 1 }, &.{ p("X", "*bf16", x), p("FN", "*bf16", fn_w), p("PART", "*fp32", part) }, &.{ ci("WIDE", streams * d), ci("NB", hc_blocks), ci("SUB", 128) });
     }
 
-    /// glue._hc_partial_mma (v1.8 glue.py:155; TF_GLM_HC_MMA): a prompt chunk's mixing dots on the tensor cores, 64 rows a program.
+    /// glue._hc_partial_mma (v1.8 glue.py:155, TF_GLM_HC_MMA): a prompt chunk's dots on tensor cores, 64-row programs.
     pub fn hcPartialMma(t: Tri, x: u64, fn_w: u64, part: u64, rows: usize, d: usize, streams: usize) !void {
         try t.run("_hc_partial_mma", .{ cdiv(rows, 64), hc_blocks, 1 }, &.{ p("X", "*bf16", x), p("FN", "*bf16", fn_w), p("PART", "*fp32", part), int("R", rows) }, &.{ ci("WIDE", streams * d), ci("NB", hc_blocks), ci("BM", 64), ci("BK", 64) });
     }
@@ -200,8 +194,7 @@ pub const Tri = struct {
         try t.run("_hc_post", .{ rows, d / block, 1 }, &.{ p("X", "*bf16", x), p("XOUT", "*bf16", xout), p("G", "*fp32", gathered), p("POST", "*fp32", post), p("COMB", "*fp32", comb), int("RS", rows * d) }, &.{ ci("D", d), ci("S", streams), ci("WORLD", world), ci("BLOCK", block) });
     }
 
-    /// glue.hc_post_pair (v1.10 glue.py:265, TF_GLM_HC_SPLIT): hc_post of two ranks' fp32 partials [R, D] held apart, rank 0's
-    /// at `g0` and rank 1's `rs` elements from it (may be negative): the same kernel, sum order and bits.
+    /// glue.hc_post_pair (v1.10, TF_GLM_HC_SPLIT): hc_post, two ranks' partials apart; notes/glm_triton.md#hc-post-pair
     pub fn hcPostPair(t: Tri, x: u64, xout: u64, g0: u64, post: u64, comb: u64, rs: i64, rows: usize, d: usize, streams: usize) !void {
         const block = @min(1024, d);
         try t.run("_hc_post", .{ rows, d / block, 1 }, &.{ p("X", "*bf16", x), p("XOUT", "*bf16", xout), p("G", "*fp32", g0), p("POST", "*fp32", post), p("COMB", "*fp32", comb), aot.int("RS", @intCast(rs)) }, &.{ ci("D", d), ci("S", streams), ci("WORLD", 2), ci("BLOCK", block) });
@@ -225,8 +218,7 @@ pub const Tri = struct {
         try t.run("_swiglu", .{ rows, w / block, 1 }, &.{ p("GU", "*bf16", gu), p("OUT", "*bf16", out), p("XS", "*fp32", xs), aot.float("LIMIT", limit) }, &.{ ci("W", w), ci("BLOCK", block) });
     }
 
-    /// glue.router (glue.py:333), the sliced path: `part` holds router_ks * m * ne fp32 (Python's torch.empty), `out` [m, ne] fp32 contiguous.
-    /// Python's single-pass `_router` (d not a multiple of 512, or a strided out) was never captured, so it is an error here.
+    /// glue.router (glue.py:333), the sliced path only; notes/glm_triton.md#router
     pub fn router(t: Tri, x: u64, x_stride: usize, w: u64, part: u64, out: u64, m: usize, d: usize, ne: usize) !void {
         if (d % (router_ks * 64) != 0) return error.RouterSinglePassNotCaptured;
         const bm = routerBm(m);
@@ -235,21 +227,18 @@ pub const Tri = struct {
         try t.run("_router_sum", .{ cdiv(total, 1024), 1, 1 }, &.{ p("PART", "*fp32", part), p("OUT", "*fp32", out), int("total", total) }, &.{ ci("KS", router_ks), ci("BLOCK", 1024) });
     }
 
-    /// glue.select (glue.py:383): each row's top_k experts and weights, then the shared expert (id `experts`, weight 1).
+    /// glue.select (glue.py:383): each row's top_k experts and weights, then the shared expert (id experts, weight 1).
     pub fn select(t: Tri, logits: u64, bias: u64, pick: u64, wts: u64, rows: usize, top_k: usize, experts: usize, scale: f32, norm: bool) !void {
         try t.run("_topk", .{ rows, 1, 1 }, &.{ p("L", "*fp32", logits), p("BIAS", "*fp32", bias), p("PICK", "*i32", pick), p("WTS", "*fp32", wts), aot.float("scale", scale) }, &.{ ci("NE", experts), ci("TOPK", top_k), ci("SLOTS", top_k + 1), ci("BLOCK", pow2(experts + 1)), ci("SLOTP", pow2(top_k + 1)), flag("NORM", norm) });
     }
 
-    /// glue.combine (glue.py:406): y [R, slots, D] fp32 (the EXL3 scratch; only fp32 was captured) -> out [R, D] fp32.
-    /// The caller first copies the shared expert's sy [R, D] fp32 into slot top_k of y (forward.py:407,
-    /// `b.ey[:R, c.top_k].copy_(b.sy[:R])`, a strided copy: row r's D values to y + ((r * slots + top_k) * D) * 4).
+    /// glue.combine (glue.py:406): y [R, slots, D] fp32 -> out [R, D] fp32; notes/glm_triton.md#combine
     pub fn combine(t: Tri, y: u64, wts: u64, out: u64, rows: usize, d: usize, slots: usize) !void {
         const block = @min(1024, d);
         try t.run("_combine", .{ rows, d / block, 1 }, &.{ p("Y", "*fp32", y), p("WTS", "*fp32", wts), p("OUT", "*fp32", out) }, &.{ ci("D", d), ci("SLOTS", slots), ci("BLOCK", block) });
     }
 
-    /// qmm._matmul_b16 (qmm.py:245): out [m, n] (bf16, or fp32 with `wide`, Python's f32=True, contiguous) = x [m, k] (rows strided) . w [n, k].T.
-    /// When b16SplitK(n, k) > 1, `part` holds sk * m * n fp32 (Python's b.sk); otherwise it is unused (Python passes OUT as PART).
+    /// qmm._matmul_b16 (qmm.py:245): out [m, n] = x [m, k] . w [n, k].T, K split; notes/glm_triton.md#matmul-b16
     pub fn matmulB16(t: Tri, x: u64, x_stride: usize, w: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
         if (k % b16_bk != 0) return error.KNotMultipleOf64;
         const bm = try bucket(@min(m, 128));
@@ -262,9 +251,7 @@ pub const Tri = struct {
         try t.run("_reduce", .{ cdiv(total, 1024), 1, 1 }, &.{ p("PART", "*fp32", part), p("OUT", ot, out), int("total", total) }, &.{ ci("SK", sk), ci("BLOCK", 1024), flag("F32", wide) });
     }
 
-    /// qmm._matmul_f8 (v1.8 qmm.py:417) for a window of up to 16 rows on one K slice (the head's shape): `_fmm`, BM 16 and
-    /// BLOCK_N F8_BN_DECODE columns a program, over e4m3 `w` [n, k] with its fp32 block scales `sc` [n, k / 128].
-    /// `part` is unused (Python passes OUT as PART when sk is 1).
+    /// qmm._matmul_f8 (v1.8 qmm.py:417): `_fmm` for up to 32 rows on one K slice; notes/glm_triton.md#matmul-f8
     pub fn matmulF8(t: Tri, x: u64, x_stride: usize, w: u64, sc: u64, out: u64, part: u64, m: usize, n: usize, k: usize, wide: bool) !void {
         _ = part;
         if (k % 128 != 0) return error.KNotMultipleOf128;
@@ -275,41 +262,36 @@ pub const Tri = struct {
         try t.run("_fmm", .{ 1, cdiv(n, f8_bn_decode), 1 }, &.{ p("X", "*bf16", x), p("W", "*fp8e4nv", w), p("S", "*fp32", sc), p("OUT", ot, out), p("PART", ot, out), int("M", m), int("x_stride", x_stride) }, &.{ ci("N", n), ci("K", k), ci("SK", 1), ci("BM", 16), ci("BLOCK_N", f8_bn_decode), ci("BK", b16_bk), flag("F32", wide), flag("SEQ", false) });
     }
 
-    /// glue.combine_shared (v1.8 glue.py:514): `combine` with the shared expert's row read from sy [R, D] fp32 instead of
-    /// y's last slot; the same terms in the same slot order.
+    /// glue.combine_shared (v1.8 glue.py:514): `combine` with the shared row from sy; notes/glm_triton.md#combine-sy
     pub fn combineSy(t: Tri, y: u64, sy: u64, wts: u64, out: u64, rows: usize, d: usize, slots: usize) !void {
         const block = @min(1024, d);
         try t.run("_combine_sy", .{ rows, d / block, 1 }, &.{ p("Y", "*fp32", y), p("SY", "*fp32", sy), p("WTS", "*fp32", wts), p("OUT", "*fp32", out) }, &.{ ci("D", d), ci("SLOTS", slots), ci("BLOCK", block) });
     }
 
-    /// qmm.group_sums (qmm.py:117): x [m, k] bf16 (rows strided) -> xs [m, k/64] fp32.
-    /// dflash2._dconv: the two-tap grouped dynamic convolution of x [rows, d] over rows r and r - 1 (`branch` 0 the first
-    /// mix, 1 the second), plus the residual `res` when given.
+    /// dflash2._dconv: the two-tap grouped dynamic convolution of x [rows, d]; notes/glm_triton.md#dconv
     pub fn dconv(t: Tri, x: u64, dyn: u64, base: u64, res: ?u64, out: u64, rows: usize, d: usize, gs: usize, branch: usize) !void {
         const block = 1024;
         try t.run("_dconv_kernel", .{ rows, cdiv(d, block), 1 }, &.{ p("X", "*bf16", x), p("DYN", "*bf16", dyn), p("BASE", "*bf16", base), p("RES", "*bf16", res orelse x), p("OUT", "*bf16", out) }, &.{ ci("D", d), ci("G", d / gs), ci("GS", gs), ci("BRANCH", branch), flag("HAS_RES", res != null), ci("BLOCK", block), ci("SEG", 0) });
     }
 
-    /// dflash2._prep: q and k normalized and rotated, v copied, [heads, rows, head_dim] each (`qo` unused without query heads).
+    /// dflash2._prep: q, k normalized and rotated, v copied, [heads, rows, head_dim] each (`qo` unused if no queries).
     pub fn draftPrep(t: Tri, qkv: u64, qn: u64, kn: u64, cos: u64, sin: u64, qo: u64, ko: u64, vo: u64, rows: usize, stride: usize, eps: f32, heads: usize, kvh: usize, hd: usize) !void {
         try t.run("_prep_kernel", .{ rows, heads + 2 * kvh, 1 }, &.{ p("QKV", "*bf16", qkv), p("QN", "*bf16", qn), p("KN", "*bf16", kn), p("COS", "*fp32", cos), p("SIN", "*fp32", sin), p("QO", "*bf16", qo), p("KO", "*bf16", ko), p("VO", "*bf16", vo), int("L", rows), int("stride", stride), aot.float("eps", eps) }, &.{ ci("H", heads), ci("HKV", kvh), ci("HALF", hd / 2) });
     }
 
-    /// dflash2's `_dattn_kernel`: each KV head attends its queries to the window's tiles and the block's keys. `pos` is the
-    /// context's end on the device.
+    /// dflash2's `_dattn_kernel`: each KV head over the window's tiles and the block's keys; notes/glm_triton.md#dattn
     pub fn draftAttention(t: Tri, q: u64, kc: u64, vc: u64, out: u64, pos: u64, window: usize, rows: usize, heads: usize, kvh: usize, hd: usize, cap: usize, causal: bool, ring: bool) !void {
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(hd), -0.5));
         try t.run("_dattn_kernel", .{ kvh, 1, 1 }, &.{ p("Q", "*bf16", q), p("K", "*bf16", kc), p("V", "*bf16", vc), p("OUT", "*bf16", out), p("POS", "*i64", pos), int("window", window), aot.float("scale", scale) }, &.{ ci("N", rows), ci("G", heads / kvh), ci("NH", heads), ci("HD", hd), ci("CAP", cap), ci("BK", 64), flag("CAUSAL", causal), flag("RING", ring), flag("SKIP", true) });
     }
 
-    /// dflash2_multi's `_dattn_seg_kernel`: `_dattn_kernel` for blocks of `n` rows side by side (q [heads, rows, hd], out
-    /// [rows, heads hd]), block s reading its slot slot[s] of the pooled caches (kc, vc: slot 0; a slot counts rows of cap, the
-    /// kv heads `slot_rows` apart) at position pos[s].
+    /// dflash2_multi's `_dattn_seg_kernel`: `_dattn_kernel` for blocks of `n` rows; notes/glm_triton.md#dattn-seg
     pub fn draftAttentionSeg(t: Tri, q: u64, kc: u64, vc: u64, out: u64, pos: u64, slot: u64, window: usize, rows: usize, n: usize, slot_rows: usize, heads: usize, kvh: usize, hd: usize, cap: usize, causal: bool, ring: bool) !void {
         const scale: f32 = @floatCast(std.math.pow(f64, @floatFromInt(hd), -0.5));
         try t.run("_dattn_seg_kernel", .{ kvh, rows / n, 1 }, &.{ p("Q", "*bf16", q), p("K", "*bf16", kc), p("V", "*bf16", vc), p("OUT", "*bf16", out), p("POS", "*i64", pos), p("SLOT", "*i64", slot), int("window", window), aot.float("scale", scale), int("L", rows), int("SLOT_ROWS", slot_rows) }, &.{ ci("N", n), ci("G", heads / kvh), ci("NH", heads), ci("HD", hd), ci("CAP", cap), ci("BK", 64), flag("CAUSAL", causal), flag("RING", ring) });
     }
 
+    /// qmm.group_sums (qmm.py:117): x [m, k] bf16 (rows strided) -> xs [m, k/64] fp32.
     pub fn groupSums(t: Tri, x: u64, x_stride: usize, xs: u64, m: usize, k: usize) !void {
         try t.run("_group_sums", .{ m, cdiv(k / 64, 16), 1 }, &.{ p("X", "*bf16", x), p("XS", "*fp32", xs), int("x_stride", x_stride) }, &.{ ci("K", k), ci("GB", 16) });
     }
@@ -324,8 +306,7 @@ pub const Tri = struct {
         try t.run("_expand_v", .{ heads, dv / 16, 1 }, &.{ p("OL", "*bf16", ol), p("WV", "*bf16", wv), p("OUT", "*bf16", out), int("R", rows) }, &.{ ci("H", heads), ci("DV", dv), ci("LW", lw), ci("BN", 16) });
     }
 
-    /// latent.absorb_q for a prompt chunk's rows (TF_GLM_LATENT_MMA, v1.8 latent.py:334): `_absorb_mma`, 64-row tiles on the
-    /// tensor cores (rows contiguous).
+    /// latent.absorb_q for a prompt chunk (TF_GLM_LATENT_MMA, v1.8 latent.py:334): `_absorb_mma`, 64-row MMA tiles.
     pub fn absorbQMma(t: Tri, q: u64, wk: u64, out: u64, rows: usize, heads: usize, d: usize, lw: usize) !void {
         try t.run("_absorb_mma", .{ heads, cdiv(rows, mma_bm), lw / mma_bn }, &.{ p("Q", "*bf16", q), p("WK", "*bf16", wk), p("QA", "*bf16", out), int("R", rows) }, &.{ ci("H", heads), ci("D", d), ci("LW", lw), ci("BM", mma_bm), ci("BN", mma_bn), ci("BK", mma_bk) });
     }
@@ -335,19 +316,18 @@ pub const Tri = struct {
         try t.run("_expand_mma", .{ heads, cdiv(rows, mma_bm), dv / mma_bn }, &.{ p("OL", "*bf16", ol), p("WV", "*bf16", wv), p("OUT", "*bf16", out), int("R", rows) }, &.{ ci("H", heads), ci("DV", dv), ci("LW", lw), ci("BM", mma_bm), ci("BN", mma_bn), ci("BK", mma_bk) });
     }
 
-    /// latent.sparse_onepass (v1.8 latent.py:709): a prompt chunk's rows with counts > 0 attend their selected tokens in one
-    /// online softmax, a program a row (all the rank's heads, ONEPASS_TILE (32, 32, 1), launch (8 warps, 1 stage, prefetch)).
+    /// latent.sparse_onepass (v1.8 latent.py:709): sparse rows, one online softmax; notes/glm_triton.md#sparse-onepass
     pub fn sparseOnepass(t: Tri, qa: u64, lc: u64, tokens: u64, counts: u64, out: u64, rows: usize, heads: usize, lw: usize, width: usize, scale: f32) !void {
         const hbt = @max(16, @min(32, pow2(heads)));
         try t.run("_sparse_onepass", .{ rows, cdiv(heads, hbt), 1 }, &.{ p("QA", "*bf16", qa), t.kvv("LC", lc), t.kvs("LS", lc), p("TOK", "*i32", tokens), p("CNT", "*i32", counts), p("OUT", "*bf16", out) }, &.{ ci("W", width), ci("H", heads), ci("LW", lw), aot.cf("SCALE", scale), ci("HBT", hbt), ci("KTT", 32), ci("SPLIT", 1), ci("STAGES", 1), flag("PREFETCH", true), ci("RS", t.kvRow(lw)), flag("FP8", t.fp8) });
     }
 
-    /// latent.latent_write (latent.py:198): lat [R, LW] rows (strided) into cache [capacity, LW] at slots pos..pos + R - 1 (pos on the device).
+    /// latent.latent_write (latent.py:198): lat [R, LW] rows into cache slots pos .. pos + R - 1 (pos on the device).
     pub fn latentWrite(t: Tri, lat: u64, lat_stride: usize, cache: u64, pos: u64, rows: usize, lw: usize) !void {
         try t.run("_lat_write", .{ rows, 1, 1 }, &.{ p("LAT", "*bf16", lat), int("lat_stride", lat_stride), t.kvv("LC", cache), t.kvs("LS", cache), p("POS", "*i32", pos) }, &.{ ci("LW", lw), ci("RS", t.kvRow(lw)), flag("FP8", t.fp8) });
     }
 
-    /// latent.LatentScratch's device buffers (latent.py:304): fp32 chunk partials for `part_rows` rows and an i32 zero word.
+    /// latent.LatentScratch (latent.py:304): fp32 chunk partials for `part_rows` rows and an i32 zero word.
     pub const Scratch = struct { po: u64, pm: u64, pl: u64, dummy: u64, part_rows: usize };
 
     /// latent.attention (latent.py:318): one dense call of `rows` rows at `pos`, `hb_` heads a program.
@@ -357,13 +337,7 @@ pub const Tri = struct {
         try t.run("_merge", .{ rows, heads, 1 }, &.{ p("PO", "*fp32", s.po), p("PM", "*fp32", s.pm), p("PL", "*fp32", s.pl), p("OUT", "*bf16", out), p("CNT", "*i32", s.dummy), int("R", rows) }, &.{ ci("H", heads), ci("LW", lw), ci("NCH", nch), flag("SPARSE", false) });
     }
 
-    /// forward.dense_attention (forward.py:331) over latent.attention: qa [R, H, LW] causal through pos + R - 1 in `nch` 512-key
-    /// chunks, in blocks of s.part_rows rows, every block with head_block(R) of the whole window.
-    /// `pos_at[j]` is the device i32 position of block j's first row: pos_at[0] is pos itself.
-    // TORCH-GLUE: forward.py:341 `at = pos_dev + r0` for block j >= 1 (r0 = j * part_rows): a new one-element int32 device
-    //   tensor holding pos + r0 (int32 add, no clamp). The Zig caller fills pos_at[1..] with that value before this call;
-    //   each address must be 16-byte aligned (the captured _dense_chunks variants have POS divisible by 16).
-    // The caller picks nch as _dsa_latent does (forward.py:372): min(chunks_for(pos + R) or s.nch, s.nch).
+    /// forward.dense_attention (forward.py:331): latent.attention by blocks; notes/glm_triton.md#dense-attention
     pub fn denseAttention(t: Tri, qa: u64, lc: u64, pos_at: []const u64, s: Scratch, out: u64, rows: usize, window: usize, heads: usize, lw: usize, nch: usize, scale: f32) !void {
         const h = headBlock(window); // the window's head block, though only `rows` of its rows (the ones within the dense limit) run
         const step = s.part_rows;
@@ -375,9 +349,7 @@ pub const Tri = struct {
         }
     }
 
-    /// latent.sparse_attention (latent.py:335): rows with counts > 0 attend their selected tokens [R, W] (ascending, -1 padded)
-    /// into out [R, H, LW]; other rows are left alone. po, pm, pl are Python's torch.empty scratch: nch * R * H (* LW) fp32,
-    /// nch = cdiv(W, 512).
+    /// latent.sparse_attention (latent.py:335): rows over their selected tokens; notes/glm_triton.md#sparse-attention
     pub fn sparseAttention(t: Tri, qa: u64, lc: u64, tokens: u64, counts: u64, out: u64, po: u64, pm: u64, pl: u64, rows: usize, heads: usize, lw: usize, width: usize, scale: f32) !void {
         const nch = chunksFor(width);
         const h = headBlock(rows);
@@ -385,23 +357,18 @@ pub const Tri = struct {
         try t.run("_merge", .{ rows, heads, 1 }, &.{ p("PO", "*fp32", po), p("PM", "*fp32", pm), p("PL", "*fp32", pl), p("OUT", "*bf16", out), p("CNT", "*i32", counts), int("R", rows) }, &.{ ci("H", heads), ci("LW", lw), ci("NCH", nch), flag("SPARSE", true) });
     }
 
-    /// sparse.index_update (v1.8 sparse.py:76): k_raw [R, 128] (rows strided, the first 128 columns of ikr) and gate [R, 128] fp32
-    /// into the index rings ik, ig at pos.. (token t at row t % ring; `ring` is at least the context here: no row wraps), then
-    /// every pool the window completes into pk (bf16, or kv8 rows under TF_GLM_KV=fp8).
+    /// sparse.index_update (v1.8 sparse.py:76): index rings, then pooled keys; notes/glm_triton.md#index-update
     pub fn indexUpdate(t: Tri, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64, ln_b: u64, ape: u64, ik: u64, ig: u64, pk: u64, pos: u64, rows: usize, ring: usize) !void {
         try t.run("_index_write", .{ rows, 1, 1 }, &.{ p("KR", "*bf16", k_raw), int("k_stride", k_stride), p("GR", "*fp32", gate), p("LNW", "*bf16", ln_w), p("LNB", "*bf16", ln_b), p("IK", "*bf16", ik), p("IG", "*bf16", ig), p("POS", "*i32", pos), int("RING", ring), aot.float("eps", 1e-6) }, &.{ci("D", 128)});
         try t.run("_pool_keys", .{ rows / 4 + 2, 1, 1 }, &.{ p("IK", "*bf16", ik), p("IG", "*bf16", ig), p("APE", "*bf16", ape), t.kvv("PK", pk), t.kvs("PKS", pk), p("POS", "*i32", pos), int("R", rows), int("RING", ring) }, &.{ ci("D", 128), ci("RS", t.kvRow(128)), flag("FP8", t.fp8) });
     }
 
-    /// The split selection's int32 scratch (sparse.split_scratch) for `rows` rows of up to `np` scores: totals, histograms, counts.
+    /// sparse.split_scratch: int32 totals, histograms and counts for `rows` rows of up to `np` scores.
     pub fn splitInts(rows: usize, np: usize) usize {
         return rows * (1024 + splitChunks(np) * 257);
     }
 
-    /// sparse.select_tokens for decode rows (v1.8 sparse.py:323; also a prompt chunk of under 64 rows): `_scores_rows` over the
-    /// `np` pools of the graph's bucket into `scores` [rows, np], then the K best pools and each row's tokens and count:
-    /// `_select_split` (five launches, np >= 8192; `split` is its scratch) writes them itself, else `_select_rows` (visible
-    /// pools only) into `pools` and `_tokens`. qi [rows, H * D] contiguous; w points at ikr's gate columns (row stride w_stride).
+    /// sparse.select_tokens for decode rows (v1.8 sparse.py:323); notes/glm_triton.md#select-decode
     pub fn selectDecode(t: Tri, qi: u64, w: u64, w_stride: usize, pk: u64, pos: u64, scores: u64, pools: u64, split: u64, tokens: u64, counts: u64, rows: usize, np: usize, heads: usize, dim: usize) !void {
         if (np < topk_pools) return error.TopPoolsFallbackNotCaptured;
         const g = @min(row_score_g, cdiv(np, 64));
@@ -423,9 +390,7 @@ pub const Tri = struct {
     pub const segAttention = seg.segAttention;
     pub const convShiftSeg = seg.convShiftSeg;
 
-    /// sparse.select_split: the K best pools of `rows` rows of `np` scores across chunk programs, five launches over `split`
-    /// (zeroed totals first). `toks`: rows at pos, pos + 1, .. through `_tokens`' formulas into tokens / counts (VIS), else the
-    /// pool ids into `pools` [rows, K] int64.
+    /// sparse.select_split: the K best pools of `rows` rows in five launches; notes/glm_triton.md#select-split
     fn selectSplit(t: Tri, scores: u64, np: usize, pos: u64, split: u64, pools: u64, tokens: u64, counts: u64, rows: usize, toks: bool) !void {
         const cp = splitChunks(np);
         const tot = split;
@@ -437,10 +402,7 @@ pub const Tri = struct {
         }
     }
 
-    /// sparse._select_prompt (v1.8 sparse.py:358) for a prompt chunk of 64 rows or more at host position `host_pos`: its rows in
-    /// blocks of select_rows, each scored over `pool_count` pools by `_scores` (score_rows() = 4 rows a program) into `scores`,
-    /// then the best pools (`_select_split` for a block of under 64 rows at 8192 pools or more, else `_select_rows`) and
-    /// `_tokens`. `pos_at[j]` is the device i32 position of block j's first row (pos_at[0] is pos itself).
+    /// sparse._select_prompt (v1.8 sparse.py:358) for prompt chunks from 64 rows; notes/glm_triton.md#select-prompt
     pub fn selectPrompt(t: Tri, qi: u64, w: u64, w_stride: usize, pk: u64, pos_at: []const u64, scores: u64, pools: u64, split: u64, tokens: u64, counts: u64, rows: usize, host_pos: usize, np_max: usize, heads: usize, dim: usize) !void {
         const b = @min(rows, select_rows);
         if (pos_at.len < cdiv(rows, b)) return error.MissingBlockPositions;
@@ -462,8 +424,7 @@ pub const Tri = struct {
         }
     }
 
-    /// forward._shift_conv (forward.py:525): conv [L, 3, C] (in place) takes rows keep .. keep + 2 of [conv; proj rows]
-    /// (proj [L, R, >= C]); strides in elements as Python's conv.stride(0), proj.stride(0), proj.stride(1).
+    /// forward._shift_conv (forward.py:525): conv takes rows keep .. keep + 2; notes/glm_triton.md#shift-conv
     pub fn convShift(t: Tri, conv: u64, proj: u64, keep: usize, layers: usize, c: usize, conv_layer: usize, proj_layer: usize, proj_row: usize) !void {
         try t.run("_conv_shift", .{ layers, cdiv(c, 1024), 1 }, &.{ p("CONV", "*bf16", conv), p("PROJ", "*bf16", proj), int("keep", keep), int("conv_layer", conv_layer), int("proj_layer", proj_layer), int("proj_row", proj_row) }, &.{ ci("C", c), ci("TAPS", 3), ci("BLOCK", 1024) });
     }
@@ -548,7 +509,7 @@ test "every launch method type-checks" {
 
 test "selection sizes: pool counts, split chunks, scale" {
     const t = std.testing;
-    // v1.8 captures (cap/v1): _select_split CHS 2048 with CP 4 at 8,192 scores, CP 8 at 16,384; CHS 4096 with CP 8 at 32,768
+    // v1.8 captures (cap/v1): _select_split CHS 2048, CP 4 at 8,192 scores, CP 8 at 16,384; CHS 4096, CP 8 at 32,768
     try t.expectEqual(@as(usize, 4), splitChunks(8192));
     try t.expectEqual(@as(usize, 8), splitChunks(16384));
     try t.expectEqual(@as(usize, 4096), splitChunk(32768));

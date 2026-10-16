@@ -8,8 +8,7 @@ const int = kern.int;
 const u = kern.u;
 const kda_chunk_smem = kern.kda_chunk_smem;
 
-/// One KDA layer's chain (kda.chain): the conv, gates and delta rule over `rows` rows from `state_in`, the new state
-/// into `state_out` (0: none) and each row's k, v, g, b saved for a later replay. Element strides.
+/// One KDA layer's chain (kda.chain) over `rows` rows, strides in elements; notes/glm_kernels.md#chain
 pub const Chain = struct {
     heads: usize,
     p: u64,
@@ -38,13 +37,13 @@ pub const Chain = struct {
     y_tmp: u64 = 0,
 };
 
-// -- several lanes' windows in one launch (v1.8 kda.py:116-178) ----------------------------------------------------
+// -- several lanes' windows in one launch (v1.8 kda.py:116-178)
+
 /// kda.SEG_COLS: a segment table's row, int32 (first row, rows, state slot, parity, conv slot, keep).
 pub const seg_cols = 6;
 pub const SegRow = extern struct { row0: i32, rows: i32, slot: i32, parity: i32, conv: i32, keep: i32 };
 
-/// kda.segment_table: `segs` (rows, state slot, parity, conv slot, keep) back to back from row 0 into `out`, the rows past
-/// them empty segments (0 rows), so a table sized for the most lanes serves fewer.
+/// kda.segment_table: `segs` back to back from row 0 into `out`, the rest empty, so a table serves fewer lanes.
 pub fn segmentTable(segs: []const SegRow, out: []SegRow) !void {
     if (segs.len > out.len) return error.TooManySegments;
     var row0: i32 = 0;
@@ -70,9 +69,7 @@ test "segment tables lay the segments back to back and pad with empty ones" {
     try std.testing.expectError(error.TooManySegments, segmentTable(&five, &out));
 }
 
-/// kda.chain_segments' arguments: Chain's, with the lanes' states stacked by slot (strides in elements, as kda.cpp passes
-/// tensor strides): rec [slots, 2, layers, H, 128, 128] f32 at this layer (`rec` points at slot 0, parity 0, this layer),
-/// conv [slots, layers, 3, 3 H 128] bf16 at this layer; `seg` the device table of `nseg` rows.
+/// kda.chain_segments' arguments: Chain's, the lanes' states stacked by slot; notes/glm_kernels.md#chain-segments-args
 pub const ChainSegments = struct {
     heads: usize,
     seg: u64,
@@ -105,8 +102,7 @@ pub const ChainSegments = struct {
     y_tmp: u64,
 };
 
-/// kda.chain_segments (kda_chain_wide_segments_cuda, v1.8 kda.cu:604-627): one layer's window cut into the table's
-/// segments, each the bits of a solo wide chain of its rows; conv is read only (the commit shifts it).
+/// kda.chain_segments: one layer's window cut into the table's segments; notes/glm_kernels.md#chain-segments
 pub fn chainSegments(k: *const Kernels, s: cuda.Stream, c: ChainSegments) !void {
     var a: cuda.Args = .{};
     a.add(int(c.heads));
@@ -153,9 +149,7 @@ pub fn chainSegments(k: *const Kernels, s: cuda.Stream, c: ChainSegments) !void 
     try go(k.out, s, .{ c.rows, c.heads, 1 }, 128, 0, &o);
 }
 
-/// kda.replay_layers_segments (v1.8 kda.cu:629-634): each segment with keep < rows, every layer's state after its first
-/// `keep` saved rows, rec[slot, parity] into rec[slot, 1 - parity]. rec at slot 0, parity 0, layer 0; strides in
-/// elements; the saves [layers, scratch_rows, H, ...] of the window's rows.
+/// kda.replay_layers_segments: each segment's states after its kept rows; notes/glm_kernels.md#replay-segments
 pub fn replayLayersSegments(k: *const Kernels, s: cuda.Stream, seg: u64, nseg: usize, layers: usize, heads: usize, rec: u64, slot_stride: usize, parity_stride: usize, k_save: u64, v_save: u64, g_save: u64, b_save: u64, scratch_rows: usize) !void {
     var a: cuda.Args = .{};
     a.add(int(heads));
@@ -174,8 +168,7 @@ pub fn replayLayersSegments(k: *const Kernels, s: cuda.Stream, seg: u64, nseg: u
     try go(k.replay_layers_seg, s, .{ nseg * layers * heads, 1, 1 }, 1024, 0, &a);
 }
 
-/// hc.hc_partial (v1.8 hc.cu): decode rows' 24 mixing dots and sum of squares of x [rows, 16384] bf16 against fn [24, 16384]
-/// into part [rows, 16, 32] fp32 (glue._hc_partial's bits, 48 blocks a row).
+/// hc.hc_partial (v1.8 hc.cu): decode rows' 24 mixing dots and sum of squares; notes/glm_kernels.md#hc-partial
 pub fn hcPartial(k: *const Kernels, s: cuda.Stream, x: u64, fn_w: u64, part: u64, rows: usize) !void {
     var a: cuda.Args = .{};
     a.add(x);
@@ -185,8 +178,7 @@ pub fn hcPartial(k: *const Kernels, s: cuda.Stream, x: u64, fn_w: u64, part: u64
     try go(k.hc_partial, s, .{ 16, 3, (rows + 3) / 4 }, 288, 0, &a);
 }
 
-/// l2pf.prefetch: `count` (address, bytes) pieces of the table at `table` + 16 `first` into L2 (mode 0: cp.async.bulk.prefetch.L2,
-/// 1: prefetch.global.L2::evict_last per line, 2: loads), on the stream given.
+/// l2pf.prefetch: `count` (address, bytes) pieces of `table` from `first` into L2; notes/glm_kernels.md#l2-prefetch
 pub fn l2Prefetch(k: *const Kernels, s: cuda.Stream, table: u64, first: usize, count: usize, mode: i32, blocks: usize, threads: usize, sink: u64) !void {
     var a: cuda.Args = .{};
     a.add(table + 16 * first);
@@ -196,8 +188,7 @@ pub fn l2Prefetch(k: *const Kernels, s: cuda.Stream, table: u64, first: usize, c
     try go(k.l2pf, s, .{ blocks, 1, 1 }, threads, 0, &a);
 }
 
-/// kda_chunked.chain: a prompt chunk of `c.rows` rows whose first row sits at absolute position `pos`, in 32-row
-/// sub-chunks at absolute positions (TF_GLM_KDA_CHUNKED=1). Writes `c.out` and `c.state_out` only; the conv state is read.
+/// kda_chunked.chain: a prompt chunk in 32-row sub-chunks (TF_GLM_KDA_CHUNKED=1); notes/glm_kernels.md#chain-chunked
 pub fn chainChunked(k: *const Kernels, s: cuda.Stream, c: Chain, pos: usize) !void {
     var a: cuda.Args = .{};
     a.add(int(c.heads));

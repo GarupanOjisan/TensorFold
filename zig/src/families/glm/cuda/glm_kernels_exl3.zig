@@ -170,7 +170,7 @@ test "routed-expert plan items and prompt kernels' shared memory" {
     const t = std.testing;
     try t.expectEqual(@as(usize, 9), maxItems(9, 289, 16)); // one row: nine pairs, each its own expert
     try t.expectEqual(@as(usize, 289 + 18432 / 64), maxItems(18432, 289, 64)); // a 2,048-row chunk
-    // exl3.cu prompt_smem<64, XM>(): the larger of the stages (XM member-row copies and 2 x PWORDS halves, 3 deep) and the epilogue halves
+    // exl3.cu prompt_smem<64, XM>(): the larger of the stages and the epilogue halves; notes/glm_kernels.md#prompt-smem
     const stages = struct {
         fn bytes(xm: usize) usize {
             return 3 * (xm * 64 * 40 + 2 * 1024) * 2;
