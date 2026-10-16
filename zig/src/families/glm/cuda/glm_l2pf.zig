@@ -1,12 +1,4 @@
-//! TF_GLM_L2PF (v1.8 glm5_next/cuda/l2pf.py): in decode windows a small kernel on a side stream asks the memory system to
-//! bring the weights the main stream reads next into L2 while it waits on an all-gather or runs latency-bound glue. It only
-//! loads or prefetches, so no result changes. Three sites a layer: `a` at the attention block's all-gather (the FFN's
-//! hyper-connection weights and norm, the router and shared expert, or a dense MLP), `f` at the FFN's all-gather (the next
-//! layer's hyper-connection weights, norm and input projections; after the last layer the final norm and the head), `o` after
-//! the attention block's input projections (its output projection). Each site takes up to TF_GLM_L2PF_MB (default 8) MiB:
-//! small tensors first, then a 4-bit matrix's chunk heads where its decode launch is one wave, else the leading bytes of
-//! the large tensors. The side stream forks from the main stream at a site (an event) and is joined before a window ends,
-//! so it also works inside a captured graph.
+//! TF_GLM_L2PF (v1.8 l2pf.py): side-stream L2 prefetch of the weights decode reads next; notes/glm_l2pf.md#sites
 const std = @import("std");
 const cuda = @import("cuda");
 const wt = @import("glm_weights.zig");
@@ -132,8 +124,7 @@ fn ranges(gpa: std.mem.Allocator, groups: []const Group, budget: usize, out: *st
     }
 }
 
-/// l2pf.q4_heads: the first `left / chunks` bytes of every (64-column tile, K slice) chunk of a 4-bit matrix whose decode launch is
-/// one wave, so each program starts on L2 hits.
+/// l2pf.q4_heads: the head bytes of every chunk of a one-wave 4-bit matrix; notes/glm_l2pf.md#q4-heads
 fn q4Heads(gpa: std.mem.Allocator, q: Q4Head, left: usize, out: *std.ArrayList(T)) !void {
     const chunks = (q.n + 63) / 64 * kern.denseSplitK(q.n, q.k);
     const total = q.weight.bytes;
@@ -200,7 +191,7 @@ pub const Prefetch = struct {
         }
     }
 
-    /// Site `f`: the next layer's hyper-connection weights, norm and input projections; after the last layer the final norm and head.
+    /// Site `f`: the next layer's hyper-connection weights, norm and input projections, or the final norm and head.
     fn next(w: *const wt.Weights, nxt: ?wt.Layer, gs: *std.ArrayList(Group), gpa: std.mem.Allocator) !void {
         const n = nxt orelse {
             var a: Group = .{};

@@ -1,9 +1,4 @@
-//! TF_GLM_COMM=roce (v1.10's default, patch 0006 and b12x's "RoCEnante"): small all-gathers over the Sparks' link as one-shot RDMA
-//! writes instead of NCCL's ~30-50 us of fixed latency. The GB10 GPU writes its shard into pinned host memory the ConnectX-7
-//! RDMA-writes to the peer (roce_proxy.c's thread, unchanged), and reads the peer's shard from its own pinned memory in
-//! place (glm_roce.cu): one kernel, a device-side epoch so CUDA graphs replay it. Gathers of up to TF_ROCE_MAX_KB (default
-//! 512) KiB a rank whose size is a multiple of 16 bytes go this way, the rest through NCCL, with the same layout (rank order)
-//! and bits. libibverbs is opened by dlopen (roce_dl.c); the two ranks swap their connection blobs over the TCP pair.
+//! TF_GLM_COMM=roce (v1.10's default): small all-gathers as one-shot RDMA writes; notes/glm_roce.md#design
 const std = @import("std");
 const cuda = @import("cuda");
 const kern = @import("glm_kernels.zig");
@@ -28,8 +23,7 @@ const blocks = 8; // the largest grid; smaller shards launch fewer (power-of-two
 const classes = 4; // blocks.bit_length()
 const world = 2;
 
-/// TF_GLM_COMM: `nccl` all NCCL, `roce` required (a setup failure is an error), unset: RoCE when the HCAs are named and the
-/// setup works on both ranks, else NCCL.
+/// TF_GLM_COMM: `nccl` all NCCL, `roce` required, unset: RoCE when it sets up on both ranks; notes/glm_roce.md#mode
 pub const Mode = enum { nccl, roce, auto };
 
 pub fn mode(default: Mode) !Mode {
@@ -76,8 +70,7 @@ pub const Roce = struct {
     ctrl: u64,
     ctrl_words: [*]volatile u32,
 
-    /// Both ranks' HCAs, pinned region and proxy threads, connected through `pair` (rank 0 sends first). Every failure after the
-    /// first exchange is agreed on by both ranks.
+    /// Both ranks' HCAs, pinned region and proxy threads, connected through `pair`; notes/glm_roce.md#init
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, k: *const kern.Kernels, pair: cuda.Pair, rank: u32, max_bytes: usize) !*Roce {
         var r = try gpa.create(Roce);
         errdefer gpa.destroy(r);

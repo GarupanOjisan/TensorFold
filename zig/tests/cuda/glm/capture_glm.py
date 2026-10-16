@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
-"""GLM-5.3-Flash's Python CUDA engine (v0.6.6, two ranks) as the Zig engine's oracle: Triton launches and tokens.
+"""GLM-5.3-Flash's Python CUDA engine (v0.6.6, two ranks) as the Zig engine's oracle: Triton launches and tokens."""
+
+from __future__ import annotations
+
+HELP = """GLM-5.3-Flash's Python CUDA engine (v0.6.6, two ranks) as the Zig engine's oracle: Triton launches and tokens.
 
 Rank 0 runs the prompt set, serial and MTP-drafted, and writes launches.json, jit.json and tokens.json; rank 1
 mirrors it and is stopped once rank 0 has written them. The set covers what the native engine must replay: one-row
 and drafted windows of every width, prompts past one 2048-row chunk and past the 2,051-token dense limit (the
 indexer and sparse attention), and a three-chunk prompt.
 """
-
-from __future__ import annotations
 
 import argparse
 import hashlib
@@ -59,7 +61,7 @@ def lengths(model: Path, sizes: list[int]) -> dict[str, list[int]]:
 
 
 def copy_prompts(model: Path) -> dict[str, list[int]]:
-    """Prompts whose replies repeat the prompt (copy drafts fire): a code edit, a JSON edit, a JSON reformat, a quote."""
+    """Prompts whose replies repeat the prompt (copy drafts fire): code edit, JSON edit, JSON reformat, quote."""
 
     from tokenizers import Tokenizer
     import heapq
@@ -96,7 +98,7 @@ def copy_prompts(model: Path) -> dict[str, list[int]]:
 
 
 def window_ms(eng, rank: int, out: Path) -> None:
-    """Engine._calibrate's way (fastest of seven after two warm-up turns, the larger of the two ranks) for every window width."""
+    """Engine._calibrate's timing (fastest of 7 after 2 warm-ups, the larger rank) for every window width."""
 
     import numpy as np
     import torch
@@ -144,7 +146,7 @@ def specialization() -> dict:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=HELP)
     ap.add_argument("--model", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--rank", type=int, required=True)

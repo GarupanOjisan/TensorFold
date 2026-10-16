@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Print, per captured GLM Triton function, each variant's runtime params, constexprs, grids and call sites (host-only, no torch).
+"""Print each captured GLM Triton function's variants: runtime params, constexprs, grids and call sites."""
+
+from __future__ import annotations
+
+HELP = """Print, per captured GLM Triton function, each variant's runtime params, constexprs, grids and call sites (host-only, no torch).
 
 Compare with zig/src/families/glm/cuda/glm_triton.zig: launches.json comes from tools/zig/triton_aot_manifest.py's Recorder,
 aot.json from the AOT pack; a variant is one specialization (hash) of a function.
 """
-
-from __future__ import annotations
 
 import argparse
 import json
@@ -26,7 +28,7 @@ def b16_split_k(n: int, k: int) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__)
+    ap = argparse.ArgumentParser(description=HELP)
     ap.add_argument("--launches", default=str(Path.home() / "tf-native/cap/c2/launches.json"))
     ap.add_argument("--aot", default=str(Path.home() / "tf-native/aot/c2/aot.json"))
     a = ap.parse_args()

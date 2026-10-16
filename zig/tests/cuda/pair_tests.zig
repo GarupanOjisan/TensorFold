@@ -1,4 +1,4 @@
-//! Two ranks over NCCL: the unique id over the TCP pair, then an all-gather of GLM's per-layer size inside a CUDA graph.
+//! Two ranks over NCCL: the unique id over the TCP pair, then an all-gather of GLM's per-layer size in a CUDA graph.
 
 const std = @import("std");
 const cuda = @import("cuda");
