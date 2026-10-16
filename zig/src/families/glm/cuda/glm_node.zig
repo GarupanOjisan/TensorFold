@@ -71,7 +71,7 @@ pub const Node = struct {
         // both ranks must have been started with the same window and the same TF_GLM_DENSE (their all-gathered partials
         // would mix 4-bit and BF16 projections)
         // and the same row split (TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP: one rank's swaps would wait on the other's forever)
-        var mine = [5]u32{ @intCast(context), 0x474c4d31, @intFromEnum(try wt.denseKind()), @intFromBool(drafterDir() != null), (try fwd.SplitSettings.fromEnv()).code() };
+        var mine = [5]u32{ @intCast(context), 0x474c4d31, @backingInt(try wt.denseKind()), @intFromBool(drafterDir() != null), (try fwd.SplitSettings.fromEnv()).code() };
         var theirs: [5]u32 = undefined;
         if (rank == 0) {
             try n.pair.send(std.mem.sliceAsBytes(&mine));

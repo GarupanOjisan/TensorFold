@@ -199,9 +199,9 @@ pub fn rule(name: []const u8) Split {
     const cols = [_][]const u8{ ".mlp.shared_experts.down_proj.", ".mlp.down_proj.", ".self_attn.o_proj." };
     for (cols) |c| if (has(u8, name, c) != null) return .col;
     const rows = [_][]const u8{
-        ".mlp.shared_experts.gate_proj.", ".mlp.shared_experts.up_proj.", ".mlp.gate_proj.", ".mlp.up_proj.",
-        ".self_attn.q_proj.",             ".self_attn.k_proj.",           ".self_attn.v_proj.", ".self_attn.q_conv1d.",
-        ".self_attn.k_conv1d.",           ".self_attn.v_conv1d.",         ".self_attn.f_b_proj.", ".self_attn.g_b_proj.",
+        ".mlp.shared_experts.gate_proj.", ".mlp.shared_experts.up_proj.", ".mlp.gate_proj.",       ".mlp.up_proj.",
+        ".self_attn.q_proj.",             ".self_attn.k_proj.",           ".self_attn.v_proj.",    ".self_attn.q_conv1d.",
+        ".self_attn.k_conv1d.",           ".self_attn.v_conv1d.",         ".self_attn.f_b_proj.",  ".self_attn.g_b_proj.",
         ".self_attn.b_proj.",             ".self_attn.q_b_proj.",         ".self_attn.kv_b_proj.",
     };
     for (rows) |r| if (has(u8, name, r) != null) return .row;

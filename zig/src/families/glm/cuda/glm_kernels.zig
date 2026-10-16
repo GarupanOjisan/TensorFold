@@ -968,13 +968,13 @@ pub fn routed18(k: *const Kernels, s: cuda.Stream, x: u64, x_stride: usize, pick
         g.add(pl.done);
         try go(k.dec_gu_fused[bv][@intFromBool(rows_in)][dec_order], s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
     } else {
-    g.add(@as(u64, 0)); // done: only the gate/up epilogue fused into the kernel (TF_GLM_EXL3_FUSE 2) counts blocks
-    try go(if (rows_in) k.dec_gu_rows[bv][dec_order] else k.dec_gu[bv][dec_order], s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
-    var e: cuda.Args = .{};
-    for ([_]u64{ sc.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| e.add(v);
-    for ([_]usize{ p, i_w, sk_gu, slots }) |v| e.add(int(v));
-    e.add(limit);
-    try go(k.gu_epilogue18, s, .{ p, i_w / 128, 1 }, 32, 0, &e);
+        g.add(@as(u64, 0)); // done: only the gate/up epilogue fused into the kernel (TF_GLM_EXL3_FUSE 2) counts blocks
+        try go(if (rows_in) k.dec_gu_rows[bv][dec_order] else k.dec_gu[bv][dec_order], s, .{ items, i_w / 128, 2 * sk_gu }, 128, 0, &g);
+        var e: cuda.Args = .{};
+        for ([_]u64{ sc.z, pick, ex.svh_g, ex.svh_u, ex.suh_d, sc.xd }) |v| e.add(v);
+        for ([_]usize{ p, i_w, sk_gu, slots }) |v| e.add(int(v));
+        e.add(limit);
+        try go(k.gu_epilogue18, s, .{ p, i_w / 128, 1 }, 32, 0, &e);
     }
     var dn: cuda.Args = .{};
     for ([_]u64{ sc.xd, sc.xd, ex.down_base, ex.down_base, pl.items, pl.counts, pl.members, sc.z }) |v| dn.add(v);

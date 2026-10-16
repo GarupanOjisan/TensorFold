@@ -515,8 +515,8 @@ pub const Tri = struct {
 // Expected values below come from the capture's launches.json (cap/c2): each kernel's constexprs and grids.
 test "b16 split-K matches every captured _bmm shape" {
     const cases = [_][3]usize{
-        .{ 12576, 4096, 1 }, .{ 4096, 128, 1 },  .{ 4096, 4096, 4 }, .{ 12288, 4096, 1 },
-        .{ 4096, 6144, 4 },  .{ 2048, 4096, 8 }, .{ 8192, 1536, 2 }, .{ 160, 4096, 8 },
+        .{ 12576, 4096, 1 }, .{ 4096, 128, 1 },  .{ 4096, 4096, 4 },  .{ 12288, 4096, 1 },
+        .{ 4096, 6144, 4 },  .{ 2048, 4096, 8 }, .{ 8192, 1536, 2 },  .{ 160, 4096, 8 },
         .{ 4096, 8192, 4 },  .{ 4096, 1024, 4 }, .{ 77440, 4096, 1 }, .{ 4096, 1536, 4 },
     };
     for (cases) |c| try std.testing.expectEqual(c[2], b16SplitK(c[0], c[1]));

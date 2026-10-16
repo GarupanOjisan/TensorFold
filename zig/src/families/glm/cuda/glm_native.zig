@@ -231,7 +231,7 @@ const Glm = struct {
         if (sm.top_k == 0) {
             const stages = [_]usize{ g.nucleus_first, nucleus_wider };
             // without the union rule (stock v1.8) a row whose nucleus is not inside one rank's candidates goes straight to the shards
-            for (stages[0 .. if (g.nucleus_union) 2 else 1]) |count| {
+            for (stages[0..if (g.nucleus_union) 2 else 1]) |count| {
                 const words = try g.n.nucleus(which, rows, sm.temperature, count);
                 if (try g.drawNucleus(sm, rows, position0, words, count, out)) return;
             }

@@ -79,6 +79,5 @@ pub fn ncclPair(gpu: Gpu, rank: usize, host: []const u8, port: u16, reps: usize)
     for (0..2) |r| for (0..n) |i| {
         try expect(@as(u32, @bitCast(got[r * n + i])) == @as(u32, @bitCast(pattern(r, i))), "rank {d} element {d}: {d} != {d}", .{ r, i, got[r * n + i], pattern(r, i) });
     };
-    check.pass("NCCL {d}: two ranks, all-gather of {d}x{d} fp32 in a CUDA graph exact, {d:.1} us a gather in a graph of {d:.0}, {d:.1} us eager, over {d}", 
-        .{ try lib.version(), rows, hidden, ms * 1000 / @as(f32, @floatFromInt(reps * per_graph)), per_graph, eager_ms * 1000 / @as(f32, @floatFromInt(reps)), reps });
+    check.pass("NCCL {d}: two ranks, all-gather of {d}x{d} fp32 in a CUDA graph exact, {d:.1} us a gather in a graph of {d:.0}, {d:.1} us eager, over {d}", .{ try lib.version(), rows, hidden, ms * 1000 / @as(f32, @floatFromInt(reps * per_graph)), per_graph, eager_ms * 1000 / @as(f32, @floatFromInt(reps)), reps });
 }

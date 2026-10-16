@@ -53,20 +53,7 @@ pub fn main(init: std.process.Init) !u8 {
     while (i + 1 < args.len) : (i += 2) {
         const a = args[i];
         const v = args[i + 1];
-        if (std.mem.eql(u8, a, "--rank")) o.rank = try std.fmt.parseInt(u32, v, 10)
-        else if (std.mem.eql(u8, a, "--master")) o.master = v
-        else if (std.mem.eql(u8, a, "--port")) o.port = try std.fmt.parseInt(u16, v, 10)
-        else if (std.mem.eql(u8, a, "--prompts")) o.prompts = v
-        else if (std.mem.eql(u8, a, "--want")) o.want = v
-        else if (std.mem.eql(u8, a, "--max-tokens")) o.max_tokens = try std.fmt.parseInt(usize, v, 10)
-        else if (std.mem.eql(u8, a, "--context")) o.context = try std.fmt.parseInt(usize, v, 10)
-        else if (std.mem.eql(u8, a, "--depth")) o.depth = try std.fmt.parseInt(usize, v, 10)
-        else if (std.mem.eql(u8, a, "--copy")) o.copy = !std.mem.eql(u8, v, "0")
-        else if (std.mem.eql(u8, a, "--drafter")) o.drafter = v
-        else if (std.mem.eql(u8, a, "--only")) o.only = v
-        else if (std.mem.eql(u8, a, "--kernels")) o.kernels = v
-        else if (std.mem.eql(u8, a, "--out")) o.out = v
-        else {
+        if (std.mem.eql(u8, a, "--rank")) o.rank = try std.fmt.parseInt(u32, v, 10) else if (std.mem.eql(u8, a, "--master")) o.master = v else if (std.mem.eql(u8, a, "--port")) o.port = try std.fmt.parseInt(u16, v, 10) else if (std.mem.eql(u8, a, "--prompts")) o.prompts = v else if (std.mem.eql(u8, a, "--want")) o.want = v else if (std.mem.eql(u8, a, "--max-tokens")) o.max_tokens = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, a, "--context")) o.context = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, a, "--depth")) o.depth = try std.fmt.parseInt(usize, v, 10) else if (std.mem.eql(u8, a, "--copy")) o.copy = !std.mem.eql(u8, v, "0") else if (std.mem.eql(u8, a, "--drafter")) o.drafter = v else if (std.mem.eql(u8, a, "--only")) o.only = v else if (std.mem.eql(u8, a, "--kernels")) o.kernels = v else if (std.mem.eql(u8, a, "--out")) o.out = v else {
             std.debug.print("unknown option {s}\n", .{a});
             return 2;
         }
@@ -88,7 +75,7 @@ pub fn main(init: std.process.Init) !u8 {
     var pair = if (o.rank == 0) try cuda.Pair.listen(o.port) else try cuda.Pair.connect(o.master, o.port, 600);
     defer pair.close();
     // both ranks must run the same TF_GLM_DENSE: their all-gathered partials would mix 4-bit and BF16 projections
-    const dense_mine: u32 = @intFromEnum(try wt.denseKind());
+    const dense_mine: u32 = @backingInt(try wt.denseKind());
     var dense_theirs: u32 = undefined;
     if (o.rank == 0) {
         try pair.send(std.mem.asBytes(&dense_mine));
@@ -180,10 +167,8 @@ pub fn main(init: std.process.Init) !u8 {
             }
             if (!same) failed += 1;
             if (o.rank == 0) std.debug.print("{s} {s}: {d} prompt tokens in {d:.2} s, {d} tokens in {d:.2} s ({d:.1} tok/s{s}), {s}{s}\n", .{
-                if (same) "PASS" else "FAIL", name, ids.len, pre_s, out.items.len, dec_s,
-                @as(f64, @floatFromInt(out.items.len)) / @max(dec_s, 1e-9), if (drafted) try std.fmt.allocPrint(arena, ", {d} rounds{s}, {s}", .{ rounds, detail, if (drafter != null) "DFlash2" else "MTP" }) else "",
-                if (same) "equal to Python" else try std.fmt.allocPrint(arena, "first difference at {d}", .{at}),
-                if (same) "" else try std.fmt.allocPrint(arena, " (got {any})", .{out.items[0..@min(out.items.len, at + 4)]}),
+                if (same) "PASS" else "FAIL",                               name,                                                                                                                                       ids.len,                                                                                          pre_s,                                                                                                         out.items.len, dec_s,
+                @as(f64, @floatFromInt(out.items.len)) / @max(dec_s, 1e-9), if (drafted) try std.fmt.allocPrint(arena, ", {d} rounds{s}, {s}", .{ rounds, detail, if (drafter != null) "DFlash2" else "MTP" }) else "", if (same) "equal to Python" else try std.fmt.allocPrint(arena, "first difference at {d}", .{at}), if (same) "" else try std.fmt.allocPrint(arena, " (got {any})", .{out.items[0..@min(out.items.len, at + 4)]}),
             });
         }
     }
