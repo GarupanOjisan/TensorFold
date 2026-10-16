@@ -231,8 +231,7 @@ pub const Info = struct {
     prompt_logprobs: bool = false,
     /// Prompt rows a prefill chunk at most, for the server's chunk starts (0: the engine cuts prompts itself).
     prefill_step: u32 = 0,
-    /// Chunk starts and kept prompt states sit on multiples of this many rows (a family whose prompt kernels depend on
-    /// the alignment of their sub-chunks; 0: anywhere).
+    /// Chunk starts and kept prompt states sit on multiples of this many rows (0: anywhere).
     prefill_grid: u32 = 0,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
     prompt_cache: bool = false,
@@ -593,11 +592,5 @@ pub const keepalive = @import("keepalive.zig");
 pub const originals = @import("originals.zig");
 
 test {
-    _ = @import("lane_host.zig");
-    _ = @import("lane_host_test.zig");
-    _ = @import("prompt_cache.zig");
-    _ = @import("prompt_radix.zig");
-    _ = @import("prompt_imprint.zig");
-    _ = @import("keepalive.zig");
-    _ = @import("originals_test.zig");
+    _ = @import("engine_api_test.zig");
 }

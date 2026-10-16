@@ -82,37 +82,7 @@ pub const Engine = struct {
     pub const opened = open.opened;
     pub const fills = open.fills;
     pub const fillStream = open.fillStream;
-
-    /// addStream for streams being filled (v1.10 FILL): one Backend.prefillMany round over them, then the first token and
-    /// drafts of each whose prompt is in; it joins the rounds. Reorders `streams` with those done first and returns their
-    /// count; errs[i] is done stream i's error (a failed round: every stream's, all done), else null. Without the hook
-    /// each stream is added whole, in order.
-    pub fn fillStreams(e: *Engine, streams: []*Stream, errs: []?anyerror) usize {
-        @memset(errs, null);
-        if (e.backend.vtable.prefill_many == null) {
-            for (streams, errs) |s, *er| er.* = if (e.addStream(s)) null else |err| err;
-            return streams.len;
-        }
-        _ = e.arena.reset(.retain_capacity);
-        const k = e.backend.prefillMany(streams) catch |err| {
-            for (streams, errs) |s, *er| {
-                if (s.isCancelled()) e.backend.release(s);
-                er.* = if (s.isCancelled()) error.Cancelled else err;
-            }
-            return streams.len;
-        };
-        for (streams[0..k], errs[0..k]) |s, *er| {
-            trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) }) catch |err| {
-                er.* = err;
-                e.backend.release(s);
-                continue;
-            };
-            e.opened(s) catch |err| {
-                er.* = err;
-            };
-        }
-        return k;
-    }
+    pub const fillStreams = open.fillStreams;
 
     /// Take over a stream another driver decoded so far: its cache settled, `pending` and `cache_len` set, no drafts held.
     pub fn adopt(e: *Engine, s: *Stream) !void {

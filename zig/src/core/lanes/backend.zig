@@ -104,9 +104,7 @@ pub const Backend = struct {
         reports_fill: bool = false,
         /// The stream left the rounds: free its caches and held drafts.
         release: *const fn (ptr: *anyopaque, s: *Stream) void,
-        /// One prompt round over streams being filled (their prompts may share a pass), the host running a decode round
-        /// between calls: reorders `streams` so those whose prompt is in (their first token drawn) or that were
-        /// cancelled come first, and returns their count; the others go on at the next call. null: one `prefill` each.
+        /// One prompt round over filling streams in one pass: done or cancelled ones first, their count returned.
         prefill_many: ?*const fn (ptr: *anyopaque, streams: []*Stream) anyerror!usize = null,
     };
 

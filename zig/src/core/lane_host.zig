@@ -32,8 +32,7 @@ pub const LaneHost = struct {
     queued: std.ArrayList(*Job) = .empty,
     admitted: std.ArrayList(*Job) = .empty,
     filling: std.ArrayList(*Job) = .empty, // admitted jobs whose prompt is still going in, a chunk a round, oldest first
-    /// TENSORFOLD_ACCEPT_WAIT_MS: when nothing decodes or fills and a request arrives, wait up to this long for others,
-    /// so prompts sent together prefill in one pass (what v1.10's Python front end ends up doing); 0: take it at once.
+    /// TENSORFOLD_ACCEPT_WAIT_MS: idle with a request in, wait this long for others so they prefill in one pass.
     accept_wait_ms: u32 = 0,
     cancels: std.ArrayList(Id) = .empty,
     closing: bool = false,
@@ -420,9 +419,7 @@ pub const LaneHost = struct {
         return if (h.decoded_rows) r.decode_spans else &.{};
     }
 
-    /// A prompt-only pass on a `warm_turns` engine: the backend prefills, the cache keeps its end (a mark, if keyed on)
-    /// FILL's grouped round (Backend.prefill_many, v1.10 multi_prefill): one prompt-chunk round over every filling job,
-    /// their prompts sharing a pass; those whose prompt is in start decoding, the rest take the next round.
+    /// FILL's grouped round (Backend.prefill_many): every filling job's next chunk in one pass; done ones decode.
     fn fillMany(h: *LaneHost) void {
         const max = 16;
         var streams: [max]*lanes.Stream = undefined;
@@ -463,6 +460,7 @@ pub const LaneHost = struct {
         }
     }
 
+    /// A prompt-only pass on a `warm_turns` engine: the backend prefills, the cache keeps its end (a mark, if keyed on)
     fn warmPass(h: *LaneHost, job: *Job, began: i96) bool {
         const be = h.core.backend;
         be.prefill(&job.stream) catch |e| { // a yield ends it like a cancel: what it prefilled is kept

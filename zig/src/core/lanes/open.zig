@@ -70,8 +70,7 @@ pub fn opened(e: *Engine, s: *Stream) !void {
     try e.live.append(e.gpa, s);
 }
 
-/// Whether the backend can run a prompt pass a chunk at a time between rounds (`fillStream`, or `Engine.fillStreams`
-/// over every filling stream at once).
+/// Whether the backend can run a prompt pass a chunk at a time between rounds (`fillStream` or `fillStreams`).
 pub fn fills(e: *const Engine) bool {
     return e.backend.vtable.prefill_step != null or e.backend.vtable.prefill_many != null;
 }
@@ -88,4 +87,32 @@ pub fn fillStream(e: *Engine, s: *Stream, first: bool) !bool {
     if (!done) return false;
     try opened(e, s);
     return true;
+}
+
+/// FILL's grouped round (Backend.prefill_many): done streams first and their count; errs[i] is done stream i's error.
+pub fn fillStreams(e: *Engine, streams: []*Stream, errs: []?anyerror) usize {
+    @memset(errs, null);
+    if (e.backend.vtable.prefill_many == null) { // without the hook each stream is added whole, in order
+        for (streams, errs) |s, *er| er.* = if (add(e, s)) null else |err| err;
+        return streams.len;
+    }
+    _ = e.arena.reset(.retain_capacity);
+    const k = e.backend.prefillMany(streams) catch |err| { // a failed round: every stream's error, all done
+        for (streams, errs) |s, *er| {
+            if (s.isCancelled()) e.backend.release(s);
+            er.* = if (s.isCancelled()) error.Cancelled else err;
+        }
+        return streams.len;
+    };
+    for (streams[0..k], errs[0..k]) |s, *er| {
+        trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) }) catch |err| {
+            er.* = err;
+            e.backend.release(s);
+            continue;
+        };
+        opened(e, s) catch |err| {
+            er.* = err;
+        };
+    }
+    return k;
 }

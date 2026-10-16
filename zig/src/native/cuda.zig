@@ -16,7 +16,6 @@ const cuda_disk = @import("cuda_disk.zig");
 const vision_offer = @import("cuda_vision_offer.zig");
 
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-/// Families of one model_type are tried in order: the first whose `reads` (if declared) takes the checkpoint opens it.
 const registry = .{ nemotron.native, nemotron.omni, glm_exl3, glm.native };
 
 /// --record opens here (engines.zig refuses it for a backend without this).
@@ -213,6 +212,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
         problem.* = why;
         return null;
     }
+    // families of one model_type in registry order: the first whose `reads` (if declared) takes the checkpoint
     inline for (registry) |F| {
         if (std.mem.eql(u8, o.model_type, F.model_type) and (!@hasDecl(F, "reads") or F.reads(gpa, io, o.dir)))
             return openWith(F, a, gpa, io, o, problem);
@@ -465,8 +465,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         std.log.info("recording each stream's rows under {s}/{s}", .{ dir, r.recorder.name });
     }
     errdefer if (h.recording) |r| r.free(gpa);
-    // the family cuts its own prompt grid from position 0, as `tensorfold run` does: prefill_step 0; a family with
-    // `promptGrid` (the EXL3 GLM) has the server cut its prompts at chunk starts on that grid instead
+    // the family cuts its prompts from 0 (prefill_step 0), or the server cuts a `promptGrid` family's on its grid
     const server_cuts = @hasDecl(F, "promptGrid") and h.store != null;
     try h.serve(io, loaded.facts, loaded.rows, .{
         .lanes = streams,
