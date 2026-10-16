@@ -84,12 +84,12 @@ pub const Kernels = struct {
         errdefer k.mods[1].unload();
         k.mods[2] = try cuda.Module.load(d, cuda.kernels.glm_port_glue);
         errdefer k.mods[2].unload();
-        // the 4-bit draft head: Nemotron's copies of qmm_group.cu and qmm_prefill.cu, and its MLX -> tiled packing (nemotron_ops)
+        // the 4-bit draft head: Nemotron's copies of qmm_group.cu and qmm_prefill.cu, and its MLX -> tiled packing (affine4_pack)
         k.mods[3] = try cuda.Module.load(d, cuda.kernels.qmm_group);
         errdefer k.mods[3].unload();
         k.mods[4] = try cuda.Module.load(d, cuda.kernels.qmm_prefill);
         errdefer k.mods[4].unload();
-        k.mods[5] = try cuda.Module.load(d, cuda.kernels.nemotron_ops);
+        k.mods[5] = try cuda.Module.load(d, cuda.kernels.affine4_pack);
         errdefer k.mods[5].unload();
         // TF_GLM_DENSE=q4's decode matmul: v1.8's qmm.cu (cuda/kernels/qmm.py `qmm`, `qmm_cfg`)
         k.mods[6] = try cuda.Module.load(d, cuda.kernels.qmm);
