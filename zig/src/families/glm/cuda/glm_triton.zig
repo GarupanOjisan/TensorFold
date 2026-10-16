@@ -5,18 +5,19 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const aot = cuda.aot;
+const seg = @import("glm_triton_seg.zig");
 
-const p = aot.ptr;
+pub const p = aot.ptr;
 
-fn int(name: []const u8, v: usize) aot.Arg {
+pub fn int(name: []const u8, v: usize) aot.Arg {
     return aot.int(name, @intCast(v));
 }
 
-fn ci(name: []const u8, v: usize) aot.Const {
+pub fn ci(name: []const u8, v: usize) aot.Const {
     return aot.ci(name, @intCast(v));
 }
 
-fn flag(name: []const u8, v: bool) aot.Const {
+pub fn flag(name: []const u8, v: bool) aot.Const {
     return aot.ci(name, @intFromBool(v));
 }
 
@@ -24,12 +25,12 @@ fn u(x: usize) u32 {
     return @intCast(x);
 }
 
-fn cdiv(a: usize, b: usize) usize {
+pub fn cdiv(a: usize, b: usize) usize {
     return (a + b - 1) / b;
 }
 
 /// triton.next_power_of_2.
-fn pow2(n: usize) usize {
+pub fn pow2(n: usize) usize {
     return std.math.ceilPowerOfTwo(usize, n) catch unreachable;
 }
 
@@ -105,11 +106,11 @@ pub const split_blk = 16;
 pub const score_loop = 32;
 
 /// sparse.split_chunk / split_chunks: scores a `_select_split` chunk program takes, and the chunk programs a row of np scores takes.
-fn splitChunk(np: usize) usize {
+pub fn splitChunk(np: usize) usize {
     return if (np <= 16384) 2048 else 4096;
 }
 
-fn splitChunks(np: usize) usize {
+pub fn splitChunks(np: usize) usize {
     return pow2(cdiv(np, splitChunk(np)));
 }
 
@@ -120,11 +121,11 @@ pub fn poolCount(pos: usize, rows: usize, np_max: usize) usize {
 }
 
 /// select_tokens' scale and wscale (1 / 5.656854249492381 exactly for 32 heads).
-fn indexScale(dim: usize) f32 {
+pub fn indexScale(dim: usize) f32 {
     return @floatCast(std.math.pow(f64, @floatFromInt(dim), -0.5));
 }
 
-fn indexWscale(heads: usize) f32 {
+pub fn indexWscale(heads: usize) f32 {
     return @floatCast(if (heads == 32) 1.0 / 5.656854249492381 else std.math.pow(f64, @floatFromInt(heads), -0.5));
 }
 
@@ -149,11 +150,11 @@ pub const Tri = struct {
 
     /// A cache's values / scales as the kernels take them (kv8.parts): the codes and the fp32 view of the same rows, or
     /// the bf16 rows twice.
-    fn kvv(t: Tri, name: []const u8, addr: u64) aot.Arg {
+    pub fn kvv(t: Tri, name: []const u8, addr: u64) aot.Arg {
         return p(name, if (t.fp8) "*fp8e4nv" else "*bf16", addr);
     }
 
-    fn kvs(t: Tri, name: []const u8, addr: u64) aot.Arg {
+    pub fn kvs(t: Tri, name: []const u8, addr: u64) aot.Arg {
         return p(name, if (t.fp8) "*fp32" else "*bf16", addr);
     }
 
@@ -162,7 +163,7 @@ pub const Tri = struct {
         return if (t.fp8) width + 16 else width;
     }
 
-    fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
+    pub fn run(t: Tri, name: []const u8, grid: [3]usize, args: []const aot.Arg, consts: []const aot.Const) !void {
         try t.set.run(t.s, name, .{ u(grid[0]), u(grid[1]), u(grid[2]) }, args, consts);
     }
 
@@ -415,56 +416,12 @@ pub const Tri = struct {
         try t.run("_tokens", .{ rows, 1, 1 }, &.{ p("POOLS", "*i64", pools), p("POS", "*i32", pos), p("TOK", "*i32", tokens), p("CNT", "*i32", counts) }, &.{ ci("W", select_width), ci("K", topk_pools), ci("PL", pool), ci("BLOCK", 1024) });
     }
 
-    // -- segmented windows (v1.10 segments.py, latent.seg_*, sparse.seg_*): several lanes' rows back to back, each row's
-    // position and arena base in the SegRows tables (glm_segments.zig), so one CUDA graph a row count serves every mix.
-
-    /// latent.seg_latent_write: lat [R, LW] rows into the arena at each row's base + pos.
-    pub fn segLatWrite(t: Tri, lat: u64, lat_stride: usize, cache: u64, pos: u64, base: u64, rows: usize, lw: usize) !void {
-        try t.run("_seg_lat_write", .{ rows, 1, 1 }, &.{ p("LAT", "*bf16", lat), int("lat_stride", lat_stride), t.kvv("LC", cache), t.kvs("LS", cache), p("POS", "*i32", pos), p("BASE", "*i32", base) }, &.{ ci("LW", lw), ci("RS", t.kvRow(lw)), flag("FP8", t.fp8) });
-    }
-
-    /// sparse.seg_index_update: each row's index key and gate at ibase + pos % ring, then every pool a row completes.
-    pub fn segIndexUpdate(t: Tri, k_raw: u64, k_stride: usize, gate: u64, ln_w: u64, ln_b: u64, ape: u64, ik: u64, ig: u64, pk: u64, pos: u64, base: u64, ibase: u64, ring: i32, rows: usize) !void {
-        try t.run("_seg_index_write", .{ rows, 1, 1 }, &.{ p("KR", "*bf16", k_raw), int("k_stride", k_stride), p("GR", "*fp32", gate), p("LNW", "*bf16", ln_w), p("LNB", "*bf16", ln_b), p("IK", "*bf16", ik), p("IG", "*bf16", ig), p("POS", "*i32", pos), p("IBASE", "*i32", ibase), aot.int("RING", ring), aot.float("eps", 1e-6) }, &.{ci("D", 128)});
-        try t.run("_seg_pool_keys", .{ rows, 1, 1 }, &.{ p("IK", "*bf16", ik), p("IG", "*bf16", ig), p("APE", "*bf16", ape), t.kvv("PK", pk), t.kvs("PKS", pk), p("POS", "*i32", pos), p("BASE", "*i32", base), p("IBASE", "*i32", ibase), aot.int("RING", ring) }, &.{ ci("D", 128), ci("RS", t.kvRow(128)), flag("FP8", t.fp8) });
-    }
-
-    /// Scores a segmented selection's rows hold (segments.SelectScratch over a pool of up to 4,194,304 tokens: the
-    /// split selection's CHS 4096 / CP 256, the shapes v1.10's captured graphs launch).
-    pub const seg_pools = 1 << 20;
-
-    /// sparse.seg_select_tokens: every segment's pools up to its device-side count scored by `_seg_scores` (`segs` programs,
-    /// one a table segment), then the split selection over each sparse row's visible pools into tokens / counts.
-    pub fn segSelect(t: Tri, qi: u64, w: u64, w_stride: usize, pk: u64, scores: u64, split: u64, tokens: u64, counts: u64, pos: u64, sparse: u64, start: u64, nrows: u64, pbase: u64, pools: u64, rows: usize, segs: usize, heads: usize, dim: usize) !void {
-        const np = seg_pools;
-        const g = @min(256, cdiv(np, 64));
-        try t.run("_seg_scores", .{ segs, g, 1 }, &.{ p("QI", "*bf16", qi), p("W", "*bf16", w), int("w_stride", w_stride), t.kvv("PK", pk), t.kvs("PKS", pk), p("OUT", "*fp32", scores), int("o_stride", np), p("POS", "*i32", pos), p("SPR", "*i32", sparse), p("SEG_START", "*i32", start), p("SEG_ROWS", "*i32", nrows), p("SEG_PBASE", "*i32", pbase), p("SEG_POOLS", "*i32", pools), aot.float("scale", indexScale(dim)), aot.float("wscale", indexWscale(heads)) }, &.{ ci("H", heads), ci("HP", @max(16, pow2(heads))), ci("D", dim), ci("BP", 64), ci("G", g), ci("RS", t.kvRow(128)), flag("FP8", t.fp8) });
-        const cp = splitChunks(np);
-        const tot = split;
-        const hist = split + rows * 1024 * 4;
-        const gt = split + rows * (1024 + cp * 256) * 4;
-        try t.s.d.check(t.s.d.api.cuMemsetD8Async(tot, 0, rows * 1024 * 4, t.s.handle), "cuMemsetD8Async");
-        for (0..5) |step| {
-            try t.run("_select_split", .{ rows, cp, 1 }, &.{ p("S", "*fp32", scores), int("s_stride", np), int("NPC", np), p("POS", "*i32", pos), p("SPR", "*i32", sparse), p("TOT", "*i32", tot), p("HIST", "*i32", hist), p("GT", "*i32", gt), p("OUT", "*i32", split), p("TOK", "*i32", tokens), p("CNT", "*i32", counts) }, &.{ ci("W", select_width), ci("K", topk_pools), ci("PL", pool), ci("CHS", splitChunk(np)), ci("CP", cp), ci("STEP", step), flag("SEG", true), flag("VIS", false), flag("TOKS", false), ci("BLK", split_blk) });
-        }
-    }
-
-    /// latent.seg_attention: dense rows over their stream's keys 0 .. pos, sparse rows over their selected tokens, each in its
-    /// own arena extent; seg_chunks() = 5 chunk programs a row, `_merge` over them (a row's bits are its lone window's).
-    pub fn segAttention(t: Tri, qa: u64, lc: u64, pos: u64, base: u64, sparse: u64, tokens: ?u64, counts: ?u64, s: Scratch, out: u64, rows: usize, heads: usize, lw: usize, scale: f32) !void {
-        const nch = 5; // latent.seg_chunks: cdiv(max(SPARSE_FROM, TOKENS), CHUNK)
-        if (rows > s.part_rows) return error.RowsPastScratch;
-        const hb_: usize = if (rows >= 8) hb_wide else hb; // latent.seg_head_block (SEG_WIDE_ROWS 8)
-        const r_arg: aot.Arg = int("R", rows);
-        try t.run("_seg_chunks", .{ rows, cdiv(heads, hb_), nch }, &.{ p("QA", "*bf16", qa), t.kvv("LC", lc), t.kvs("LS", lc), p("POS", "*i32", pos), p("BASE", "*i32", base), p("SPR", "*i32", sparse), p("TOK", "*i32", tokens orelse s.dummy), p("CNT", "*i32", counts orelse s.dummy), p("PO", "*fp32", s.po), p("PM", "*fp32", s.pm), p("PL", "*fp32", s.pl), r_arg }, &.{ ci("W", if (tokens != null) select_width else 1), ci("H", heads), ci("LW", lw), ci("CH", chunk), aot.cf("SCALE", scale), ci("HBT", hb_), ci("KTT", kt), ci("RS", t.kvRow(lw)), flag("FP8", t.fp8) });
-        try t.run("_merge", .{ rows, heads, 1 }, &.{ p("PO", "*fp32", s.po), p("PM", "*fp32", s.pm), p("PL", "*fp32", s.pl), p("OUT", "*bf16", out), p("CNT", "*i32", s.dummy), int("R", rows) }, &.{ ci("H", heads), ci("LW", lw), ci("NCH", nch), flag("SPARSE", false) });
-    }
-
-    /// forward.conv_shift_segments: each table segment's conv slot takes rows keep .. keep + 2 of [conv; its projection rows].
-    /// Strides in elements: conv slot and layer, projection layer and row.
-    pub fn convShiftSeg(t: Tri, conv: u64, proj: u64, seg: u64, nseg: usize, layers: usize, c: usize, conv_slot: usize, conv_layer: usize, proj_layer: usize, proj_row: usize) !void {
-        try t.run("_conv_shift_seg", .{ layers, cdiv(c, 1024), nseg }, &.{ p("CONV", "*bf16", conv), p("PROJ", "*bf16", proj), p("SEG", "*i32", seg), int("conv_slot", conv_slot), int("conv_layer", conv_layer), int("proj_layer", proj_layer), int("proj_row", proj_row) }, &.{ ci("C", c), ci("TAPS", 3), ci("COLS", 6), ci("BLOCK", 1024) });
-    }
+    pub const segLatWrite = seg.segLatWrite;
+    pub const segIndexUpdate = seg.segIndexUpdate;
+    pub const seg_pools = seg.seg_pools;
+    pub const segSelect = seg.segSelect;
+    pub const segAttention = seg.segAttention;
+    pub const convShiftSeg = seg.convShiftSeg;
 
     /// sparse.select_split: the K best pools of `rows` rows of `np` scores across chunk programs, five launches over `split`
     /// (zeroed totals first). `toks`: rows at pos, pos + 1, .. through `_tokens`' formulas into tokens / counts (VIS), else the
