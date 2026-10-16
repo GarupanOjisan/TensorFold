@@ -257,8 +257,7 @@ pub const State = struct {
         return st.kda_layers * ll * 128 * 128 * f4;
     }
 
-    /// One sequence's state for `w`'s layers, carved out of `a` (a.size 0: count only). `pooled`: its KDA states and DSA
-    /// layers' caches are left to Pool.view (the MTP layer's stay here).
+    /// One sequence's state carved out of `a` (a.size 0: count only); `pooled` leaves KDA and DSA caches to Pool.view.
     pub fn carveIn(a: *Arena, w: *const Weights, capacity: usize, long_context: bool, kv_fp8: bool, pooled: bool) State {
         const c = w.cfg;
         const ll: usize = c.kda_heads / wt.world;
@@ -318,12 +317,7 @@ pub const State = struct {
 /// A lane's DSA extent starts at a multiple of this many tokens (v1.10 segments.EXTENT; its pooled keys at base / 4).
 pub const extent = 2048;
 
-/// Every lane's KDA states and DSA layers' caches in one allocation, laid out as v1.10's slots and arenas (multi.py's
-/// slots, segments.py) so the segmented kernels reach any lane from one base: KDA rec [slots, 2, layers, LL, 128, 128] f32
-/// and conv [slots, layers, 3, 3 LL 128] bf16; a DSA layer's latents [slots x extent_rows, row], index keys and gates
-/// [slots x extent_rows, 128] bf16 (no rings: token t of slot s at s x extent_rows + t, segments.SegRows' ibase = base),
-/// pooled keys [slots x extent_rows / 4 + 2, row]. Each lane's State points into its slot (Pool.view), so its own calls
-/// run as before. Also the segmented window's KDA scratch (one layer set of `max_rows` rows) and tables.
+/// Every lane's KDA states and DSA caches in one allocation (v1.10's slots); notes/glm_forward.md#pool-layout
 pub const Pool = struct {
     mem: cuda.DeviceBuffer,
     slots: usize,
@@ -338,15 +332,14 @@ pub const Pool = struct {
     pk: [16]u64 = @splat(0),
     lat_row: usize,
     pk_row: usize,
-    /// The segmented window's KDA projection rows and replay saves, [layers, shared_rows, ...] (kda.KDAScratchSet's layout).
+    /// The segmented window's KDA projection rows and replay saves, [layers, shared_rows, ...] (kda.KDAScratchSet).
     proj: u64,
     scr: KdaScratch,
     /// kda.segment_table [max_lanes, kern.seg_cols] i32 and segments.SegRows' tables (glm_segments.zig), device copies.
     kseg: u64,
     segrows: u64,
 
-    /// A slot's tokens in the arenas for lanes of `capacity`: capacity rounded up to `extent`, with room for the pooled
-    /// keys' two rows past capacity / 4 (a slot's pooled keys must end before the next slot's begin).
+    /// A slot's tokens in the arenas for lanes of `capacity`; notes/glm_forward.md#pool-layout
     pub fn extentRows(capacity: usize) usize {
         var n = std.mem.alignForward(usize, capacity, extent);
         if (capacity / 4 + 2 > n / 4) n += extent;

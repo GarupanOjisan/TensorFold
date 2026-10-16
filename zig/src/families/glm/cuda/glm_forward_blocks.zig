@@ -18,19 +18,17 @@ const Buffers = buffers.Buffers;
 const KdaScratch = buffers.KdaScratch;
 const max_rows = Engine.max_rows;
 
-// -- blocks -------------------------------------------------------------------------------------------------
 pub fn gather(e: *Engine, b: *const Buffers, rows: usize) !u64 {
     try e.comm.allGather(e.s, b.part, b.gath, rows * e.w.cfg.hidden);
     return b.gath;
 }
 
-/// forward.mm: x rows (stride in elements) times q.T into out (fp32 with `wide`). BF16 and FP8 weights ignore the
-/// group sums `xs` (qmm.matmul); a 4-bit q takes the prompt matmul in a prompt chunk, else the decode matmul on `xs`.
+/// forward.mm: x rows (stride in elements) times q.T into out (fp32 with `wide`); notes/glm_forward.md#matmul
 pub fn mm(e: *Engine, b: *const Buffers, x: u64, x_stride: usize, xs: u64, q: Mat, out: u64, rows: usize, wide: bool) !void {
     switch (q.kind) {
         .b16 => try e.t.matmulB16(x, x_stride, q.ptr, out, b.sk, rows, q.n, q.k, wide),
         .q4 => if (b.prefill) try kern.q4Prefill(e.k, e.s, x, x_stride, q.q4(), out, rows, wide) else {
-            // a shared window past 16 rows on the 32-row tile (each weight read once; a row's bits as on its lane's 16)
+            // a shared window past 16 rows on the 32-row tile (each weight read once; bits as on the lane's 16)
             const qq = q.q4();
             if (rows > max_rows and envOn("TF_GLM_QMM32")) {
                 try kern.qmmShared(e.k, e.s, x, x_stride, xs, qq, out, rows, wide);
@@ -57,8 +55,7 @@ pub fn mm(e: *Engine, b: *const Buffers, x: u64, x_stride: usize, xs: u64, q: Ma
     }
 }
 
-/// forward.out_proj: every rank's partials [world, R, D] (b.gath), or 0 while a prompt chunk runs row-split, which
-/// exchanges them itself (forward.partials).
+/// forward.out_proj: every rank's partials [world, R, D] (b.gath), or 0 while a prompt chunk runs row-split.
 pub fn outProj(e: *Engine, b: *const Buffers, x: u64, xs: u64, q: Mat, rows: usize, site: ?struct { u32, usize }) !u64 {
     if (e.splitActive(b)) {
         try e.splitPartial(b, .{ .proj = .{ .x = x, .xs = xs, .q = q } });
@@ -95,7 +92,7 @@ pub fn kdaBlock(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize, 
         try e.mm(b, b.normed, c.hidden, b.xs, kw.proj, p, rows, false);
         const fa = p + kw.fa_off * bf;
         const ga = p + kw.ga_off * bf;
-        // f_b and g_b read these group sums when 4-bit; BF16 weights ignore them (qmm.matmul), but Python still launches _group_sums
+        // the group sums f_b and g_b read when 4-bit; notes/glm_forward.md#matmul
         try e.t.groupSums(fa, e.width, b.xs_fa, rows, 128);
         try e.mm(b, fa, e.width, b.xs_fa, kw.fb, b.ka, rows, false);
         try e.t.groupSums(ga, e.width, b.xs_ga, rows, 128);
@@ -108,8 +105,7 @@ pub fn kdaBlock(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize, 
     return e.outProj(b, scr_out, b.kxs, kw.o, rows, .{ l.index, 0 });
 }
 
-/// kdaBlock's state work after its projections (b.kproj or the lane's proj): the chain over the KDA state and, for a
-/// prompt chunk, the conv window's move; the rows' outputs in the scratch's `out`.
+/// kdaBlock after its projections: the chain over the KDA state (and a prompt chunk's conv move) into scratch out.
 pub fn kdaState(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize, host_pos: usize) !void {
     const c = e.w.cfg;
     const kw = l.kda.?;
@@ -209,8 +205,7 @@ pub fn dsaState(e: *Engine, l: *const wt.Layer, b: *const Buffers, kc: u64, pos_
         const lat_nch = tri.chunksFor(@min(e.st.capacity, 2560) + b.rows);
         // a captured window serves every dense position: all chunks, as Python's graphs (pos unknown) run
         const nch = if (e.capturing) lat_nch else @min(tri.chunksFor(host_pos + rows), lat_nch);
-        // rows past the dense limit are recomputed sparsely below: the dense pass needs only the rows before it (a row's
-        // dense bits do not depend on the others), with the window's head block (forward.dense_rows)
+        // the dense pass only on the rows before the dense limit (forward.dense_rows); notes/glm_forward.md#dense-rows
         const dense = if (sparse_rows and host_pos < dense_limit) @min(rows, dense_limit - host_pos) else rows;
         const blocks = (dense + s.part_rows - 1) / s.part_rows;
         var at: [Buffers.pos_slots]u64 = undefined;
@@ -269,8 +264,7 @@ pub fn moeBlock(e: *Engine, m: wt.Moe, b: *const Buffers, rows: usize, layer: u3
     try e.t.router(b.normed, d, m.router, b.rpart, b.mlog, rows, d, c.experts);
     try e.t.select(b.mlog, m.bias, b.pick, b.wts, rows, c.topk, c.experts, c.routed_scale, true);
     const sh = m.shared;
-    // TF_GLM_L2PF: the shared expert before the routed experts (disjoint buffers, the same kernels: the same bits), while the
-    // L2 still holds what site "a" prefetched for it
+    // TF_GLM_L2PF: the shared expert before the routed experts; notes/glm_forward.md#moe-order
     if (e.l2pf_active) try e.sharedExpert(b, sh, rows);
     if (e.exl3_v18) try kern.routed18(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit, b.prefill) else try kern.routed(e.k, e.s, b.normed, d, b.pick, m.ex, b.exl3, rows, c.swiglu_limit);
     if (e.splitActive(b)) { // the shared expert and combine a piece of rows at a time (forward.moe_block's fill)
@@ -278,8 +272,7 @@ pub fn moeBlock(e: *Engine, m: wt.Moe, b: *const Buffers, rows: usize, layer: u3
         return 0;
     }
     if (!e.l2pf_active) try e.sharedExpert(b, sh, rows);
-    // forward.py moe_block: the shared row read from sy where it is (a prompt chunk always, a decode window unless
-    // TF_GLM_COMBINE_SY=0), else copied into the routed rows' last slot
+    // forward.py moe_block: the shared row read from sy where it is, else copied in; notes/glm_forward.md#moe-order
     if (e.exl3_v18 and (b.prefill or e.combine_sy)) {
         try e.t.combineSy(b.exl3.y, b.sy, b.wts, b.part, rows, d, slots);
     } else {
@@ -317,8 +310,7 @@ pub fn copyRows(e: *Engine, src: u64, src_ld: usize, dst: u64, dst_ld: usize, by
     try cuda.launch.launch(e.k.copy_rows, .{ .grid = .{ .x = @intCast(rows) }, .block = .{ .x = 256 } }, e.s, &a);
 }
 
-/// glue.hc_pre: the mixing dots of a prompt chunk on the tensor cores (TF_GLM_HC_MMA), of a decode window in hc.cu
-/// (TF_GLM_HC_DEC), else glue._hc_partial; then _hc_finish.
+/// glue.hc_pre: the mixing dots (tensor cores, hc.cu or glue._hc_partial, by TF_GLM_HC_MMA / HC_DEC), then _hc_finish.
 pub fn hcPre(e: *Engine, b: *const Buffers, h: wt.Hc, norm: u64, rows: usize) !void {
     return e.hcPreRows(b, h, norm, 0, rows);
 }

@@ -22,9 +22,7 @@ const Keep = Engine.Keep;
 
 const SegSel = struct { scores: u64, tokens: u64, counts: u64, split: u64 };
 
-/// One forward over several lanes' windows back to back (`tokens`: each segment's rows in turn), logits [R, V/2] in
-/// buf.logits: the row-independent parts on the whole window, each lane's KDA and DSA on its own state with the
-/// kernels its window alone would take (its row count). Eager; each lane then commits on its own (bind, commit).
+/// One forward over several lanes' windows back to back into buf.logits; notes/glm_forward.md#shared-windows
 pub fn forwardShared(e: *Engine, segs: []const Seg, tokens: []const u32) !void {
     if (e.pool != null and e.seg_enabled) return e.forwardSeg(segs, tokens);
     var rows: usize = 0;
@@ -64,8 +62,7 @@ pub fn forwardShared(e: *Engine, segs: []const Seg, tokens: []const u32) !void {
     if (prefetch) try e.l2pf.?.join(e.s);
 }
 
-/// kdaBlock over a shared window: the projections on every row, then each lane's chain on its state; its rows of the
-/// projection go to its `proj` (its commit's conv shift reads them there) and the chain's saves to its `scr`.
+/// kdaBlock over a shared window: projections on every row, then each lane's chain; notes/glm_forward.md#shared-windows
 pub fn kdaShared(e: *Engine, l: *const wt.Layer, b: *const Buffers, segs: []const Seg, rows: usize) !u64 {
     const c = e.w.cfg;
     const kw = l.kda.?;
@@ -120,8 +117,7 @@ pub fn kdaShared(e: *Engine, l: *const wt.Layer, b: *const Buffers, segs: []cons
     return e.outProj(b, e.sout, b.kxs, kw.o, rows, .{ l.index, 0 });
 }
 
-/// dsaBlock over a shared window: the projections, norms and the latent absorb on every row; each lane's latent and
-/// indexer writes, token selection and attention on its own caches, positions and row count.
+/// dsaBlock over a shared window: the front on every row, then each lane's own; notes/glm_forward.md#shared-windows
 pub fn dsaShared(e: *Engine, l: *const wt.Layer, b: *Buffers, segs: []const Seg, rows: usize) !u64 {
     const c = e.w.cfg;
     const a = l.dsa.?;
@@ -189,8 +185,7 @@ pub fn dsaShared(e: *Engine, l: *const wt.Layer, b: *Buffers, segs: []const Seg,
     return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
 }
 
-/// The segmented selection's buffers (segments.SelectScratch): scores [shared_rows, seg_pools], tokens, counts and the
-/// split selection's scratch, allocated at the first segmented window of a long-context engine (outside any capture).
+/// The segmented selection's buffers, allocated at first use; notes/glm_forward.md#segmented-windows
 pub fn segSelBuffers(e: *Engine) !void {
     if (e.seg_sel != null) return;
     const np = tri.Tri.seg_pools;
@@ -207,7 +202,7 @@ pub fn segSel(e: *const Engine) SegSel {
     return .{ .scores = base, .tokens = tokens, .counts = counts, .split = split };
 }
 
-/// forwardShared through the segmented kernels (TF_GLM_SEG, default on once lanes share a pool).
+/// forwardShared through the segmented kernels (TF_GLM_SEG); notes/glm_forward.md#segmented-windows
 pub fn forwardSeg(e: *Engine, segs: []const Seg, tokens: []const u32) !void {
     const pl = &e.pool.?;
     var spans: [max_lanes]segments.Span = undefined;
@@ -263,8 +258,7 @@ pub fn segBody(e: *Engine, rows: usize) !void {
     if (prefetch) try e.l2pf.?.join(e.s);
 }
 
-/// forward.kda_segments: the projections on every row (into the pool's [layers, max_rows, width] rows the commit's conv
-/// shift reads), then kda.chain_segments, each segment from its slot's state into its other parity.
+/// forward.kda_segments: the projections on every row, then kda.chain_segments; notes/glm_forward.md#segmented-windows
 pub fn kdaSeg(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize) !u64 {
     const c = e.w.cfg;
     const kw = l.kda.?;
@@ -318,8 +312,7 @@ pub fn kdaSeg(e: *Engine, l: *const wt.Layer, b: *const Buffers, rows: usize) !u
     return e.outProj(b, out, b.kxs, kw.o, rows, .{ l.index, 0 });
 }
 
-/// forward.dsa_segments: the front on every row, each row's latent and index key into its lane's arena extent, the
-/// segmented selection (every row: dense rows ignore it, as v1.10's graphs run it), absorb, segmented attention, expand.
+/// forward.dsa_segments: the DSA block over a segmented window; notes/glm_forward.md#segmented-windows
 pub fn dsaSeg(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize) !u64 {
     const c = e.w.cfg;
     const a = l.dsa.?;
@@ -358,8 +351,7 @@ pub fn dsaSeg(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize) !u64 {
     return e.outProj(b, b.vn, b.xs_ao, a.o, rows, .{ l.index, 0 });
 }
 
-/// verify.BatchedVerify.commit for the bound lane's segment of the last segmented window: its KDA states replayed to
-/// `keep` rows (when it keeps fewer), its conv window shifted, its parity flipped, its position advanced.
+/// verify.BatchedVerify.commit for the bound lane's segment; notes/glm_forward.md#segmented-windows
 pub fn commitSeg(e: *Engine, rows: usize, keep: usize) !void {
     const pl = &e.pool.?;
     const st = &e.st;
@@ -377,9 +369,7 @@ pub fn commitSeg(e: *Engine, rows: usize, keep: usize) !void {
     try e.setPos(st.pos + keep);
 }
 
-/// commitSeg for several lanes of the last segmented window at once (verify.BatchedVerify.commit over its segments): one
-/// table, one replay of the segments that keep fewer rows than they ran, one conv shift; then each lane's parity and
-/// position. Every lane's last window must be segmented (Node.keepLanes commits the others on their own).
+/// commitSeg for several lanes of the last segmented window at once; notes/glm_forward.md#segmented-windows
 pub fn commitSegs(e: *Engine, ks: []const Keep) !void {
     const m = ks.len;
     if (m == 0) return;
@@ -432,8 +422,7 @@ pub fn commit(e: *Engine, rows: usize, keep: usize) !void {
     try e.setPos(e.st.pos + keep);
 }
 
-/// forward.commit(R, R) after a prompt chunk on pbuf: Python flips each KDA layer's state half as the layer runs
-/// (st.cur[li]); every layer flips once a chunk, so one flip for all after the chunk reads and writes the same halves.
+/// forward.commit(R, R) after a prompt chunk on pbuf: one flip for every layer; notes/glm_forward.md#kept-states
 pub fn commitChunk(e: *Engine, rows: usize) !void {
     if (e.st.kda_layers > 0) e.st.cur = 1 - e.st.cur;
     try e.setPos(e.st.pos + rows);

@@ -1,6 +1,4 @@
-//! GLM-5.3-Flash's tensor-parallel forward, MTP step and commit on CUDA, launch for launch as the Python engine runs
-//! them (v0.6.6 families/glm5_next/cuda/forward.py and mtp.py, TF_GLM_LATENT=1, the EXL3 checkpoint), eagerly:
-//! every buffer is static, positions live on the device, and the host knows them too (Python's host_pos path).
+//! GLM-5.3-Flash's tensor-parallel forward, MTP step and commit on CUDA; notes/glm_forward.md#engine
 const std = @import("std");
 const cuda = @import("cuda");
 const wt = @import("glm_weights.zig");
@@ -33,14 +31,13 @@ pub const Comm = struct {
     comm: cuda.nccl.Comm,
     roce: ?*roce_mod.Roce = null,
 
-    /// Small gathers (up to TF_ROCE_MAX_KB a rank, a multiple of 16 bytes) over RoCE when it is up, the rest through NCCL; the
-    /// choice is by byte count alone, which both ranks' matching calls share.
+    /// Small gathers over RoCE when it is up, the rest through NCCL, chosen by byte count; notes/glm_forward.md#comm
     pub fn allGather(c: Comm, s: cuda.Stream, send: u64, recv: u64, count: usize) !void {
         if (c.roce) |r| if (r.fits(count * 4) and send % 16 == 0 and recv % 16 == 0) return r.gather(s, send, recv, count * 4);
         try c.lib.check(c.lib.api.ncclAllGather(send, recv, count, .f32, c.comm, s.handle), "ncclAllGather");
     }
 
-    /// comm.exchange: byte ranges sent to and received from the peer in one NCCL group, always through NCCL (hcsplit's swaps).
+    /// comm.exchange: byte ranges to and from the peer in one NCCL group, always through NCCL (hcsplit's swaps).
     pub fn exchange(c: Comm, s: cuda.Stream, sends: []const Seg, recvs: []const Seg, peer: usize) !void {
         const api = c.lib.api;
         try c.lib.check(api.ncclGroupStart(), "ncclGroupStart");
@@ -52,11 +49,7 @@ pub const Comm = struct {
     pub const Seg = struct { ptr: u64, bytes: usize };
 };
 
-/// TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (v1.10 hcsplit.SplitSettings; the recipe's default SPLIT=1 sets 1 and 2, as here):
-/// a prompt chunk's hyper-connection glue split by rows between the ranks (each rank sends the other its partial of the
-/// other's rows and glues its own), the swaps on a second stream in row pieces (overlap), and the next block's
-/// row-independent front on own rows while the swaps run (fronts). Every glue kernel is row-independent and the partials are
-/// summed rank 0 first as unsplit, so every bit is the unsplit path's. Swaps are p2p only (no TF_GLM_HC_EXCHANGE=gather).
+/// TF_GLM_HC_SPLIT / TF_GLM_PREFILL_OVERLAP (v1.10 hcsplit.SplitSettings); notes/glm_forward.md#row-split
 pub const SplitSettings = struct {
     split: bool = true,
     overlap: bool = true,
@@ -108,8 +101,7 @@ pub const SplitSettings = struct {
     }
 };
 
-/// One prompt buffer's row split (hcsplit.HcSplit, two ranks, p2p): rank r owns rows [r H, r H + H), H = Rp / 2 (an odd
-/// chunk gets one zero pad row, never read); the second stream and its events when overlapping.
+/// One prompt buffer's row split between the two ranks (hcsplit.HcSplit); notes/glm_forward.md#row-split
 pub const Split = struct {
     set: SplitSettings,
     side: ?cuda.Stream,
@@ -149,18 +141,16 @@ pub const Split = struct {
     }
 };
 
-/// What a split site writes into b.part for rows lo .. hi (forward.partials' `fill`): an output projection's rows, or the
-/// MoE's shared expert on the rows its front has not run on, then the combine.
+/// What a split site writes into b.part for rows lo .. hi (forward.partials' `fill`); notes/glm_forward.md#row-split
 pub const Fill = union(enum) {
     proj: struct { x: u64, xs: u64, q: Mat },
     moe: struct { m: wt.Moe, done: ?[2]usize },
 };
 
-/// The next block's row-independent start (forward.mixer_front / ffn_front) the glue runs on own rows (TF_GLM_PREFILL_OVERLAP=2).
+/// The next block's row-independent start the glue runs on own rows (forward.mixer_front / ffn_front, OVERLAP=2).
 pub const Front = union(enum) { none, kda: *const wt.Layer, dsa: *const wt.Layer, mlp: wt.Mlp, shared: wt.Mlp };
 
-/// forward.undone: the row ranges of [0, rows) outside `done` (rows a front already ran on), in row order; empty ranges
-/// have hi <= lo.
+/// forward.undone: the row ranges of [0, rows) outside `done`, in row order; an empty range has hi <= lo.
 pub fn undone(rows: usize, done: ?[2]usize) [2][2]usize {
     const d = done orelse return .{ .{ 0, rows }, .{ 0, 0 } };
     return .{ .{ 0, @min(d[0], rows) }, .{ d[1], rows } };
@@ -192,13 +182,12 @@ pub const Engine = struct {
     mem: cuda.DeviceBuffer,
     width: usize,
     np_max: usize,
-    /// Every lane's state but the bound one's, which `st` holds (bind swaps them); lane 0 lives in `mem`, the others
-    /// in `lane_mem` from `addLanes`.
+    /// Every lane's state but the bound one's (in `st`; bind swaps them); their memory is in `lane_mem`.
     lanes: [max_lanes]State = undefined,
     lane_mem: [max_lanes]cuda.DeviceBuffer = undefined, // each lane's own part (all of lane 0's until `addLanes` pools them)
     /// Every lane's KDA states and DSA caches once `addLanes` made several (null: lane 0 alone, all in lane_mem[0]).
     pool: ?Pool = null,
-    /// The segmented window's tables on the host (uploaded into the pool's), its selection buffers, TF_GLM_SEG (default on).
+    /// The segmented window's host tables (uploaded into the pool's), its selection buffers, TF_GLM_SEG (default on).
     seg_host: [segments.SegRows.words]i32 = undefined,
     kseg_host: [max_lanes]kern.SegRow = undefined,
     seg_sel: ?cuda.DeviceBuffer = null,
@@ -215,38 +204,30 @@ pub const Engine = struct {
     graphs: [max_graphs]GraphEntry = undefined,
     n_graphs: usize = 0,
     use_graphs: bool = true,
-    /// TF_GLM_WIDE_GRAPHS (v1.8 production: 16; 0: off): the one verify-window width past 8 rows that replays a CUDA graph
-    /// (copy drafts pad their windows up to it, glm_copy.zig); the others of 9..15 rows run eagerly.
+    /// TF_GLM_WIDE_GRAPHS: the one window width past 8 rows that replays a graph; notes/glm_forward.md#wide-graph
     wide_graph: usize = 16,
     /// DFlash2's tap layers (the target layers whose stream means `Buffers.taps` take); none when taps are off.
     tap_layers: [5]u32 = @splat(std.math.maxInt(u32)),
     /// A shared window's KDA projections and chain outputs, every lane's rows back to back (forwardShared).
     sproj: u64 = 0,
     sout: u64 = 0,
-    /// TF_GLM_EXL3_DEC (default on): v1.8's routed-expert kernels, plan and direct shared-expert combine; 0: the generic
-    /// grouped kernel of v0.6.6 (the A/B path).
+    /// TF_GLM_EXL3_DEC (default on): v1.8's routed-expert kernels, else v0.6.6's; notes/glm_forward.md#switches
     exl3_v18: bool = true,
-    /// TF_GLM_KV (default fp8, v1.8's production setting; bf16 the earlier format): the DSA latent cache and the indexer's
-    /// pooled keys as e4m3 rows with a power-of-two scale each (kv8.py).
+    /// TF_GLM_KV (default fp8): DSA latents and pooled keys as e4m3 rows with a scale; notes/glm_forward.md#switches
     kv_fp8: bool = true,
-    /// TF_GLM_HC_DEC / TF_GLM_HC_MMA (default on): hyper-connection mixing dots of decode rows in hc.cu, of prompt rows on the
-    /// tensor cores.
+    /// TF_GLM_HC_DEC / TF_GLM_HC_MMA (default on): mixing dots of decode rows in hc.cu, of prompt rows on tensor cores.
     hc_dec: bool = true,
-    /// TF_GLM_L2PF (default on): decode windows of up to TF_GLM_L2PF_ROWS rows prefetch the next kernels' weights into L2 from
-    /// a side stream (glm_l2pf.zig); `l2pf_active` is set while such a window runs.
+    /// TF_GLM_L2PF (default on): small decode windows prefetch the next weights into L2; notes/glm_forward.md#switches
     l2pf: ?l2pf.Prefetch = null,
     l2pf_active: bool = false,
     pieces: []const Piece = &.{}, // a multi-prompt chunk's pieces while it runs (prefillPieces)
     hc_mma: bool = true,
-    /// TF_GLM_LATENT_MMA / TF_GLM_SPARSE_ONEPASS (default on): a prompt chunk's absorb and expand on the tensor cores, its
-    /// sparse attention in one pass a row.
+    /// TF_GLM_LATENT_MMA / TF_GLM_SPARSE_ONEPASS (default on): prompt absorb/expand on tensor cores, one-pass sparse.
     latent_mma: bool = true,
     sparse_onepass: bool = true,
-    /// The indexer's key rings hold the whole context here, so no row wraps; the ring length only picks the kernels'
-    /// 16-divisibility specialization, as Python's does.
+    /// The indexer's ring length: the rings hold the whole context, so it only picks the 16-divisible kernels.
     index_ring: usize = 0,
-    /// TF_GLM_KDA_CHUNKED (default on, v1.8's production setting): prompt chunks run KDA in chunked (WY) form, which
-    /// needs prompt chunks to start on a grid of 32 (`kdaChunked`, the server's `promptGrid`); 0: the serial chain.
+    /// TF_GLM_KDA_CHUNKED (default on): prompt chunks run KDA in chunked (WY) form; notes/glm_forward.md#switches
     kda_chunked: bool = true,
     /// TF_GLM_COMBINE_SY (default on, with exl3_v18): decode windows combine the shared expert's row where it is.
     combine_sy: bool = true,
@@ -254,16 +235,14 @@ pub const Engine = struct {
     /// The nucleus draw's device scratch (`nucleusGather`), allocated at its first use, and its host copy.
     nuc_dev: ?cuda.DeviceBuffer = null,
     nuc_host: []u64 = &.{},
-    /// TF_GLM_HC_SPLIT (default on): prompt chunks' glue split by rows between the ranks (`SplitSettings`); null when off.
+    /// TF_GLM_HC_SPLIT (default on): prompt chunks' glue split by rows between the ranks; null when off.
     split: ?Split = null,
 
     pub const max_rows = 16; // engine.MAX_ROWS: a pending token and up to 15 copied drafts
-    /// A shared round's rows across lanes (v1.10's TF_GLM_MULTI_WINDOW, 32): the window buffers and the pool's KDA
-    /// scratch hold that many; each lane's own part stays within max_rows.
+    /// A shared round's rows across lanes (v1.10's TF_GLM_MULTI_WINDOW); a lane's own part stays within max_rows.
     pub const shared_rows = segments.max_rows;
     pub const mtp_rows = 8; // engine.MTP_ROWS: rows an MTP step takes at once (a kept backlog is absorbed in steps of this)
-    /// Windows of 1..8 and `wide_graph` rows x 2 KDA parities and MTP steps of 1..8 rows, each dense or at one of ~10 pool
-    /// buckets (9 widths x 2 x 11 + 8 x 11 = 286).
+    /// The graphs a lane may capture; notes/glm_forward.md#graph-count
     pub const max_graphs = 352 * max_lanes; // a lane's each (graphs bake in its state's addresses)
     /// Sequences whose caches are allocated at once (one a stream, idle ones keeping their rows for a later turn).
     pub const max_lanes = 8;
@@ -309,17 +288,13 @@ pub const Engine = struct {
     pub const hcPreRows = block_fns.hcPreRows;
     pub const mixer = block_fns.mixer;
 
-    // -- multi-prompt chunks (v1.10 multi_prefill) -----------------------------------------------------------------
-    /// A lane's rows of a multi-prompt chunk: its next `rows` prompt rows from its position, at row `lo` of the prompt
-    /// buffers (a multiple of 64, so each row keeps the place in the prompt kernels' 64-row tiles a chunk of its own gives it).
+    /// A lane's rows of a multi-prompt chunk, at row `lo` of the prompt buffers; notes/glm_forward.md#pieces
     pub const Piece = struct { lane: usize, rows: usize, lo: usize };
 
     pub const mixPieces = prompt_fns.mixPieces;
     pub const pieceView = prompt_fns.pieceView;
     pub const prefillPieces = prompt_fns.prefillPieces;
     pub const layerForward = prompt_fns.layerForward;
-
-    // -- the row split (hcsplit.HcSplit, TF_GLM_HC_SPLIT) ------------------------------------------------------------------
 
     pub const splitActive = prompt_fns.splitActive;
     pub const splitApplies = prompt_fns.splitApplies;
@@ -339,19 +314,12 @@ pub const Engine = struct {
     pub const computeWindow = prompt_fns.computeWindow;
     pub const forward = prompt_fns.forward;
 
-    // -- shared windows (verify.BatchedVerify) ---------------------------------------------------------------------
     /// A lane's rows of a shared window, in order.
     pub const Seg = struct { lane: usize, rows: usize };
 
     pub const forwardShared = shared_fns.forwardShared;
     pub const kdaShared = shared_fns.kdaShared;
     pub const dsaShared = shared_fns.dsaShared;
-
-    // -- segmented shared windows (v1.10 verify.BatchedVerify) -------------------------------------------------------
-    // Every lane's rows back to back through the segmented kernels (KDA chain_segments, latent.seg_*, sparse.seg_*): each
-    // row's position, arena base and sparseness and each segment's slot and parity live in the pool's device tables, so one
-    // CUDA graph a row count serves every mix of lanes and positions. Each segment's rows get the bits of its lane's window
-    // alone (the kernels' contract); the commit replays and shifts one lane's segment at a time (commitSeg).
 
     pub const segSelBuffers = shared_fns.segSelBuffers;
     pub const segSel = shared_fns.segSel;
@@ -382,8 +350,7 @@ pub const Engine = struct {
     pub const greedy = sample_fns.greedy;
 };
 
-/// TF_GLM_WIDE_GRAPHS: the verify-window width past 8 rows that replays a CUDA graph, 9 to max_rows (default 16, v1.8's
-/// production setting; 0 or empty: none). Python takes a list of widths; one is all the copy drafts' padding uses.
+/// TF_GLM_WIDE_GRAPHS: 9 to max_rows (default 16), 0 or empty for none; notes/glm_forward.md#wide-graph
 pub fn wideGraph() !usize {
     const v = std.c.getenv("TF_GLM_WIDE_GRAPHS") orelse return 16;
     const t = std.mem.trim(u8, std.mem.span(v), " ");
@@ -401,8 +368,7 @@ pub fn kdaChunked() bool {
     return if (std.c.getenv("TF_GLM_KDA_CHUNKED")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
 }
 
-/// engine.prompt_grid: the rows a prompt chunk and a kept prompt state start on. Chunked KDA depends on the alignment of its
-/// 32-row sub-chunks, so under TF_GLM_KDA_CHUNKED the grid is 64 (a multiple of 32 that divides the 2,048-row chunks).
+/// engine.prompt_grid: the rows prompt chunks and kept states start on; notes/glm_forward.md#prompt-grid
 pub fn promptGrid() u32 {
     return if (kdaChunked()) 64 else 0;
 }

@@ -123,18 +123,13 @@ pub fn init(w: *const Weights, d: *const cuda.Driver, s: cuda.Stream, t: tri.Tri
     return e;
 }
 
-// -- lanes ------------------------------------------------------------------------------------------------
-/// One more lane's device bytes (its caches at this engine's window).
-/// One more lane's device bytes once pooled: its own part and its share of the pool (the pool's segmented scratch
-/// and tables come with the first lane).
+/// One more lane's device bytes once pooled: its own part and its share of the pool; notes/glm_forward.md#lanes
 pub fn laneBytes(e: *const Engine) usize {
     const st = &e.st;
     return State.bytes(e.w, st.capacity, st.long_context, st.kv_fp8, true) + Pool.bytes(e.w, st.capacity, st.long_context, st.kv_fp8, 2) - Pool.bytes(e.w, st.capacity, st.long_context, st.kv_fp8, 1);
 }
 
-/// Lanes up to `total` (at most max_lanes), all zeroed, their KDA states and DSA caches in one Pool: how many there
-/// are now. Called once, before serving (lane 0's state is dropped: a load's timings left nothing to keep). Lane 0's
-/// own buffer is freed first, so the pool takes its room; a pool that does not fit is tried with fewer lanes.
+/// Lanes up to `total`, all zeroed, their caches in one Pool; returns how many there are; notes/glm_forward.md#lanes
 pub fn addLanes(e: *Engine, total: usize) !usize {
     const want = @min(total, max_lanes);
     if (want <= e.n_lanes) return e.n_lanes;
@@ -198,8 +193,7 @@ pub fn laneState(e: *Engine, i: usize) *State {
     return if (i == e.lane) &e.st else &e.lanes[i];
 }
 
-/// Lane `src`'s attention-cache rows below `rows` (every DSA layer's latents, the MTP layer's, and with a long
-/// context the indexer's keys and pooled keys) into lane `dst`: a kept prompt state then resumes in `dst`.
+/// Lane `src`'s attention-cache rows below `rows` into lane `dst`; notes/glm_forward.md#lanes
 pub fn copyLaneRows(e: *Engine, src: usize, dst: usize, rows: usize) !void {
     if (src >= e.n_lanes or dst >= e.n_lanes or src == dst) return error.NoSuchLane;
     const c = e.w.cfg;
@@ -229,10 +223,7 @@ pub fn deinit(e: *Engine) void {
     e.mem.free();
 }
 
-// -- CUDA graphs (graphs.py) --------------------------------------------------------------------------------
-/// A window wholly below the dense limit, or wholly past it at one pool bucket, replays one graph per key; one
-/// across the limit runs eagerly (decode.py's same rule). Positions live on the device, so a graph serves every
-/// position of its key.
+/// The graph key of a window, or null when it runs eagerly (graphs.py); notes/glm_forward.md#graph-count
 pub fn graphKey(e: *const Engine, head: GraphKey.Head, rows: usize, pos: usize) ?GraphKey {
     if (!e.use_graphs) return null;
     if (rows > 8 and rows != e.wide_graph) return null; // engine.GRAPH_ROWS + WIDE_GRAPHS: the others run eagerly
@@ -285,7 +276,6 @@ pub fn setInt(e: *Engine, dst: u64, v: usize) !void {
     try e.upload(dst, std.mem.asBytes(&x));
 }
 
-// -- State --------------------------------------------------------------------------------------------------
 pub fn reset(e: *Engine) !void {
     const c = e.w.cfg;
     const ll: usize = c.kda_heads / wt.world;
@@ -321,10 +311,7 @@ pub fn stage(e: *Engine, b: *Buffers, tokens: []const u32) !usize {
     return tokens.len;
 }
 
-// -- kept prompt states ----------------------------------------------------------------------------------
-/// A kept prompt state's bytes: every KDA layer's recurrent state (the half in use) and conv window. The
-/// attention caches (DSA, indexer, MTP) are not copied: they are positional, and the caller only restores a
-/// state while their rows below its position still hold its tokens.
+/// A kept prompt state's bytes: every KDA layer's state in use and conv window; notes/glm_forward.md#kept-states
 pub fn snapshotBytes(e: *const Engine) usize {
     const ll: usize = e.w.cfg.kda_heads / wt.world;
     return e.st.kda_layers * (ll * 128 * 128 * f4 + 3 * 3 * ll * 128 * bf);

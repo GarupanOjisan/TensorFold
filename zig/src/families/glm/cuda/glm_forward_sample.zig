@@ -14,9 +14,7 @@ const shared_rows = Engine.shared_rows;
 const max_k = Engine.max_k;
 const max_nucleus = Engine.max_nucleus;
 
-// -- MTP ----------------------------------------------------------------------------------------------------
-/// mtp_stage + mtp_compute: the head on rows (next token, hidden), cache slots mtp_len.. onward; the last row's
-/// draft-head logits in b.logits. The caller advances mtp_len.
+/// mtp_stage + mtp_compute: the head on rows (next token, hidden) from slot mtp_len; the caller advances mtp_len.
 pub fn mtp(e: *Engine, b: *Buffers, next: []const u32, hidden: u64) !void {
     const c = e.w.cfg;
     const d: usize = c.hidden;
@@ -56,16 +54,13 @@ pub fn mtpBody(e: *Engine, b: *Buffers, n: usize) !void {
     try e.draftHead(b, b.fnormed, 1);
 }
 
-/// The MTP head's logits from the 4-bit draft head (mtp.py: `w.draft_head`, forward.mm): a prompt chunk's on the
-/// prefill matmul, a decode step's on qmm_group with the rows' group sums (b.fxs, from the final norm).
+/// The MTP head's logits from the 4-bit draft head (mtp.py: `w.draft_head`); notes/glm_forward.md#sampling
 pub fn draftHead(e: *Engine, b: *const Buffers, x: u64, rows: usize) !void {
     if (b.prefill) return kern.q4Prefill(e.k, e.s, x, e.draft_head.k, e.draft_head, b.logits, rows, false);
     try kern.q4Matmul(e.k, e.s, x, b.fxs, e.draft_head, b.logits, rows);
 }
 
-// -- sampling -----------------------------------------------------------------------------------------------
-/// sample_rows' candidates for sampled rows: each rank's top `k` of its vocabulary slice (k = top_k + MARGIN),
-/// gathered on every rank into cand_host, for the host chooser.
+/// sample_rows' candidates: each rank's top `k` of its vocabulary slice (top_k + MARGIN), gathered into cand_host.
 pub fn candidates(e: *Engine, b: *const Buffers, logits: u64, rows: usize, k: usize) !void {
     if (k == 0 or k > max_k or k > e.w.head.n or rows > shared_rows) return error.BadCandidateCount;
     var a: cuda.Args = .{};
@@ -82,15 +77,13 @@ pub fn candidates(e: *Engine, b: *const Buffers, logits: u64, rows: usize, k: us
     try e.s.synchronize();
 }
 
-/// sampling.nucleus_rows' `_shares` for `rows` rows of `logits` (this rank's half of the vocabulary, bf16): every rank's top
-/// `count` (value, id, mass) per row and its shard's mass total and width, as 64-bit words [rank][row][count float64 values,
-/// count ids, count masses, sum, width], gathered on every rank. The row maxima come from `greedy`'s gather.
+/// sampling.nucleus_rows' `_shares`: every rank's top `count` per row, gathered; notes/glm_forward.md#sampling
 pub fn nucleusGather(e: *Engine, logits: u64, rows: usize, temperature: f64, count: usize) ![]const u64 {
     if (rows == 0 or rows > max_rows or count == 0 or count > max_nucleus) return error.BadNucleus;
     const world = wt.world;
     const vn = e.w.head.n;
     const per_row = 3 * max_nucleus + 2;
-    // [sums: max_rows words][candidate pairs: max_rows * 2 * max_nucleus u32][packed: max_rows * per_row words][gathered]
+    // the scratch's four regions; notes/glm_forward.md#sampling
     const cand_off = max_rows * 8;
     const loc_off = cand_off + max_rows * 2 * max_nucleus * 4;
     const all_off = loc_off + max_rows * per_row * 8;
@@ -155,8 +148,7 @@ pub fn fullRows(e: *Engine, logits: u64, rows: usize) ![]const u16 {
     return e.full_host[0 .. wt.world * n];
 }
 
-/// sample_rows, greedy: each rank's row maximum (first column on ties), gathered; the larger value wins, the
-/// smaller token on a tie (np.lexsort((tokens, -values))).
+/// sample_rows, greedy: each rank's row maximum, gathered; the larger value wins; notes/glm_forward.md#sampling
 pub fn greedy(e: *Engine, b: *const Buffers, logits: u64, rows: usize, vocab: usize, out: []u32) !void {
     var a: cuda.Args = .{};
     a.add(logits);

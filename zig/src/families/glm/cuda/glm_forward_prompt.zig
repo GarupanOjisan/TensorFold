@@ -17,8 +17,7 @@ const Buffers = buffers.Buffers;
 const max_lanes = Engine.max_lanes;
 const Piece = Engine.Piece;
 
-/// multi_prefill.PieceMixer: the block's fronts and output projection over every row; its state work piece by piece,
-/// on the piece's lane at its position, through the calls a chunk of its own makes (the piece's rows a view at `lo`).
+/// multi_prefill.PieceMixer: the block on every row, its state work piece by piece; notes/glm_forward.md#pieces
 pub fn mixPieces(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, done: ?[2]usize) !u64 {
     const c = e.w.cfg;
     const home = e.lane;
@@ -51,8 +50,7 @@ pub fn mixPieces(e: *Engine, l: *const wt.Layer, b: *Buffers, rows: usize, done:
     }
 }
 
-/// The prompt buffers from row `lo` on, for kdaState and dsaState: every buffer they index by row moves; their
-/// scratch (attention partials, selection, block positions) stays, a piece's work running before the next one's.
+/// The prompt buffers from row `lo` on, for kdaState and dsaState; notes/glm_forward.md#pieces
 pub fn pieceView(e: *const Engine, b: *const Buffers, lo: usize) Buffers {
     const c = e.w.cfg;
     const ll: usize = c.kda_heads / wt.world;
@@ -82,10 +80,7 @@ pub fn pieceView(e: *const Engine, b: *const Buffers, lo: usize) Buffers {
     return v;
 }
 
-/// multi_prefill.prefill_pieces up to the commits: one prompt chunk over every piece (`ids`: the chunk's rows, a
-/// piece's tokens at its `lo`, the rows between pieces any token), then per piece the head on its last row and that
-/// row's hidden state into its lane's last_logits and last_hidden, as prefillChunk leaves them. The taps and each
-/// lane's commitChunk are the caller's (Node.chunkLanes).
+/// multi_prefill.prefill_pieces up to the commits: one prompt chunk over every piece; notes/glm_forward.md#pieces
 pub fn prefillPieces(e: *Engine, pieces: []const Piece, ids: []const u32) !void {
     const d: usize = e.w.cfg.hidden;
     const b = &e.pbuf;
@@ -200,7 +195,7 @@ pub fn fillRows(e: *Engine, b: *const Buffers, f: Fill, lo: usize, hi_in: usize)
     }
 }
 
-/// Piece j: this rank's partial of the peer's rows out, the peer's partial of this rank's rows in (b.gath, unused while split).
+/// Piece j: this rank's partial of the peer's rows out, the peer's partial of this rank's rows into b.gath.
 pub fn swapPartial(e: *Engine, s: cuda.Stream, b: *const Buffers, j: usize) !void {
     const d: usize = e.w.cfg.hidden;
     const off, const n = e.split.?.pieces[j];
@@ -220,8 +215,7 @@ pub fn swapRows(e: *Engine, s: cuda.Stream, j: usize, outs: []const u64) !void {
     try e.comm.exchange(s, sends[0..outs.len], recvs[0..outs.len], 1 - e.w.rank);
 }
 
-/// hcsplit.partial: the peer's rows of this rank's partial first, piece by piece, each piece's swap starting as it is done
-/// (overlap), then this rank's rows.
+/// hcsplit.partial: the peer's rows piece by piece, each piece's swap starting as it is done, then this rank's rows.
 pub fn splitPartial(e: *Engine, b: *const Buffers, f: Fill) !void {
     const sp = &e.split.?;
     const side = sp.side orelse {
@@ -251,9 +245,7 @@ pub fn runFront(e: *Engine, b: *const Buffers, f: Front, lo: usize, hi_in: usize
     }
 }
 
-/// hcsplit.glue: hc_post of this rank's rows (both partials summed rank 0 first), then the layer's DFlash2 taps, the final
-/// stream mean (`final`) and the next hc_pre (`hc`), their rows swapped with the peer's; `front` on own rows of each piece
-/// while its swap is on the wire.
+/// hcsplit.glue: the glue on own rows, swapped with the peer's piece by piece; notes/glm_forward.md#row-split
 pub fn splitGlue(e: *Engine, b: *const Buffers, hc: ?wt.Hc, norm: u64, tap_layer: ?u32, final: bool, front: Front) !void {
     const c = e.w.cfg;
     const d: usize = c.hidden;
@@ -300,8 +292,7 @@ pub fn splitGlue(e: *Engine, b: *const Buffers, hc: ?wt.Hc, norm: u64, tap_layer
     }
 }
 
-/// forward.split_layers: every layer of a prompt chunk with its glue split by rows; the first hc_pre runs on every row as
-/// unsplit, and b.normed, the taps and b.hidden come back whole from the peer.
+/// forward.split_layers: every layer of a prompt chunk with its glue split by rows; notes/glm_forward.md#row-split
 pub fn splitLayers(e: *Engine, b: *Buffers, rows: usize) !void {
     try e.splitBegin(b, rows);
     const fronts = e.split.?.set.fronts;
