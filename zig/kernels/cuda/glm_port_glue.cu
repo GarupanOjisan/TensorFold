@@ -1,13 +1,10 @@
-// GLM's torch glue between kernels, as small exact kernels (ours): what the Python engine does with torch ops
-// between its Triton and CUDA launches (v0.6.6 families/glm5_next/cuda): copies, the sparse token lists and the
-// greedy pick. Every result is a copy or an integer, so bits cannot differ from torch's.
+// GLM's torch glue as small exact kernels (ours): copies and integers, torch's bits; notes/glm_port_glue.md#scope
 
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <stdint.h>
 
-// rows of `bytes` bytes (a multiple of 4) from src (row stride src_ld bytes) to dst (dst_ld): forward.py:407's
-// `b.ey[:R, top_k].copy_(b.sy[:R])`. grid (rows), block 256.
+// forward.py:407's `b.ey[:R, top_k].copy_(b.sy[:R])`: rows of `bytes` bytes, byte strides. grid (rows), block 256
 extern "C" __global__ void tf_glm_copy_rows(const uint32_t* __restrict__ src, uint64_t src_ld, uint32_t* __restrict__ dst,
                                             uint64_t dst_ld, uint64_t bytes) {
   const uint64_t r = blockIdx.x;
@@ -16,9 +13,7 @@ extern "C" __global__ void tf_glm_copy_rows(const uint32_t* __restrict__ src, ui
   for (uint64_t i = threadIdx.x; i < bytes / 4; i += blockDim.x) d[i] = s[i];
 }
 
-// sparse.py:204-215: each row's selected token list and count from its 512 best pools (int64, ascending).
-// q = pos + r; npool = (q + 1) / 4; tokens[r, 4i + j] = pools[r, i] * 4 + j; then the 3 tail tokens past the last
-// whole pool if visible (else -1); count = npool > 512 ? 2048 + visible tails : 0. grid (rows), block 256.
+// sparse.py:204-215: a row's token list and count from its 512 best pools; notes/glm_port_glue.md#tokens
 extern "C" __global__ void tf_glm_tokens(const int64_t* __restrict__ pools, const int* __restrict__ pos, int* __restrict__ tokens,
                                          int* __restrict__ counts, int width, int k) {
   const int r = blockIdx.x;
@@ -38,8 +33,7 @@ extern "C" __global__ void tf_glm_tokens(const int64_t* __restrict__ pools, cons
   }
 }
 
-// decode.py:34-49 for greedy rows on one rank: torch.topk(logits.float(), 1) gives the row's maximum and its first
-// column; out[r] = (value as fp32 bits, column + offset) for the all-gather. grid (rows), block 1024.
+// decode.py:34-49, greedy rows: out[r] = (row max as fp32 bits, first column + offset). grid (rows), block 1024
 extern "C" __global__ void tf_glm_greedy(const __nv_bfloat16* __restrict__ logits, int vocab, int ld, int offset,
                                          uint32_t* __restrict__ out) {
   __shared__ float best_v[1024];
@@ -75,10 +69,7 @@ extern "C" __global__ void tf_glm_greedy(const __nv_bfloat16* __restrict__ logit
   }
 }
 
-// decode.py:31-37 for sampled rows on one rank: torch.topk(logits.float(), k) of the rank's vocabulary slice, as
-// (value as fp32 bits, column + offset) pairs; which pairs, not their order, matters (the host chooser sorts them).
-// The k-th largest bf16 key is found in two 8-bit radix passes; columns above it are all taken, columns equal to it
-// in column order until k. grid (rows), block 1024, k <= 1024.
+// decode.py:31-37, sampled rows: the top k (value, column) pairs by radix passes; notes/glm_port_glue.md#topk
 __device__ __forceinline__ uint32_t tf_glm_key(unsigned short b) {
   return (b & 0x8000) ? (uint32_t)(~b & 0xffff) : (uint32_t)(b | 0x8000);
 }
@@ -126,8 +117,7 @@ extern "C" __global__ void tf_glm_topk(const unsigned short* __restrict__ logits
     }
   }
   __syncthreads();
-  // ties at the threshold, lowest columns first: a tile of blockDim.x columns at a time, each tie ranked in column order by a
-  // warp ballot and the warps' counts (the same pairs as a serial scan from column 0, without one thread walking the row)
+  // ties at the threshold, lowest columns first, by warp ballots a tile at a time; notes/glm_port_glue.md#ties
   __shared__ int warp_ties[32];
   __shared__ int tie_at, tie_left;
   if (threadIdx.x == 0) {
@@ -161,10 +151,7 @@ extern "C" __global__ void tf_glm_topk(const unsigned short* __restrict__ logits
   }
 }
 
-// qmm.quantize4 (v0.6.6 glm5_next/cuda/qmm.py:158): bf16 (n, k) -> MLX affine 4-bit groups of 64, one thread a group.
-// scale = bf16(max((hi - lo) / 15, 1e-8)), bias = bf16(lo), q = round-half-even((w - bias) / scale) in 0..15, input
-// 8 i + j of a group at bits 4 j of its word i; fp32 arithmetic as torch's. torch's CUDA tensor / Python scalar multiplies
-// by the fp32 reciprocal (BinaryDivTrueKernel.cu), tensor / tensor divides correctly rounded.
+// qmm.quantize4 (v0.6.6 qmm.py:158): bf16 (n, k) -> MLX affine 4-bit groups of 64; notes/glm_port_glue.md#quantize4
 extern "C" __global__ void tf_glm_quantize4(const __nv_bfloat16* __restrict__ w, int n, int k, uint32_t* __restrict__ words,
                                             __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ biases) {
   const long long g = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -192,10 +179,7 @@ extern "C" __global__ void tf_glm_quantize4(const __nv_bfloat16* __restrict__ w,
   biases[g] = bb;
 }
 
-// The squared error of one group of 64 under scale s and bias b, summed in torch's order for `(...).sum(-1)` over 64
-// contiguous fp32 values (Reduce.cuh: 32 lanes, lane t adds x[t] and x[t + 32], then shfl_down sums at offsets
-// 16, 8, 4, 2, 1; checked bit for bit against torch 2.13 on this checkpoint's groups): every op rounds, as torch's
-// separate kernels do (q * s, + b, - g, squared).
+// The squared error of a group of 64 under (s, b) in torch's order; notes/glm_port_glue.md#group-error
 __device__ __forceinline__ float group_error(const float (&g)[64], float s, float b) {
   float l[32];
 #pragma unroll
@@ -217,10 +201,7 @@ __device__ __forceinline__ float group_error(const float (&g)[64], float s, floa
   return l[0];
 }
 
-// qmm.quantize4_mse_raw (v1.8 glm5_next/cuda/qmm.py:179), TF_GLM_DENSE=q4: groups of 64 as quantize4, each group's range
-// the one of 16 clippings a = 1 - 0.45 i / 15 of its min and max with the least squared error (the first on a tie),
-// scale and bias stored as bf16. a is a Python float, cast to fp32 where torch multiplies the fp32 tensor by it.
-// MLX layout out, as tf_glm_quantize4.
+// qmm.quantize4_mse_raw (v1.8 qmm.py:179): the best of 16 clippings a group; notes/glm_port_glue.md#quantize4-mse
 extern "C" __global__ void tf_glm_quantize4_mse(const __nv_bfloat16* __restrict__ w, int n, int k, uint32_t* __restrict__ words,
                                                 __nv_bfloat16* __restrict__ scales, __nv_bfloat16* __restrict__ biases) {
   const long long gi = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -267,9 +248,7 @@ extern "C" __global__ void tf_glm_quantize4_mse(const __nv_bfloat16* __restrict_
   biases[gi] = best_bb;
 }
 
-// qmm.make_f8 (v1.8 qmm.py:412): bf16 (n, k) -> e4m3 (n, k) and an fp32 scale per row and 128 columns, one thread a block:
-// scale = max(absmax * (1 / 448), 1e-30) (torch multiplies by the reciprocal of a Python scalar), value =
-// e4m3(clamp(w / scale, -448, 448)), round to nearest even.
+// qmm.make_f8 (v1.8 qmm.py:412): bf16 (n, k) -> e4m3 and fp32 scales; notes/glm_port_glue.md#make-f8
 extern "C" __global__ void tf_glm_make_f8(const __nv_bfloat16* __restrict__ w, int n, int k, uint8_t* __restrict__ q8,
                                           float* __restrict__ scale) {
   const long long b = (long long)blockIdx.x * blockDim.x + threadIdx.x;
@@ -288,8 +267,7 @@ extern "C" __global__ void tf_glm_make_f8(const __nv_bfloat16* __restrict__ w, i
 
 // -- DFlash2's glue (glm5_next/cuda/dflash2.py): the torch ops between its Triton launches --------------------------
 
-// `self.kc[i].index_copy_(1, idx, k)`: rows [kvh, rows, hd] into a cache [kvh, cap, hd] at the positions pos + r (modulo the
-// ring). grid (rows, kvh), block 128.
+// `self.kc[i].index_copy_(1, idx, k)`: rows into the ring cache at pos + r. grid (rows, kvh), block 128
 extern "C" __global__ void tf_glm_df_scatter(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ cache,
                                              const int64_t* __restrict__ pos, int rows, int cap, int ring, int hd) {
   const int r = blockIdx.x, h = blockIdx.y;
@@ -299,9 +277,7 @@ extern "C" __global__ void tf_glm_df_scatter(const __nv_bfloat16* __restrict__ s
     cache[((int64_t)h * cap + at) * hd + d] = src[((int64_t)h * rows + r) * hd + d];
 }
 
-// dflash2_multi's `self.kc[i].index_copy_(1, idx, k)`: the rows [kvh, rows, hd] of blocks of n rows side by side, block s
-// into its slot of the pooled caches (`cache` is slot 0; slot[s] counts rows of cap, the kv heads cap apart) at the positions
-// pos[s] + r (modulo the ring). grid (rows, kvh), block 128.
+// dflash2_multi's index_copy_: blocks of n rows into their pooled-cache slots; notes/glm_port_glue.md#df-scatter-seg
 extern "C" __global__ void tf_glm_df_scatter_seg(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ cache,
                                                  const int64_t* __restrict__ pos, const int64_t* __restrict__ slot, int rows, int n,
                                                  int cap, int ring, int hd) {
@@ -312,8 +288,7 @@ extern "C" __global__ void tf_glm_df_scatter_seg(const __nv_bfloat16* __restrict
   for (int d = threadIdx.x; d < hd; d += blockDim.x) cache[row * hd + d] = src[((int64_t)h * rows + r) * hd + d];
 }
 
-// dflash2_multi `_taps_compute`'s `index_copy_(1, idx, k)`: rows [kvh, rows, hd] into the pooled caches (`cache` is slot 0),
-// row r at dest[r] (its slot's first row plus its ring row), the kv heads cap apart. grid (rows, kvh), block 128.
+// `_taps_compute`'s index_copy_: row r into the pooled caches at dest[r]; notes/glm_port_glue.md#df-scatter-rows
 extern "C" __global__ void tf_glm_df_scatter_rows(const __nv_bfloat16* __restrict__ src, __nv_bfloat16* __restrict__ cache,
                                                   const int64_t* __restrict__ dest, int rows, int cap, int hd) {
   const int r = blockIdx.x, h = blockIdx.y;
@@ -331,7 +306,7 @@ extern "C" __global__ void tf_glm_df_rope_rows(const int64_t* __restrict__ pos, 
   sin_out[i] = sinf(phase);
 }
 
-// `_rotary`: phase = float(pos + r) * inv_freq, cos and sin in fp32, [rows, half]. grid (ceil(rows half / 128)), block 128.
+// `_rotary`: phase = float(pos + r) * inv_freq, fp32 cos and sin [rows, half]. grid (ceil(rows half / 128)), block 128
 extern "C" __global__ void tf_glm_df_rope(const int64_t* __restrict__ pos, const float* __restrict__ inv_freq, int rows, int half,
                                           float* __restrict__ cos_out, float* __restrict__ sin_out) {
   const int i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -362,8 +337,7 @@ extern "C" __global__ void tf_glm_df_cat(const __nv_bfloat16* __restrict__ t0, c
   for (int c = threadIdx.x; c < 5 * d; c += blockDim.x) out[(int64_t)r * 5 * d + c] = t[c / d][(int64_t)r * d + c % d];
 }
 
-// `F.linear(h, hproj).float()`: h [rows, k] times w [n, k] transposed, fp32 sums, rounded to bf16 and back. One warp an
-// output. grid (ceil(n / 8), rows), block 256.
+// `F.linear(h, hproj).float()`: fp32 sums rounded to bf16 and back, a warp an output; notes/glm_port_glue.md#df-proj
 extern "C" __global__ void tf_glm_df_proj(const __nv_bfloat16* __restrict__ h, const __nv_bfloat16* __restrict__ w,
                                           float* __restrict__ out, int n, int k) {
   const int col = blockIdx.x * 8 + threadIdx.x / 32, lane = threadIdx.x % 32, row = blockIdx.y;
@@ -374,11 +348,7 @@ extern "C" __global__ void tf_glm_df_proj(const __nv_bfloat16* __restrict__ h, c
   if (lane == 0) out[(int64_t)row * n + col] = __bfloat162float(__float2bfloat16(acc));
 }
 
-// -- the top_p nucleus draw's device side (cuda/sampling.py nucleus_rows, TENSORFOLD_NUCLEUS_UNION): per row, the mass floor(exp(v - top)
-// 2^40) of every token in fixed point (v = logit * (1 / max(T, 1e-6)) in float64 as torch's tensor / scalar computes it, top the
-// maximum over the ranks' row maxima, which `all` holds as tf_glm_greedy wrote them, gathered: [world][rows][value bits, id]),
-// the shard's sum, and the top `count` candidates' (value, id, mass). No fused multiply-add (the module's flags), the same
-// double exp as torch's CUDA kernel.
+// The top_p nucleus draw's device side: fixed-point masses, sums, candidates; notes/glm_port_glue.md#nucleus
 __device__ __forceinline__ double tf_nuc_top(const uint32_t* all, int world, int rows, int r, double inv_t) {
   double top = -INFINITY;
   for (int k = 0; k < world; ++k) {
@@ -410,8 +380,7 @@ extern "C" __global__ void tf_glm_nuc_stats(const unsigned short* __restrict__ l
   if (threadIdx.x == 0) sums[r] = red[0];
 }
 
-// grid (ceil(count / 256), rows), block 256: out[r] = [count value bits (float64)][count ids][count masses][sum][width] as 64-bit
-// words, from tf_glm_topk's (value bits, id) pairs `cand` [rows][count][2].
+// out[r] = [values][ids][masses][sum][width] as 64-bit words from `cand`; notes/glm_port_glue.md#nuc-pack
 extern "C" __global__ void tf_glm_nuc_pack(const uint32_t* __restrict__ cand, int count, double inv_t, const uint32_t* __restrict__ all,
                                            int world, int rows, const unsigned long long* __restrict__ sums, int width,
                                            unsigned long long* __restrict__ out) {

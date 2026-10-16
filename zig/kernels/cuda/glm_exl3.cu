@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/exl3/experts.cu (lines 1-237, comments and ATen includes dropped), checked by zig/tests/cuda/copies.py.
+// Device code of src/tensorfold/cuda/exl3/experts.cu (lines 1-237, comments and ATen includes dropped).
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
 
@@ -228,8 +228,7 @@ __global__ void down_combine_kernel(const float* __restrict__ Z, const int* __re
 // rot_in on GLM's bf16 hidden rows (experts.cu:322).
 template __global__ void tf_glm_exl3::rot_in_kernel<__nv_bfloat16>(const __nv_bfloat16*, int, const int*,
     const half*, const half*, half*, half*, int, int, int);
-// grouped_launch<1> (mcg) at GLM_GATEUP and GLM_DOWN, both TF_RANGES(8, 4, 1) with every expert at K2 8
-// (experts_grouped.cuh:333-336); SK is a kernel argument.
+// grouped_launch<1> (mcg) at GLM_GATEUP and GLM_DOWN: TF_RANGES(8, 4, 1), every expert at K2 8; SK an argument
 template __global__ void tf_exl3x::grouped_kernel<1, 8, 4, 1, 8, 8>(const half*, const half*, const int64_t*,
     const int64_t*, const int*, const int*, const int*, const int*, const int*, float*, int, int, int, int, int,
     int);

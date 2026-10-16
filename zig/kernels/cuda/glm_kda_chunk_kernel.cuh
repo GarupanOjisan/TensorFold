@@ -44,16 +44,13 @@ __global__ void __launch_bounds__(NT, 1) chunk_kernel(
     for (int c = 0; c < nsub; ++c) {
         const int r0 = c * BT - off;                  // the prompt chunk's row at the sub-chunk's row 0
 
-        // 0. stage this sub-chunk's rows (warmed in L2 during the previous one), warm the next one's and this
-        // one's output gates
+        // 0. stage this sub-chunk's rows (warmed in L2 before), warm the next one's and this one's output gates
         stage(sm, tid, h, H, r0, rows, P, p_stride, b_off, A, a_stride, cs, vec_p, vec_a);
         asm volatile("cp.async.wait_all;" ::: "memory");
         __syncthreads(); MARK(0);
         warm(tid, h, H, r0 + BT, c + 1 < nsub, rows, r0, P, p_stride, b_off, A, a_stride, G, g_stride);
 
-        // 1. conv + SiLU (kda.cu's arithmetic) in 4-row blocks: warp w takes rows 4 w .. 4 w + 3 of q, then of k,
-        // then of v, lane l the channels 4 l .. 4 l + 3 (kda.cu's norm lanes), and the L2 norms of its q and k rows
-        // (kda.cu's sums); then the decays and beta.
+        // 1. conv + SiLU and the q, k L2 norms in 4-row blocks, then the decays and beta; notes/glm_kda_chunk.md#step-1
 #pragma unroll 1
         for (int part = 0; part < 3; ++part) {
             const int rb = 4 * warp, ch = part * DK + 4 * lane;
@@ -152,9 +149,7 @@ __global__ void __launch_bounds__(NT, 1) chunk_kernel(
         }
         __syncthreads(); MARK(1);
 
-        // 3. L and M. Group pr = tid / 16 takes column t = pr (rows s > pr), then t = 31 - pr (31 entries in all,
-        // every group alike), in batches of 8; lane cg holds the key quads cg and cg + 16, k_t E(t -> s) multiplied
-        // row after row; a batch's 16 sums reduce over the 16 lanes by a transposing tree.
+        // 3. L and M, column pr then 31 - pr a 16-lane group, batches of 8; notes/glm_kda_chunk.md#step-3
         {
             const int pr = tid >> 4, cg = tid & 15;
             const int n1 = BT - 1 - pr;               // entries of column pr
@@ -238,9 +233,7 @@ __global__ void __launch_bounds__(NT, 1) chunk_kernel(
         }
         __syncthreads(); MARK(3);
 
-        // 4. T = (I + L)^-1 by warp 0: lane l inverts column l % 16 of diagonal block l / 16 by forward
-        // substitution, then block (1, 0) = -T11 (L10 T00). Warps 1-7 per key channel: k E(s ->), then k E(s) in
-        // place, and E(31) (threads 32-159); q E(s) in place (threads 160-255, then 160-191 for the last 32 channels)
+        // 4. T = (I + L)^-1 by warp 0; k E(s ->), k E(s), E(31) and q E(s) by warps 1-7; notes/glm_kda_chunk.md#step-4
         if (warp == 0) {
             const int blk = lane >> 4, j = lane & 15, base = 16 * blk;
             float col[16];
@@ -297,8 +290,7 @@ __global__ void __launch_bounds__(NT, 1) chunk_kernel(
         }
         __syncthreads(); MARK(4);
 
-        // 5. Every thread: its sums of (k E) S0^T and (q E) S0^T; Y = beta (v - (k E) S0^T) into g, the (q E) S0^T
-        // of the rows it finishes kept in o1.
+        // 5. (k E) S0^T and (q E) S0^T; Y = beta (v - (k E) S0^T) into g, the (q E) S0^T of the finished rows in o1
         float o1[OWN];
         {
             float4 ck[NQ], cq[NQ], nk[NQ], nq[NQ];
@@ -354,10 +346,7 @@ __global__ void __launch_bounds__(NT, 1) chunk_kernel(
         }
         __syncthreads(); MARK(5);
 
-        // 6. load this sub-chunk's output gates (warm in L2); (q E) S0^T into k (free now); V' = T Y into q. Tiles:
-        // warp w the rows 4 w' .. 4 w' + 3 with w' = w (w < 4) or 11 - w (the two warps of a scheduler, w and w + 4,
-        // then run 36 steps of t together), lane l the value columns 4 l .. 4 l + 3 (T is zero above its diagonal:
-        // t runs to the tile's last row)
+        // 6. output gates; (q E) S0^T into k; V' = T Y into q by 4-row tiles; notes/glm_kda_chunk.md#step-6
         const int rq = 4 * (warp < 4 ? warp : 11 - warp), vq = 4 * lane;
         float gate[4][4];
 #pragma unroll
@@ -400,8 +389,7 @@ __global__ void __launch_bounds__(NT, 1) chunk_kernel(
         }
         __syncthreads(); MARK(6);
 
-        // 7. read-outs O = (q E) S0^T + M V' of the same tile, bf16, the gated RMSNorm (kda.cu's formula; a warp
-        // holds its rows' 128 values); the state update
+        // 7. read-outs O = (q E) S0^T + M V' in bf16, the gated RMSNorm (kda.cu's formula); the state update
         {
             float o[4][4];
 #pragma unroll

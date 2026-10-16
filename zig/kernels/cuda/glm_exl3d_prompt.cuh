@@ -1,11 +1,4 @@
-// glm_exl3d.cu's prompt-chunk kernels, included inside namespace tf_glm_exl3d.
-// ---- prompt chunks: Y^T = W^T X^T --------------------------------------------------------------------------------
-// A decoded trellis tile is, reordered, an m16n8k16 A fragment of W^T (lane (g, t): a0 = b0[0], a1 = b1[0],
-// a2 = b0[1], a3 = b1[1]), so each warp decodes its own tiles straight into registers and every decoded fragment
-// feeds the whole pass's member rows (up to 64 tokens, the prefill plan's item) as B fragments from shared memory.
-// Each output is one fp32 chain of mma over ascending k tiles (no split K, no partials in memory), so a row's bits
-// depend on its own values only (any chunking gives the same prompt state), though they are not the decode
-// kernel's (which sums split and warp partials). The epilogues are gateup/down_epilogue_kernel's formulas.
+// Prompt chunks of glm_exl3d.cu: Y^T = W^T X^T, one fp32 mma chain an output; notes/glm_exl3d.md#prompt-chunks
 constexpr int PBK = 32;              // k values a shared-memory stage (2 k tiles)
 constexpr int PKT = PBK / 16;
 constexpr int PSTAGES = 3;
@@ -25,12 +18,7 @@ __device__ __forceinline__ void ldsm_x4(uint32_t (&r)[4], const void* p) {
                  : "r"(s));
 }
 
-// A block covers 16 m tiles (gate/up: 8 of each matrix = one 128-column Hadamard block; down: 256 columns) for a
-// pass of PM members with NW warps: each warp holds MT = 16 / NW m tiles for all PM members (PM / 8 n blocks), so a
-// decoded tile feeds PM / 8 mma. PM 64 / 8 warps (two blocks an SM) or PM 128 / 16 warps (one): the same per-element
-// chains, so the same bits. Every stage brings the members' next PBK k values and the 16 tiles' trellis words into
-// shared memory (cp.async, PSTAGES deep). SHX (gate/up of a layer whose experts share one suh for both): gate and up
-// read the same member rows (X0 = X1 = the per-row Xh, the members' rows from xrows), so a stage holds them once.
+// A block: 16 m tiles for a pass of PM members, NW warps, PSTAGES cp.async stages; notes/glm_exl3d.md#prompt-block
 constexpr int PWORDS = 16 * PKT * 32;          // a stage's trellis words (16 m tiles x PKT k tiles x 32)
 
 template <int MATS, int PM, int NW, bool SHX = false>
@@ -138,8 +126,7 @@ __device__ __forceinline__ void prompt_mainloop(const half* __restrict__ X0, con
     __syncthreads();                                   // the stages become the epilogue's rows
 }
 
-// acc (this warp's m tiles, members PM / 2 * hf .. + PM / 2 - 1) -> E[member - PM / 2 * hf][col] fp32, row stride
-// ES; col0: the first m tile's first column within the block's E columns.
+// acc (this warp's m tiles, members PM / 2 * hf ..) -> E fp32 (row stride ES) from column col0 of the block's E
 template <int MT, int PM>
 __device__ __forceinline__ void prompt_spill(float* E, int ES, int col0, const float (&acc)[MT][PM / 8][4], int hf) {
     const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
@@ -159,19 +146,14 @@ __device__ __forceinline__ void prompt_spill(float* E, int ES, int col0, const f
 constexpr int GU_ES = 128 + 4, DN_ES = 256 + 4;
 template <int PM, int XM = 2>
 constexpr size_t prompt_smem() {
-    // max of: gate/up stages (XM copies of the member rows), down stages, gate/up epilogue half (2 x PM/2 x GU_ES),
-    // down half (PM/2 x DN_ES)
+    // max of the gate/up stages, the down stages, the gate/up epilogue half and the down epilogue half
     const size_t gu = (size_t)PSTAGES * (XM * PM * PXS + 2 * PWORDS) * 2;
     const size_t ep = (size_t)2 * (PM / 2) * GU_ES * 4;
     const size_t dn = (size_t)(PM / 2) * DN_ES * 4;
     return gu > ep ? (gu > dn ? gu : dn) : (ep > dn ? ep : dn);
 }
 
-// The launch order of a prompt plan's items (ORDER): the items of experts that take one item (their weights come
-// from DRAM, few mma) and of experts that take several (their passes run together and share the weights through L2:
-// mostly mma) merged evenly, each list in plan order, so DRAM and the tensor cores stay busy together instead of in
-// turns. Only which block runs which item changes: every output keeps its bits. The shared expert's items (id E, the
-// plan's last) are left out: order[slot] = item for slot < the routed items, -1 after. One block.
+// ORDER: one-item and several-item experts' items merged evenly (launch order only); notes/glm_exl3d.md#prompt-order
 __global__ void __launch_bounds__(1024) prompt_order_kernel(const int* __restrict__ items,
                                                             const int* __restrict__ counts, int* __restrict__ order,
                                                             int cap, int E) {

@@ -1,18 +1,9 @@
-// Device code of src/tensorfold/families/glm5_next/cuda/kda.cu [v1.8] (lines 1-529, ATen includes dropped), checked by zig/tests/cuda/copies.py; v1.8 and v1.10 hold the same file.
-// GLM-5.3-Flash's KDA (Kimi delta attention) on CUDA: one block of 1024 threads per head, a chain of R rows.
-//
-// Per row, following the Hugging Face definition: the depthwise conv over [conv state; q|k|v rows] (4 taps,
-// fp32) with SiLU and one bf16 rounding; fp32 L2 norms of q and k (eps inside the sum, q times DK^-0.5); the
-// per-channel decay g_i = exp(lower * sigmoid(exp(A_log) * (a_i + dt_bias_i))) in fp32; beta = bf16(sigmoid(b));
-// the delta rule in fp32 (decay along the key channel, read with k, correct toward v, read out with q);
-// read-out rounded to bf16; then the gated RMSNorm bf16(w * (y * rsqrt(mean(y^2) + eps)) * sigmoid(gate)).
-// Warp w owns value rows 4w .. 4w + 3, lane l the key columns 4l .. 4l + 3. The state update is one routine
-// (``update``) shared with ``replay``, compiled without FMA contraction, so a replayed prefix of a window gives
-// the bits of the serial steps.
+// Device code of src/tensorfold/families/glm5_next/cuda/kda.cu [v1.8] (lines 1-529, ATen includes dropped).
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 
+// GLM-5.3-Flash's KDA (Kimi delta attention), a 1024-thread block a head over R rows; notes/glm_port_kda.md#design
 namespace tf_glm_kda {
 
 constexpr int DK = 128, DV = 128, TAPS = 4;
@@ -214,7 +205,7 @@ __global__ void __launch_bounds__(1024) replay_layers_kernel(
         for (int i = 0; i < 4; ++i) sout[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
 }
 
-// Long windows: state-independent work for all rows (prep_kernel, out_kernel), the delta rule alone row by row (step_kernel); chain_kernel's bits.
+// Long windows: prep_kernel and out_kernel for all rows, step_kernel the delta rule row by row; chain_kernel's bits
 
 // Block (row, head), 512 threads: conv + SiLU of the 3 x 128 q|k|v channels, the decay, beta, then the q/k norms.
 __global__ void __launch_bounds__(512) prep_kernel(
@@ -267,7 +258,7 @@ __global__ void __launch_bounds__(512) prep_kernel(
     }
 }
 
-// Block (head, part): each warp owns 4 value rows; TR rows of saved k, q, decay, v and beta are staged in shared memory at a time.
+// Block (head, part): a warp owns 4 value rows; TR rows of saved k, q, decay, v and beta staged in shared memory
 template <int WARPS, int TR>
 __global__ void __launch_bounds__(WARPS * 32) step_kernel(
         int H, const float* __restrict__ state_in, const float* __restrict__ q_in, const float* __restrict__ k_save,
@@ -351,11 +342,7 @@ __global__ void __launch_bounds__(128) out_kernel(
     out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
 }
 
-// Several streams' windows in one launch. A segment table (int32 [nseg, SEG_COLS]: first row, rows, state slot,
-// parity, conv slot, keep) cuts the window's rows into streams; each segment reads its conv taps from its own
-// conv slot and runs the recurrence from rec[slot, parity] into rec[slot, 1 - parity]. Per row the arithmetic is
-// the solo kernels' line for line (same ``update``), so a segment's bits equal a solo run of its rows. A segment
-// of 0 rows is skipped: a table sized for the most streams serves fewer (grids stay fixed for CUDA graphs).
+// Several streams' windows in one launch, cut by a segment table; notes/glm_port_kda.md#segments
 constexpr int SEG_COLS = 6, SEG_ROW0 = 0, SEG_ROWS = 1, SEG_SLOT = 2, SEG_PARITY = 3, SEG_CONV = 4, SEG_KEEP = 5;
 
 // prep_kernel for block (row, head) of the whole window; the row's conv taps come from its segment.
@@ -484,8 +471,7 @@ __global__ void __launch_bounds__(WARPS * 32) step_seg_kernel(
         for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
 }
 
-// replay_layers_kernel for block (segment, layer, head): the segment's first ``keep`` rows from rec[slot, parity]
-// into rec[slot, 1 - parity]; keep == rows (the chain already left that state) or rows == 0 skips the segment.
+// replay_layers_kernel by segment: its first keep rows (none if keep == rows); notes/glm_port_kda.md#replay-seg
 __global__ void __launch_bounds__(1024) replay_layers_seg_kernel(
         int H, int layers, const int* __restrict__ seg, float* __restrict__ rec, size_t slot_stride,
         size_t parity_stride, size_t layer_stride, const float* __restrict__ k_save,

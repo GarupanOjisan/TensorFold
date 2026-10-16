@@ -1,5 +1,4 @@
-// Device code of src/tensorfold/cuda/kernels/qmm.cu [v1.8] (lines 1-253, ATen includes dropped), checked by zig/tests/cuda/copies.py.
-// Lane matmul: acc = fma(xs, b, fma(P, s, acc)) per group in order, K slices set by shape, so no row affects another.
+// Device code of src/tensorfold/cuda/kernels/qmm.cu [v1.8] (lines 1-253, ATen includes dropped).
 
 #include <algorithm>
 #include <cooperative_groups.h>
@@ -8,6 +7,7 @@
 
 #include "qmm_frag.cuh"
 
+// Lane matmul: acc = fma(xs, b, fma(P, s, acc)) per group in order, K slices set by shape, so no row affects another.
 namespace tf_qmm {
 
 using namespace qmm_frag;
@@ -253,9 +253,7 @@ __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__
 
 } // namespace tf_qmm
 
-// The instantiations a decode window launches (rows <= 16, groups of 64; qmm_cfg tile configs 0, 2 and 4: the default
-// 16 x 64 tile and glm5_next/cuda/qmm.py DEC_TILES' 16 x 128 on 8 warps / 4 stages and on 4 warps / 6 stages), bf16 or
-// fp32 out, K slices in a thread block cluster (SK > 1, sm_90+: qmm_clusters) or one slice.
+// The instantiations a decode window launches (rows <= 16, groups of 64); notes/qmm.md#instantiations
 #define TF_QMM_INSTANTIATE(BN, WN, STAGES, F32, CLUSTER)                                                         \
     template __global__ void tf_qmm::qmm_kernel<64, 16, BN, 1, WN, STAGES, F32, CLUSTER, false>(                \
         const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, \

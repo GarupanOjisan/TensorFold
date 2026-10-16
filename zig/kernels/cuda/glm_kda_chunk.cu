@@ -1,40 +1,10 @@
-// Device code of src/tensorfold/families/glm5_next/cuda/kda_chunk.cu [v1.8] (lines 1-225, ATen includes dropped), checked by zig/tests/cuda/copies.py.
-// GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form: one block of 256 threads per head runs the prompt
-// chunk's 32-row sub-chunks in order (sub-chunks at absolute positions), the 128 x 128 state in registers.
-//
-// Per row the inputs are kda.cu's (this file is built like kda.cu, without FMA contraction, with CUDA's expf and
-// IEEE division): conv + SiLU rounded to bf16, fp32 L2 norms (q times 128^-0.5), beta = bf16(sigmoid(b)), the
-// per-channel decay g = expf(lower * sigmoid(exp(A_log) * (a + dt_bias))). A sub-chunk of rows 0..31 entering state
-// S0 [value, key]:
-//
-//     E(t -> s)  = g_{t+1} ... g_s per key channel: a running product multiplied in row order, as the serial chain
-//                  decays its state (empty: 1); E(s) = g_0 ... g_s from the sub-chunk's start;
-//                  E(s ->) = g_{s+1} ... g_31
-//     L[s, t]    = beta_s sum_c k_s k_t E(t -> s)                  t < s
-//     M[s, t]    =        sum_c q_s k_t E(t -> s)                  t <= s
-//     T          = (I + L)^-1                                     forward substitution (16-row blocks)
-//     Y          = beta (v - (k E(s)) S0^T),   V' = T Y             the delta rule's corrections ("v_new")
-//     O          = (q E(s)) S0^T + M V'                            read-outs, rounded to bf16, then the gated RMSNorm
-//     S_end      = S0 diag(E(31)) + V'^T (k E(s ->))
-//
-// Every factor is a product of decays <= 1 (no e^(+x), no difference of cumulative log-decays), so a decay carries
-// the serial chain's rounding; all sums run in fp32 with explicit FMAs and shuffle trees in a fixed order: the kernel
-// is deterministic, and a row's bits depend only on its sub-chunk's rows and the state entering it, so they are the
-// same whichever prefill chunk the row came in, as long as prompt chunks start on multiples of 32
-// (TF_GLM_PROMPT_GRID). Rows outside the prompt chunk (a short first or last sub-chunk) are zero rows: decay 1, no
-// key, no value, beta 0.
-//
-// Layout. The state: thread (vg, kp) = (tid / 8, tid % 8) holds value rows 4 vg .. 4 vg + 3 and key quads kp + 8 i
-// (i < 4): an 8-lane group reads 128 contiguous bytes of a key row per load, and products with S reduce over the 8
-// lanes by a transposing shuffle tree (7 shuffles for 8 sums). Read-outs and corrections: thread (vg, kp) finishes
-// value column 4 vg + kp % 4 of the rows of one parity (odd for kp < 4, even otherwise), 16 rows. The next
-// sub-chunk's projection, decay and beta rows are loaded into registers while this one computes, and staged into
-// shared memory that is free at the sub-chunk's start.
+// Device code of src/tensorfold/families/glm5_next/cuda/kda_chunk.cu [v1.8] (lines 1-225, ATen includes dropped).
 
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <cstdint>
 
+// GLM-5.3-Flash's KDA prompt chunks in chunked (WY) form, a block of 256 threads a head; notes/glm_kda_chunk.md#design
 namespace tf_kda_chunk {
 
 constexpr int DK = 128, DV = 128, TAPS = 4;
@@ -77,9 +47,7 @@ __device__ __forceinline__ float ldb(const __nv_bfloat16* p) { return __bfloat16
 __device__ __forceinline__ float fma_(float a, float b, float c) { return __fmaf_rn(a, b, c); }
 __device__ __forceinline__ float sigmoidf_(float x) { return 1.0f / (1.0f + expf(-x)); }
 
-// a / b with IEEE rounding, branch-free: the fast path of CUDA's division (a refined reciprocal, then one
-// correction), which is the correctly rounded quotient whenever ``div_ok`` holds (checked on 742 M operand pairs
-// against a / b); callers take a / b for the rare operands outside (a huge denominator, a tiny numerator).
+// a / b with IEEE rounding whenever div_ok holds (CUDA division's fast path); notes/glm_kda_chunk.md#div-rn
 __device__ __forceinline__ float div_rn(float a, float b) {
     float r;
     asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(r) : "f"(b));
@@ -109,8 +77,7 @@ __device__ __forceinline__ uint4 ld8(const __nv_bfloat16* p, bool vec) {
     return r;
 }
 
-// One level of a transposing shuffle tree: this lane keeps the half of a[0..N) its ``hi`` bit selects, adds the
-// partner's (lane ^ mask) copy of that half, and sends the other half.
+// One level of a transposing shuffle tree: keep the half `hi` selects plus the partner's copy, send the other half
 template <int N>
 __device__ __forceinline__ void tree_level(float (&a)[N], int mask, bool hi) {
 #pragma unroll
@@ -162,9 +129,7 @@ __device__ __forceinline__ void cp16(void* dst, const void* src) {
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;" :: "r"(d), "l"(src));
 }
 
-// Warm L2 with the rows of the sub-chunk whose row 0 is prompt-chunk row r0 (projection rows r0 - 3 .. r0 + 31 of
-// this head's q | k | v channels, its decay rows and beta logits; not when ``next`` is false) and the output gate
-// rows from gate_r0.
+// Warm L2 with the sub-chunk at prompt-chunk row r0 and the output gates from gate_r0; notes/glm_kda_chunk.md#warm
 __device__ __forceinline__ void warm(int tid, int h, int H, int r0, bool next, int rows, int gate_r0,
                                      const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
                                      const __nv_bfloat16* __restrict__ A, int a_stride,
@@ -187,9 +152,7 @@ __device__ __forceinline__ void warm(int tid, int h, int H, int r0, bool next, i
     }
 }
 
-// Stage the rows of the sub-chunk whose row 0 is prompt-chunk row r0 into shared memory: projection rows r0 - 3 ..
-// r0 + 31 (the conv state before row 0, zero rows outside), decay rows and the beta logits. Global to shared
-// directly (cp.async) when the rows are 16-byte aligned; the caller waits (cp.async.wait_all) and syncs.
+// Stage the sub-chunk at row r0 in shared memory (cp.async if aligned; the caller waits); notes/glm_kda_chunk.md#stage
 __device__ __forceinline__ void stage(Smem& sm, int tid, int h, int H, int r0, int rows,
                                       const __nv_bfloat16* __restrict__ P, int p_stride, int b_off,
                                       const __nv_bfloat16* __restrict__ A, int a_stride,

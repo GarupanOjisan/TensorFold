@@ -1,4 +1,4 @@
-// EXL3 tiles (format.py, after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp): lane L decodes a tile's values 8L..8L+7 straight into its two mma.m16n8k16 B fragments, bit for bit.
+// EXL3 tiles (after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp): lane L decodes values 8L..8L+7 into B fragments
 
 #pragma once
 

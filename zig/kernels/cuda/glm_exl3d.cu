@@ -1,15 +1,6 @@
-// Device code of src/tensorfold/families/glm5_next/cuda/exl3.cu [v1.8] (lines 1-912, ATen includes dropped), checked by zig/tests/cuda/copies.py.
+// Device code of src/tensorfold/families/glm5_next/cuda/exl3.cu [v1.8] (lines 1-912, ATen includes dropped).
 #include <stdint.h>
-// GLM-5.3-Flash's EXL3 routed experts on CUDA: the grouped trellis GEMV and the Hadamard rotations around it.
-//
-// Format (see exl3.py, after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp): a 16x16 tile is 32 little-endian
-// 32-bit words; lane L of a warp decodes the tile's values 8L..8L+7 from words L-1 and L, and those eight values
-// are exactly the B fragments of two mma.m16n8k16 (columns 0-7 and 8-15 of the tile), so a tile goes from memory
-// to the tensor cores without a shuffle or a layout change.
-//
-// Every output depends only on its own row: the rows of a window share an mma tile but mma keeps rows
-// independent, the K range of every warp and split is fixed by the shape, and warps and splits are summed in a
-// fixed order (shared memory, then the epilogue kernels), never with atomics.
+// GLM-5.3-Flash's EXL3 routed experts: the grouped trellis GEMV and its Hadamard rotations; notes/glm_exl3d.md#format
 
 #include <cuda_fp16.h>
 #include <cuda_bf16.h>
@@ -42,8 +33,7 @@ __device__ __forceinline__ void decode_tile(uint32_t w, int lane, uint32_t (&b0)
     b1[1] = mcg2((w >> 4) & 0xffffu, w & 0xffffu);
 }
 
-// decode_tile's values with fewer integer instructions (the prompt kernels): the byte-aligned 16-bit states taken
-// with one PRMT each and w >> 4 shared by two states. The same states, so the same bits.
+// decode_tile with fewer integer instructions (prompt kernels): one PRMT a byte-aligned state; the same bits
 __device__ __forceinline__ void decode_tile_p(uint32_t w, int lane, uint32_t (&b0)[2], uint32_t (&b1)[2]) {
     const uint32_t p = __shfl_sync(0xffffffffu, w, (lane + 31) & 31);
     const uint32_t s = __funnelshift_r(w, p, 20);
@@ -65,8 +55,7 @@ __device__ __forceinline__ uint32_t load_pair(const half* x, bool ok) {
     return ok ? *reinterpret_cast<const uint32_t*>(x) : 0u;
 }
 
-// 16 bytes of trellis words, read once a window (no L1 allocation); asm volatile keeps it where it stands relative
-// to the (volatile) mma, so the ring depth is what the code says (patches/0580 of jayleaton/glm53-tensorfold-spark).
+// 16 bytes of trellis words without L1 allocation, kept in place by asm volatile; notes/glm_exl3d.md#ldg-nc-v4
 __device__ __forceinline__ uint4 ldg_nc_v4(const uint32_t* p) {
     uint4 v;
     asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];"
@@ -75,10 +64,7 @@ __device__ __forceinline__ uint4 ldg_nc_v4(const uint32_t* p) {
     return v;
 }
 
-// Grid (item, n block, mat * SK + split) -> Z[mat][split][pair][n]; warps sum fixed k ranges, added in warp order.
-// SEQ (prompt chunks): grid (.., .., mat); one program runs the SK splits in turn and writes Z[mat][0][pair][n] =
-// ((0 + split 0) + split 1) + ..., the epilogue's own sum, so an SK = 1 epilogue gives the same bits without the
-// SK fp32 partials' round trip through memory.
+// Grid (item, n block, mat * SK + split) -> Z[mat][split][pair][n] in a fixed order; notes/glm_exl3d.md#grouped-kernel
 template <int NT, int W, bool NFIRST, bool PF, bool SEQ>
 __global__ void __launch_bounds__(W * 32) grouped_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,
@@ -216,8 +202,7 @@ __global__ void __launch_bounds__(W * 32) grouped_kernel(
     }
 }
 
-// Fast Walsh-Hadamard transform of 128 values held 4 per lane (lane L: values 4L..4L+3), natural order, fixed
-// butterfly order: strides 1, 2 in registers, 4..64 across lanes.
+// Walsh-Hadamard transform of 128 values, lane L holding 4L..4L+3: strides 1, 2 in registers, 4..64 across lanes
 __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
     v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
@@ -231,11 +216,7 @@ __device__ __forceinline__ void fwht128(float (&v)[4], int lane) {
     }
 }
 
-// Program (member row, 128-block of K, matrix): Xh[mat][row][block] = fp16((x[row] * suh[mat][e]) @ H) for the
-// gate and up projections of every routed slot (row, slot) with slot < slots - 1 (the last slot is the shared
-// expert). One warp per program. ROWS (prompt chunks of a layer whose experts all share one suh for gate and up):
-// program (row, block) writes Xh[row][block] from suh0 = that vector, the same arithmetic as every pair's input of
-// that row, so each pair's fp16 input has the same bits, computed once a row instead of 2 x top_k times.
+// Program (member row, 128-block of K, matrix): Xh = fp16((x[row] * suh[mat][e]) @ H); notes/glm_exl3d.md#rot-in
 template <bool ROWS>
 __global__ void rot_in_kernel(const __nv_bfloat16* __restrict__ x, int x_stride, const int* __restrict__ pick,
                               const half* __restrict__ suh0, const half* __restrict__ suh1, half* __restrict__ out0,
@@ -265,9 +246,7 @@ __global__ void rot_in_kernel(const __nv_bfloat16* __restrict__ x, int x_stride,
 
 __device__ __forceinline__ float bf16r(float x) { return __bfloat162float(__float2bfloat16_rn(x)); }
 
-// Program (member row, 128-block of the rank's intermediate width): gate and up outputs summed over the splits in
-// order, rotated, scaled by svh; GLM's limited SwiGLU with the grouped kernels' bf16 roundings; then the down
-// projection's input rotation: Xd[row][block] = fp16((act * suh_d[e]) @ H).
+// Gate and up split sums rotated, GLM's limited SwiGLU, the down input's rotation; notes/glm_exl3d.md#gateup-epilogue
 __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                        const half* __restrict__ svh_g, const half* __restrict__ svh_u,
                                        const half* __restrict__ suh_d, half* __restrict__ xd, int P, int N, int SK,
@@ -305,8 +284,7 @@ __global__ void gateup_epilogue_kernel(const float* __restrict__ Z, const int* _
     for (int j = 0; j < 4; ++j) o[j] = __float2half_rn(v[j] * HAD_SCALE);
 }
 
-// Program (member row, 128-block of the model width): the down projection's output summed over the splits in
-// order, rotated and scaled by svh: Y[row][slot][:] (fp32, this rank's share of the expert's output).
+// Program (member row, 128-block of the model width): down split sums in order, rotated, times svh -> Y (fp32)
 __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __restrict__ pick,
                                      const half* __restrict__ svh_d, float* __restrict__ y, int P, int D, int SK,
                                      int slots) {
@@ -335,9 +313,7 @@ __global__ void down_epilogue_kernel(const float* __restrict__ Z, const int* __r
 
 }  // namespace tf_glm_exl3d
 
-// The instantiations GLM-5.3-Flash at two ranks launches (glm5_next/cuda/exl3_mm.py routed): a decode window's gate/up
-// and down projections (NT 8, 4 warps, 16 k steps a warp, 16-byte loads one step ahead: TF_GLM_EXL3_LOADS=nc; the
-// down projection with its epilogue fused), the row rotation, and a prompt chunk's passes of 64 pairs.
+// The instantiations GLM-5.3-Flash at two ranks launches; notes/glm_exl3d.md#instantiations
 #define TF_DEC(FUSE, XROW, SWZ, B)                                                                                  \
     template __global__ void tf_glm_exl3d::dec_kernel<8, 4, 16, FUSE, XROW, 1, 1, SWZ, B>(                          \
         const half*, const half*, const uint32_t*, const uint32_t*, const int*, const int*, const int*, float*,   \

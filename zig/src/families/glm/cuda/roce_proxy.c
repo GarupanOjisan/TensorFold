@@ -1,35 +1,6 @@
-// Adapted from b12x (https://github.com/local-inference-lab/b12x), b12x/comm/roce/_roce_proxy.c at commit
-// 8a99d639410e39d5f39cb4037675331beceea1d4: "RoCEnante", Copyright the b12x contributors, Apache License 2.0
-// (http://www.apache.org/licenses/LICENSE-2.0). Used by tensorfold/cuda/roce.py. Changes from b12x's file (TensorFold,
-// 2026-10-01, ABI 5): up to 4 HCAs, a GID index per HCA, and routes: each peer's stripes go over chosen (local HCA,
-// peer HCA) pairs (roce_set_route; default HCA h to the peer's HCA h, every HCA), so ranks cabled to each other
-// directly (a triangle of Sparks: one /24 and two rails a pair) reach each peer over its own rails only. Flags are
-// indexed by stripe (``n_flag`` stripes a peer, the same for every peer).
+// Adapted from b12x's b12x/comm/roce/_roce_proxy.c at 8a99d639410e (Apache-2.0); notes/roce_proxy.md#origin
 
-// RDMA proxy for the b12x RoCE one-shot all-reduce.
-//
-// One rank owns one pinned host region laid out as:
-//
-//   recv[src][slot]  (world * SLOTS * slot_bytes)  filled by peers' RDMA writes
-//   flag[src][slot][hca] sequence number written on each HCA after that HCA's
-//                         payload stripe
-//   send[slot]       (SLOTS * slot_bytes)          staged by the local GPU kernel
-//   ctrl             (FLAG_STRIDE)                 {u32 seq, u32 nbytes, u32 error,
-//                                                   u32 missing_peer} doorbell; the
-//                                                  last two are set by the kernel
-//                                                  when a wait times out
-//
-// The GPU kernel stages its input into send[seq & 1], publishes nbytes and seq
-// in ctrl, then spins on flag[peer][seq & 1][hca] for every peer and HCA.  The
-// proxy thread
-// below spins on ctrl.seq and, for every peer, stripes the payload across every
-// HCA.  Each stripe is followed by its own 4-byte seq write on the same reliable
-// QP, so its flag cannot become visible before its payload.  The GPU waits for
-// every stripe flag before consuming the receive slot.  Nothing on the receive
-// path involves the host.
-//
-// This file is compiled by b12x.comm.roce._proxy at first use with the host
-// gcc and libibverbs; it must stay plain C with no CUDA dependency.
+// The RDMA proxy thread of the one-shot RoCE exchange; region layout and protocol: notes/roce_proxy.md#layout
 
 #define _GNU_SOURCE
 #include <errno.h>
@@ -50,9 +21,7 @@
 #define ROCE_PORT 1
 #define ROCE_SEND_DEPTH 256
 #define ROCE_ABI_VERSION 5
-// Model graphs leave sub-millisecond gaps between collectives.  Keep the
-// proxy hot across those gaps; sleeping there adds one scheduler wakeup to
-// every collective on the graph's critical path.
+// Model graphs leave sub-millisecond gaps between collectives: stay hot across them (a sleep costs a wakeup)
 #define ROCE_IDLE_SPINS 20000000
 
 typedef struct {
@@ -122,8 +91,7 @@ int roce_layout(int world, uint64_t slot_bytes, uint64_t *out) {
     if (world < 2 || world > ROCE_MAX_PEERS || slot_bytes == 0 || (slot_bytes % 4096) != 0) {
         return -1;
     }
-    // Reject a layout whose arithmetic would wrap; the caller sizes slots from
-    // configuration, so a wrapped region must fail here rather than at the NIC.
+    // Reject a layout whose arithmetic would wrap, so a wrapped region fails here rather than at the NIC
     uint64_t recv_bytes, flag_bytes, send_bytes, send_off, ctrl_off, total;
     if (slot_bytes > ((uint64_t)1 << 40) ||
         __builtin_mul_overflow((uint64_t)world * ROCE_SLOTS, slot_bytes, &recv_bytes) ||
@@ -195,15 +163,12 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
         for (int s = 0; s < n_stripe; s++) {
             const int h = c->stripe_hca[p][s];
             roce_hca_t *hca = &c->hca[h];
-            // Two work requests per stripe; keep the queue at most a quarter
-            // full so a provider that needs extra entries can never fail a post.
+            // Two work requests a stripe; the queue at most a quarter full, so a provider's extra entries fit
             while (hca->outstanding[p] >= ROCE_SEND_DEPTH / 4) {
                 if (drain_cq(c, h) != 0) {
                     return -1;
                 }
-                // A peer that stopped acknowledging keeps the QP retrying for
-                // a long time; honour a stop request instead of blocking
-                // roce_stop (and so teardown) behind it.
+                // A peer that stopped acknowledging keeps the QP retrying: honour a stop instead of blocking teardown
                 if (!atomic_load_explicit(&c->running, memory_order_relaxed)) {
                     snprintf(c->err, sizeof(c->err),
                              "RoCE proxy stopped with %u writes outstanding to rank %d",
@@ -281,11 +246,7 @@ static int post_op(roce_ctx_t *c, uint32_t seq, uint32_t nbytes) {
 static void *proxy_main(void *arg) {
     roce_ctx_t *c = (roce_ctx_t *)arg;
     volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
-    // Spin while ops are flowing.  After ROCE_IDLE_SPINS polls without a
-    // doorbell, request a short nanosleep between polls (the OS decides the
-    // actual delay) so an idle runtime does not hold a core next to the
-    // serving process.  The missed-doorbell catch-up below keeps the protocol
-    // correct however long the thread is away.
+    // Spin while ops flow, nap between polls after ROCE_IDLE_SPINS idle ones; notes/roce_proxy.md#idle
     uint64_t idle = 0;
     const struct timespec nap = {0, 20000};
     while (atomic_load_explicit(&c->running, memory_order_relaxed)) {
@@ -306,12 +267,7 @@ static void *proxy_main(void *arg) {
             continue;
         }
         idle = 0;
-        // The doorbell holds only the newest sequence.  Our kernel for op N
-        // completes on the peers' payloads alone, so op N+1 can ring before
-        // this thread has seen op N (it slept, or the scheduler moved it).
-        // Peers cannot get further than one op ahead of us, so at most
-        // ROCE_SLOTS doorbells are pending and every send slot is intact:
-        // post each missed sequence in order using its per-slot byte count.
+        // Post every missed doorbell in order (at most ROCE_SLOTS pending); notes/roce_proxy.md#missed-doorbells
         uint32_t pending = seq - c->last_seq;
         if (pending > ROCE_SLOTS) {
             snprintf(c->err, sizeof(c->err),
@@ -336,8 +292,7 @@ int roce_start(roce_ctx_t *c) {
         return 0;
     }
     if (!c->started) {
-        // A restart continues from the last posted sequence so ops that rang
-        // the doorbell while the thread was stopped are still posted.
+        // A restart continues from the last posted sequence, so ops rung while stopped are still posted
         volatile uint32_t *ctrl = (volatile uint32_t *)(c->region + c->ctrl_off);
         c->last_seq = ctrl[0];
         c->started = 1;

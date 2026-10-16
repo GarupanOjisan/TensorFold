@@ -1,23 +1,4 @@
-// glm_exl3d.cu's decode windows (dec_kernel), included inside namespace tf_glm_exl3d.
-// ---- decode windows: grouped_kernel's arithmetic with its epilogues fused -------------------------------------
-// Every mma chain, warp sum and split sum is grouped_kernel's (non-SEQ, register prefetch of the next k step): a
-// warp runs k tiles kt0 .. kt0 + STEPS - 1 of its split in order from zero, the warps are added in warp order, the
-// splits in split order from 0. What changes:
-// FUSE 1 (the down projection, SK = 1): the block's 128 columns are one Hadamard block, so it applies
-//   down_epilogue_kernel's arithmetic to its own sums and writes Y, no Z round trip, no epilogue launch;
-// FUSE 2 (gate and up): each block still writes its Z partial; the last of the 2 * SK blocks of an (item, n block)
-//   to finish (an atomic count, reset for the next launch) runs gateup_epilogue_kernel's arithmetic on the item's
-//   rows and 128 columns, reading the partials in split order: the same sums whichever block finishes last.
-// XROW: X holds one row a token (rot_rows, a layer whose experts share one suh), pair p reads row p / slots.
-// LD (TF_GLM_EXL3_LOADS; data movement only, every chain and sum as above, so the same bits):
-//   0: 32-bit __ldg of word `lane` of each tile, one k step ahead, after the count -> item -> members round trips;
-//   1: adapted from jayleaton/glm53-tensorfold-spark patches/0580 (exl3_ld.cu ld_kernel, LD_NC; Apache-2.0,
-//      Copyright 2026 Jay Leaton). Changes: in our dec_kernel (its items / counts plan, fused epilogues and XROW
-//      inputs kept), PD fixed at compile time, no probes / PDL. The count and the item are read together and the
-//      first PD k steps' trellis words are issued before the member rows reach shared memory; the words come as
-//      ld.global.nc.L1::no_allocate.v4 (lane l: bytes 16 l .. of each 512 B of a step, NT / 4 loads a lane), PD
-//      steps in flight, through a 1 KB staging area in the warp's own slice of `red` (two __syncwarp a step), read
-//      back as word `lane` of each tile.
+// Decode windows of glm_exl3d.cu; LD 1 from jayleaton patches/0580 (Apache-2.0); notes/glm_exl3d.md#decode-windows
 template <int NT, int W, int STEPS, int FUSE, bool XROW, int LD = 0, int PD = 1, int SWZ = 0, int B = 4>
 __global__ void __launch_bounds__(W * 32) dec_kernel(
     const half* __restrict__ X0, const half* __restrict__ X1, const uint32_t* __restrict__ T0,

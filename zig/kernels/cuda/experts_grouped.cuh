@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/exl3/experts_grouped.cuh (lines 1-306, comments, ATen includes and host launchers dropped, <stdint.h> added), checked by zig/tests/cuda/copies.py.
+// Device code of src/tensorfold/cuda/exl3/experts_grouped.cuh (lines 1-306, host launchers dropped).
 #pragma once
 
 #include <cuda_fp16.h>
