@@ -8,19 +8,21 @@ const fwd = @import("forward.zig");
 const pk = @import("prefill_kernels.zig");
 const pl = @import("prefill_launch.zig");
 const mixers = @import("prefill_mixers.zig");
+const layers = @import("layers.zig");
+const lesson_route = @import("lesson_route.zig");
 const Model = @import("model.zig").Model;
 
 const Buffer = mtl.Buffer;
 const At = pl.At;
 const opts = mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked;
 
-/// lane_qmm's rows at most: wider chunks take MLX's 4-bit matmuls on the checkpoint's layout.
+/// lane_qmm's rows at most: wider chunks take MLX's 4-bit matmuls on the checkpoint's layout (4/64 matrices).
 pub const lane_rows = 128;
 
 /// mlx_lm's SSD step.
 pub const ssd_step = 256;
 
-/// A 4-bit linear in MLX's layout: weight [N, K/8] u32, scales and biases [N, K/64] bf16.
+/// A linear in MLX's layout: weight [N, K * bits / 32] u32, scales and biases [N, K / group] bf16.
 pub const Raw = [3]At;
 
 pub const Mamba = struct { in_proj: Raw, out_proj: Raw, conv_w: At, conv_b: At, dt_bias: At, d: At, a: At };
@@ -142,8 +144,10 @@ pub const Chunk = struct {
         return self.cache.len > 0;
     }
 
-    /// x [rows, K] times a projection into `out`: lane_qmm up to 128 rows, else MLX's 4-bit matmul.
+    /// x [rows, K] times a projection: lane_qmm to 128 rows, else MLX's 4-bit matmul; other widths on the row kernels.
     pub fn linear(self: Chunk, comptime key: []const u8, comptime sums: []const u8, lin: wts.Linear, raw: Raw, x: Buffer, out: Buffer) void {
+        if (lin.tiles == null and self.rows > lane_rows and self.f.wide(self.e, lin, x, out, self.rows)) return;
+        if (lin.tiles == null) return self.f.coop(self.e, key, lin, x, 0, self.p.s.xs, out, self.rows);
         if (self.rows <= lane_rows) {
             self.f.xsum(self.e, sums, lin.k, x, 0, self.p.s.xs, self.rows);
             self.f.coop(self.e, key, lin, x, 0, self.p.s.xs, out, self.rows);
@@ -226,8 +230,8 @@ pub const Prefill = struct {
                     .a = At.of(p.a).plus(p.index[i] * c.mamba_heads * 4),
                 } },
                 .moe => .{ .moe = .{
-                    .up = try rawLinear(m, "backbone.layers.{d}.mixer.shared_experts.up_proj", i),
-                    .down = try rawLinear(m, "backbone.layers.{d}.mixer.shared_experts.down_proj", i),
+                    .up = rawOf(m.weights.layers[i].moe.shared_raw[0]),
+                    .down = rawOf(m.weights.layers[i].moe.shared_raw[1]),
                 } },
                 .attention => .{ .attention = .{
                     .q = try rawLinear(m, "backbone.layers.{d}.mixer.q_proj", i),
@@ -271,10 +275,16 @@ pub const Prefill = struct {
 
     /// One prompt chunk of `rows` ids at `ids` + `ids_off`: the caches advance, the final-normed rows land in s.x.
     pub fn chunk(self: *const Prefill, e: *fwd.Enc, f: fwd.Forward, cache: *st.Cache, ids: Buffer, ids_off: usize, rows: usize, fresh: u32) void {
-        const x = self.context(e, f, cache, rows, fresh);
+        var g = f;
+        g.untaught = cache.untaught;
+        if (g.route.count == 0) g.route.add(0, rows, cache.len, if (cache.rid >= 0) cache.decide else lesson_route.none, @intCast(@max(cache.rid, 0)));
+        const lessons = layers.firstAdapter(g.w);
+        if (lessons) |ad| layers.latchAll(g.k, e, ad, &g.route, false);
+        const x = self.context(e, g, cache, rows, fresh);
         self.embed(x, ids, ids_off);
         for (0..self.c.layers) |i| self.layer(x, i);
         self.final(x);
+        if (lessons) |ad| layers.latchAll(g.k, e, ad, &g.route, true);
     }
 
     /// A chunk of `rows` rows of the stream with `cache`, its Mamba states going to pool slot `fresh`.
@@ -283,8 +293,9 @@ pub const Prefill = struct {
         return .{ .p = self, .e = e, .f = f, .rows = rows, .cache = cache, .pool = f.pool, .fresh = fresh };
     }
 
-    /// The ids' embedding rows into s.h.
+    /// The ids' embedding rows into s.h (another width than 4/64: the decode's width-general lookup).
     pub fn embed(self: *const Prefill, x: Chunk, ids: Buffer, ids_off: usize) void {
+        if (!self.w.embed_width.four()) return x.f.embed(x.e, x.rows, ids, ids_off, self.s.h);
         const d = self.c.hidden;
         const e = x.e;
         e.pipe(self.k.get("tf_embed_b4_g64"));
@@ -321,6 +332,11 @@ pub fn tensorAt(t: anytype) At {
 fn tensor(m: *Model, comptime fmt: []const u8, i: usize) !At {
     var name: [160]u8 = undefined;
     return tensorAt(try m.checkpoint.get(try std.fmt.bufPrint(&name, fmt, .{i})));
+}
+
+/// A quantized matrix's words, scales and biases as the prompt kernels read them.
+fn rawOf(t: anytype) Raw {
+    return .{ tensorAt(t[0]), tensorAt(t[1]), tensorAt(t[2]) };
 }
 
 fn rawLinear(m: *Model, comptime base: []const u8, i: usize) !Raw {

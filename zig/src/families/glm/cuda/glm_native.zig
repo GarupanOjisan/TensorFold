@@ -41,10 +41,12 @@ pub const max_lanes: u32 = fwd.Engine.max_lanes;
 pub const default_port: u16 = 29660;
 /// GLM runs on a captured Triton kernel set only (TENSORFOLD_CUDA_KERNELS), never on the built-in glue kernels.
 pub const captured_kernels = true;
+pub const explains_open = true;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1 };
+/// `slide` stays false: the server refuses --slide for a family without a learner.
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false };
 
-pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool) anyerror!bool;
+pub const LoneRun = *const fn (ctx: *anyopaque, s: *lanes.Stream, hooks: *anyopaque, committed: *const fn (*anyopaque) void, yield: *const fn (*anyopaque) bool, resumed: bool) anyerror!bool;
 
 pub const Loaded = struct {
     backend: be.Backend,
@@ -53,14 +55,39 @@ pub const Loaded = struct {
     stream_bytes: usize,
     /// Streams that allocate nothing: the first takes the engine's own sequence (grow adds the rest).
     free_streams: u32 = 1,
+    learn_bytes: usize = 0, // no learner: the streams keep all the room
     ctx: *anyopaque,
     deinit: *const fn (*anyopaque) void,
     lone: ?LoneRun = null,
+    target: *anyopaque, // the prompt cache keeps this family's states (snap_*): the same as ctx
 };
+
+/// Whether this port reads `dir`: an EXL3 checkpoint (config.json's quantization_config names quant_method "exl3");
+/// other glm5_next checkpoints (NVIDIA's NVFP4) go to families/glm/cuda_native.zig.
+pub fn reads(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return false;
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(64 << 20)) catch return false;
+    const root = std.json.parseFromSliceLeaky(std.json.Value, a, text, .{}) catch return false;
+    if (root != .object) return false;
+    const q = root.object.get("quantization_config") orelse return false;
+    if (q != .object) return false;
+    const m = q.object.get("quant_method") orelse return false;
+    return m == .string and std.ascii.eqlIgnoreCase(m.string, "exl3");
+}
 
 /// This rank's share of the checkpoint (the routed experts and most projections halve, the embedding and the
 /// replicated layers do not): what the memory admission compares with the budget before loading.
-pub fn weightBytes(total: u64) u64 {
+pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64) u64 {
+    _ = a;
+    _ = io;
+    _ = dir;
+    return weightBytes(total);
+}
+
+fn weightBytes(total: u64) u64 {
     return total / 2 + (4 << 30) + if (node.drafterDir() != null) @as(u64, 2 << 30) else 0; // DFlash2's 4-bit layers: 1.8 GiB a rank
 }
 
@@ -513,7 +540,7 @@ const Glm = struct {
             try ln.live.appendSlice(g.gpa, s.prompt()[it[1]..][0..it[2]]);
             ln.fill_at += it[2];
             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(ln.fill_at)) != null) if (s.reuse.hook) |hk| {
-                try g.n.bind(it[0]); // snapSave keeps the bound lane's state
+                try g.n.bind(it[0]); // snap_save keeps the bound lane's state
                 g.pass = s.prompt();
                 g.pass_at = @intCast(ln.fill_at);
                 hk.at(hk.ptr, s, @intCast(ln.fill_at));
@@ -1108,7 +1135,8 @@ fn envPort() u16 {
     return std.fmt.parseInt(u16, std.mem.span(v), 10) catch default_port;
 }
 
-pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, kernels: []const u8, o: Options) !Loaded {
+pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, captured: ?[]const u8, o: Options) !Loaded {
+    const kernels = captured orelse return error.NoCapturedKernels;
     std.log.info("GLM-5.3-Flash rank 0: waiting for rank 1 (tf-glm follow) on port {d}", .{envPort()});
     const n = try Node.init(gpa, io, ctx, dir, kernels, o.context, 0, "", envPort());
     errdefer n.deinit();
@@ -1122,7 +1150,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     try g.measure(io);
     @memcpy(g.shared[0..max_rows], &g.costs);
     for (g.shared[max_rows..]) |*c| c.* = .{ .width = 0, .ms = 0 }; // width 0: left out (lanes config); measureShared fills them
-    return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = n.laneBytes(), .ctx = g, .deinit = release };
+    return .{ .backend = g.backend(), .facts = g.facts(), .rows = if (g.drafts) max_rows else 1, .stream_bytes = n.laneBytes(), .ctx = g, .target = g, .deinit = release };
 }
 
 /// Lanes up to `total` on both ranks, allocated now (native/cuda.zig calls this once, after the memory admission
@@ -1177,6 +1205,7 @@ pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
         error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
         error.OneStreamAtATime => "this build of the GLM CUDA engine runs one request's window at a time",
         error.NoFreeLane => "every lane of the GLM CUDA engine is in use: retry when a request finishes",
+        error.NoCapturedKernels => "the EXL3 GLM-5.3-Flash runs only on a captured CUDA kernel set: set TENSORFOLD_CUDA_KERNELS to a folder from aot_pack.py",
         else => null,
     };
 }
@@ -1191,12 +1220,12 @@ const Snap = struct { id: u32, at: u32, key: u64 };
 pub const cache_lookahead: u32 = 1;
 pub const cache_planned = true;
 
-pub fn snapBytes(p: *anyopaque, at: u32) u64 {
+pub fn snap_bytes(p: *anyopaque, at: u32) u64 {
     _ = at;
     return Glm.of(p).n.snapshotBytes();
 }
 
-pub fn snapSave(p: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
+pub fn snap_save(p: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
     _ = owner;
     const g = Glm.of(p);
     if (g.pass_at != at) return error.SnapshotOutOfStep;
@@ -1210,14 +1239,14 @@ pub fn snapSave(p: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque 
 }
 
 /// The prompt pass restores a kept state itself (prefillFn), at its first chunk.
-pub fn snapRestore(p: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
+pub fn snap_restore(p: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
     _ = p;
     _ = owner;
     _ = saved;
     return error.RestoredByThePromptPass;
 }
 
-pub fn snapDrop(p: *anyopaque, saved: *anyopaque) void {
+pub fn snap_drop(p: *anyopaque, saved: *anyopaque) void {
     const g = Glm.of(p);
     const sn: *Snap = @ptrCast(@alignCast(saved));
     g.n.drop(sn.id);

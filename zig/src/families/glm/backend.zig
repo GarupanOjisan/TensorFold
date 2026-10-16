@@ -3,16 +3,17 @@ const std = @import("std");
 const lanes = @import("lanes");
 const st = @import("state.zig");
 const slots_mod = @import("slots.zig");
+const slot_images = @import("slot_images.zig");
+const pool = @import("pool.zig");
 const mirror = @import("mirror.zig");
 const snapshot = @import("snapshot.zig");
+const timing = @import("timing.zig");
 const Engine = @import("engine.zig").Engine;
 const be = lanes.backend;
 const Stream = lanes.Stream;
+const fwd = @import("forward.zig");
 
-/// One stream's window and a shared forward's rows, ms on the M5 Ultra pair (each stream's extra cost is learned).
-const window_costs = costTable(13.1, 3.5);
-const shared_costs = costTable(8.4 + 3.5, 3.5);
-/// The same on one M5 Ultra, where a row's own experts are read on that Mac alone.
+/// One stream's window and a shared forward's rows, ms on one M5 Ultra (a pair times its own at load: timing.zig).
 const one_mac_window_costs = costTable(13.0, 4.1);
 const one_mac_shared_costs = costTable(8.4 + 4.1, 4.1);
 
@@ -29,6 +30,7 @@ pub const Backend = struct {
     words: std.ArrayList(u32) = .empty, // the next command's words
     wins: std.ArrayList(slots_mod.Win) = .empty,
     drafts: std.ArrayList(slots_mod.Draft) = .empty,
+    costs: ?timing.Costs = null, // a pair's rank 0: its windows and head step as timed (shared forwards priced the same)
 
     pub fn deinit(b: *Backend) void {
         b.by.deinit(b.gpa);
@@ -38,7 +40,7 @@ pub const Backend = struct {
     }
 
     pub fn backend(b: *Backend) be.Backend {
-        return .{ .ptr = b, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        return .{ .ptr = b, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release, .reports_fill = true } };
     }
 
     /// Windows of up to 16 rows (drafted == plain at every width), the MTP head's chains, every stream in one forward.
@@ -52,15 +54,27 @@ pub const Backend = struct {
             .speculate_early = false,
             .plain_guard = true, // a shared round's draft row costs about what a plain row does: draft where it wins
             .drafts = 4,
-            .window_costs = if (b.sl.e.ep == null) &one_mac_window_costs else &window_costs,
-            .mtp_step_ms = 1.3,
+            .window_costs = if (b.costs) |*c| &c.window else if (b.sl.e.ep == null) &one_mac_window_costs else &.{},
+            .mtp_step_ms = if (b.costs) |c| c.head_ms else 1.3,
+            .depth_rate = if (b.costs != null) timing.depth_rate else 0,
             .streams_exact = true,
             .hidden_rows = true,
             .batch_rows = st.max_rows,
             .max_streams = @intCast(b.sl.slots.len),
-            .shared_costs = if (b.sl.e.ep == null) &one_mac_shared_costs else &shared_costs,
+            .shared_costs = if (b.sl.e.ep == null) &one_mac_shared_costs else &.{},
             .draft_streams = true,
         };
+    }
+
+    /// The cache tokens a stream of `prompt` and `max_new` tokens can reach: its prompt, its reply, a last window.
+    fn need(prompt: usize, max_new: usize) u32 {
+        return @intCast(@min(prompt + max_new + st.max_rows + 1, std.math.maxInt(u32)));
+    }
+
+    /// The lane host's admission check: whether a request's caches fit in the pool beside the running streams'.
+    pub fn fits(ptr: *anyopaque, prompt: u32, max_new: u32) bool {
+        const b = self(ptr);
+        return pool.fits(b.sl, need(prompt, max_new));
     }
 
     fn self(ptr: *anyopaque) *Backend {
@@ -75,22 +89,30 @@ pub const Backend = struct {
         const b = self(ptr);
         const e = b.sl.e;
         if (e.followsPeer()) return error.FollowsPeer;
-        if (s.sampling) |p| if (p.temperature > 0) return error.GreedyOnly;
+        if (e.ep != null and s.sampling != null and s.sampling.?.temperature > 0) return error.SampledPeerUnsupported;
         const prompt = s.prompt();
         if (prompt.len == 0) return error.EmptyPrompt;
-        if (prompt.len + s.max_new + st.max_rows + 1 > e.s.cap) return error.ContextFull;
-        const i = b.sl.free() orelse return error.NoFreeSlot;
+        if (prompt.len + s.max_new + st.max_rows + 1 > pool.capacity(b.sl)) return error.ContextFull;
+        const reuse: ?*const snapshot.Snap = if (s.reuse.saved) |saved| @ptrCast(@alignCast(saved)) else null;
+        const i = b.sl.pick(reuse) orelse return error.NoFreeSlot;
         try b.by.put(b.gpa, s, i);
+        try pool.reserve(b.sl, i, need(prompt.len, s.max_new), reuse); // pooled: its share (admission checked it fits)
         b.words.clearRetainingCapacity();
         try b.words.appendSlice(b.gpa, &.{ i, @intFromBool(s.drafts) });
         try b.words.appendSlice(b.gpa, prompt);
         try mirror.send(e, .begin, b.words.items);
         try b.sl.begin(i, prompt, s.drafts);
         s.cached = 0;
+        if (s.images.len > 0) { // the images through the tower first: the chunks inject their rows
+            if (e.ep != null) return error.VisionOnPair;
+            try slot_images.encode(b.sl, i, s.images);
+        }
+        defer if (s.images.len > 0) slot_images.end(b.sl);
         var at: u32 = 0;
         if (s.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
             const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
             if (snap.at < prompt.len and b.sl.usable(snap)) {
+                if (snap.home != i) try b.copyOut(i, 0); // the restore writes every one of this slot's rows
                 try mirror.send(e, .restore, &.{ i, snap.id });
                 try b.sl.restore(i, snap.id);
                 at = snap.at;
@@ -98,16 +120,33 @@ pub const Backend = struct {
             } else s.reuse_failed = true;
         }
         var next: usize = 0; // the planned chunk starts: a resumed pass cuts where a fresh one does
+        s.fill_at.store(at, .monotonic); // a restored prefix is done the moment it is restored
+        // The first reply token's draw, keyed at P: the head's one output row is draws row 0, no prompt rule.
+        const draws = @import("draw_rule.zig").promptDraws(s.sampling, @intCast(prompt.len), e.c.vocab);
+        const sampled_prompt = draws.n > 0;
         while (at < prompt.len) {
             if (s.isCancelled()) return error.Cancelled; // the core releases the slot
             while (next < s.chunks.len and s.chunks[next] <= at) next += 1;
             const end: u32 = if (next < s.chunks.len) s.chunks[next] else @intCast(prompt.len);
             const n = b.sl.chunkRows(at, end);
+            try b.copyOut(i, at);
             try mirror.send(e, .chunk, &.{ i, at, n });
-            try b.sl.chunk(i, at, n);
+            // Only the prompt's final chunk draws a token (its head runs): its last pass row takes the rule.
+            const chunk_draws: ?*const fwd.Draws = if (sampled_prompt and at + n == prompt.len) &draws else null;
+            try b.sl.chunk(i, at, n, chunk_draws); // the chunk's compute completes here: `at` is landed progress
             at += n;
+            s.fill_at.store(at, .monotonic); // the dashboard's prefill progress reads this between chunks
             if (std.mem.indexOfScalar(u32, s.reuse.marks, at) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, at);
         }
+    }
+
+    /// Slot `i`'s resident states past `at` made whole where the budget has room before it writes; a pair's rank 1 copies the same ids.
+    fn copyOut(b: *Backend, i: u32, at: u32) !void {
+        b.words.clearRetainingCapacity();
+        try b.words.append(b.gpa, i);
+        const done = b.sl.copyOut(i, at, &b.words, b.gpa);
+        if (b.words.items.len > 1) try mirror.send(b.sl.e, .copy_out, b.words.items); // the copies made, even if a later one failed
+        return done;
     }
 
     /// The prompt cache's Snapshots functions: a stream's prompt state, mirrored to the peer by id.
@@ -123,6 +162,68 @@ pub const Backend = struct {
         if (at != b.sl.slots[i].s.pos or b.sl.slots[i].rows != 0) return error.SnapshotOutOfStep;
         try mirror.send(b.sl.e, .save, &.{ id, i, at });
         return try b.sl.save(i, at, id, b.sl.resident());
+    }
+
+    pub fn snapReclaim(_: *anyopaque, dir: [:0]const u8, key: u64) !u64 {
+        var buf: [1100]u8 = undefined;
+        return lanes.learned_dirs.fileBytes(try snapshot.path(&buf, dir, key, 0));
+    }
+    pub fn peerOtherUsed(ptr: *anyopaque, id: u64) !u64 {
+        const b = self(ptr);
+        if (b.sl.e.ep == null) return 0;
+        try mirror.send(b.sl.e, .disk_other_used, &.{ @truncate(id), @truncate(id >> 32) });
+        const value = try b.sl.e.ep.?.ctl.waitReplyValue();
+        if (value == std.math.maxInt(u64)) return error.PeerDiskRead;
+        return value;
+    }
+    pub fn peerOtherNext(ptr: *anyopaque, after: ?u64) !?u64 {
+        const b = self(ptr);
+        if (b.sl.e.ep == null) return null;
+        const value = after orelse 0;
+        try mirror.send(b.sl.e, .disk_other_next, &.{ @truncate(value), @truncate(value >> 32), @intFromBool(after != null) });
+        const found = (try b.sl.e.ep.?.ctl.waitReplyOptional()) orelse return null;
+        if (found == std.math.maxInt(u64)) return error.PeerDiskRead;
+        return found;
+    }
+    pub fn peerOtherBytes(ptr: *anyopaque, id: u64) !u64 {
+        const b = self(ptr);
+        if (b.sl.e.ep == null) return 0;
+        try mirror.send(b.sl.e, .disk_other_bytes, &.{ @truncate(id), @truncate(id >> 32) });
+        const count = try b.sl.e.ep.?.ctl.waitReplyValue();
+        if (count == std.math.maxInt(u64)) return error.PeerDiskRead;
+        return count;
+    }
+    pub fn peerOtherRemove(ptr: *anyopaque, id: u64) !void {
+        const b = self(ptr);
+        if (b.sl.e.ep == null) return;
+        try mirror.send(b.sl.e, .disk_other_remove, &.{ @truncate(id), @truncate(id >> 32) });
+        if (!try b.sl.e.ep.?.ctl.waitReply()) return error.PeerLearnDelete;
+    }
+    pub fn peerNeed(ptr: *anyopaque, saved: *anyopaque, extra: u64) !u64 {
+        const b = self(ptr);
+        if (b.sl.e.ep == null) return 0;
+        const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
+        try mirror.send(b.sl.e, .disk_need, &.{ snap.id, @truncate(extra), @truncate(extra >> 32) });
+        return b.sl.e.ep.?.ctl.waitReplyValue();
+    }
+    pub fn peerReclaim(ptr: *anyopaque, key: u64) !u64 {
+        const b = self(ptr);
+        if (b.sl.e.ep == null) return 0;
+        try mirror.send(b.sl.e, .disk_reclaim, &.{ @truncate(key), @truncate(key >> 32) });
+        return b.sl.e.ep.?.ctl.waitReplyValue();
+    }
+    pub fn peerReserve(ptr: *anyopaque, saved: *anyopaque, key: u64, extra: u64) !void {
+        const b = self(ptr);
+        if (b.sl.e.ep == null) return;
+        const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
+        try mirror.send(b.sl.e, .disk_reserve, &.{ snap.id, @truncate(key), @truncate(key >> 32), @truncate(extra), @truncate(extra >> 32) });
+        if (!try b.sl.e.ep.?.ctl.waitReply()) return error.PeerDiskFull;
+    }
+    pub fn peerFinish(ptr: *anyopaque, key: u64, success: bool) !void {
+        const b = self(ptr);
+        if (b.sl.e.ep == null) return;
+        try mirror.send(b.sl.e, .disk_finish, &.{ @truncate(key), @truncate(key >> 32), @intFromBool(success) });
+        if (!try b.sl.e.ep.?.ctl.waitReply()) return error.PeerDiskOutOfStep;
     }
 
     /// --learn: a kept state to its file here and, on a pair, rank 1's half there; an error unless both are written.
@@ -159,10 +260,14 @@ pub const Backend = struct {
 
     /// --learn: learned state `key`'s file here and, on a pair, rank 1's half removed.
     pub fn snapForget(ptr: *anyopaque, dir: [:0]const u8, key: u64) void {
+        snapForgetChecked(ptr, dir, key) catch |err| std.log.err("glm: learned deletion failed: {s}", .{@errorName(err)});
+    }
+    pub fn snapForgetChecked(ptr: *anyopaque, dir: [:0]const u8, key: u64) !void {
         const b = self(ptr);
-        mirror.send(b.sl.e, .forget, &.{ @truncate(key), @truncate(key >> 32) }) catch |err| std.log.err("glm: the peer kept a forgotten learned state: {s}", .{@errorName(err)});
+        try mirror.send(b.sl.e, .forget, &.{ @truncate(key), @truncate(key >> 32) });
+        if (b.sl.e.ep) |ep| if (!try ep.ctl.waitReply()) return error.PeerLearnDelete;
         var buf: [1100]u8 = undefined;
-        _ = std.c.unlink(snapshot.path(&buf, dir, key, 0) catch return);
+        try lanes.learned_dirs.unlink(try snapshot.path(&buf, dir, key, 0));
     }
 
     pub fn snapRestore(_: *anyopaque, _: ?*anyopaque, _: *anyopaque) anyerror!void {
@@ -193,7 +298,8 @@ pub const Backend = struct {
             .handle => |h| @as(u32, @intCast(h)),
             .value => |v| b.sl.ringPut(v),
         };
-        return try b.sl.queueRound(i, from);
+        // The stream's sampling arms the queued round's keyed draw (a positive temperature); greedy streams stay plain.
+        return try b.sl.queueRound(i, from, s.sampling);
     }
 
     fn read(ptr: *anyopaque, handle: u64) anyerror!u32 {
@@ -209,14 +315,15 @@ pub const Backend = struct {
             const i = try b.slotOf(w.stream);
             const at = b.sl.length(i);
             for (w.positions, 0..) |p, r| if (p != at + r + 1) return error.PositionMismatch;
-            if (w.held > b.sl.slots[i].held_n or at + w.rows() + 1 > b.sl.e.s.cap) return error.WindowOutOfStep;
+            if (w.held > b.sl.slots[i].held_n or at + w.rows() + 1 > b.sl.slots[i].s.cap) return error.WindowOutOfStep;
             total += w.rows();
             try b.wins.append(b.gpa, .{ .slot = i, .pending = w.pending, .held = w.held, .tokens = w.tokens });
         }
         if (total > st.max_rows) return error.WindowOutOfStep;
+        const draws = @import("draw_rule.zig").windowDraws(windows, b.sl.e.c.vocab);
         try mirror.windowWords(&b.words, b.gpa, b.sl.digest, b.wins.items);
         try mirror.send(b.sl.e, .window, b.words.items);
-        try b.sl.window(b.wins.items);
+        try b.sl.window(b.wins.items, &draws);
         const picks = Engine.u32s(b.sl.e.sc.picks, total);
         var row: usize = 0;
         for (windows, out, b.wins.items) |w, o, win| {

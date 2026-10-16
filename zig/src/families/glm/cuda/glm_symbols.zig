@@ -1,4 +1,4 @@
-//! Mangled names of the GLM-5.3-Flash kernels in the glm_kda and glm_exl3 fatbins (cuobjdump -symbols, nvcc 13.0,
+//! Mangled names of the GLM-5.3-Flash kernels in the glm_port_kda and glm_exl3 fatbins (cuobjdump -symbols, nvcc 13.0,
 //! sm_121), and the host launch geometry the Python engine v0.6.6 uses for each. File:line references are into
 //! ~/tf-native/py066/src/tensorfold/. Every launch is on the current stream; "smem" is the dynamic shared memory
 //! argument; "static" is the kernel's own shared memory (cuobjdump -res-usage SHARED minus the 1 KiB the sm_121 ELF
@@ -109,7 +109,7 @@
 //!   grid (rows, (D + 255)/256), block 256, smem 0. args (experts.cu:183-184): float* y, float* wts, float* out,
 //!   int D, int slots.
 
-// glm_kda.fatbin
+// glm_port_kda.fatbin
 /// kda.chain, rows < 64: one block a head runs every row (kda.cu:368).
 pub const kda_chain = "_ZN10tf_glm_kda12chain_kernelEiPK13__nv_bfloat16iiS2_iS2_iS2_S2_PKfS4_S4_S2_ffiPS0_PfS6_S5_S6_S6_";
 /// kda.chain, rows >= 64, launch 1 of 3: conv, decay, beta and the q/k norms of every row (kda.cu:406).

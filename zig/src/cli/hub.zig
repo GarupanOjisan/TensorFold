@@ -10,9 +10,11 @@ pub const Family = struct { model_type: []const u8, title: []const u8, formats: 
 
 const titles = [_]struct { model_type: []const u8, title: []const u8 }{
     .{ .model_type = "nemotron_h", .title = "Nemotron 3.5 Lightning" },
+    .{ .model_type = "nemotron_h_omni", .title = "Nemotron 3.5 Super VL" },
     .{ .model_type = "qwen4_exp", .title = "Qwen3.8 Flash Next" },
     .{ .model_type = "glm5_next", .title = "GLM-5.3-Flash" },
     .{ .model_type = "qwen3_5", .title = "Qwen3.5-2B or Qwen3.8-27B" },
+    .{ .model_type = "lfm2_moe", .title = "LFM2.5-24B-A2B" },
 };
 
 /// The family that serves `model_type` from the engine registry, or null when Zig cannot serve it (the 0.6 line may).
@@ -49,14 +51,24 @@ pub fn repoDirName(a: Allocator, repo: []const u8) ![]const u8 {
     return std.fmt.allocPrint(a, "models--{s}--{s}", .{ repo[0..slash], repo[slash + 1 ..] });
 }
 
+/// A git sha: 40 hex characters, the only strings ever joined into a cache path.
+pub fn hexSha(text: []const u8) bool {
+    if (text.len != 40) return false;
+    for (text) |ch| {
+        const ok = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or (ch >= 'A' and ch <= 'F');
+        if (!ok) return false;
+    }
+    return true;
+}
+
 /// The cached snapshot serving `repo`: refs/main's revision, else the newest snapshot with a config.json.
 pub fn cachedSnapshot(a: Allocator, io: std.Io, hub: []const u8, repo: []const u8) !?[]const u8 {
     const dir_name = try repoDirName(a, repo);
     const root = try std.fs.path.join(a, &.{ hub, dir_name });
-    var ref_buf: [256]u8 = undefined;
     if (readSmall(a, io, try std.fs.path.join(a, &.{ root, "refs", "main" }))) |ref| {
         const rev = std.mem.trim(u8, ref, " \r\n");
-        if (rev.len > 0 and rev.len <= ref_buf.len) {
+        // The ref names the snapshot dir: only a 40-hex git sha is ever joined into a cache path.
+        if (hexSha(rev)) {
             const snapshot = try std.fs.path.join(a, &.{ root, "snapshots", rev });
             if (isDir(io, snapshot)) return snapshot;
         }
@@ -77,7 +89,6 @@ pub fn cachedSnapshot(a: Allocator, io: std.Io, hub: []const u8, repo: []const u
             newest = snapshot;
         }
     }
-    _ = &ref_buf;
     return newest;
 }
 
@@ -126,7 +137,7 @@ pub fn quantization(a: Allocator, io: std.Io, dir: []const u8) ?struct { bits: u
     return .{ .bits = @intCast(bits), .group = @intCast(group) };
 }
 
-/// Bytes of the files under `dir`, symlinks followed.
+/// Bytes of the files under `dir`, symlinks followed, hidden ones left out (a download's .cache, --slide's snapshot).
 pub fn sizeOf(a: Allocator, io: std.Io, dir: []const u8) !u64 {
     var total: u64 = 0;
     var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
@@ -134,6 +145,10 @@ pub fn sizeOf(a: Allocator, io: std.Io, dir: []const u8) !u64 {
     var walker = d.walk(a) catch return 0;
     defer walker.deinit();
     while (walker.next(io) catch null) |entry| {
+        if (entry.path[0] == '.') {
+            if (entry.kind == .directory) walker.leave(io);
+            continue;
+        }
         // Cache snapshots hold symlinks into blobs; statFile follows them to the real sizes.
         if (entry.kind != .file and entry.kind != .sym_link) continue;
         const st = entry.dir.statFile(io, entry.basename, .{}) catch continue;
@@ -171,20 +186,29 @@ test "cache layout helpers read a synthetic cache" {
     const hub = try std.fmt.allocPrint(a, ".tf-hub-test-{d}", .{std.Io.Clock.awake.now(io).toNanoseconds()});
     defer std.Io.Dir.cwd().deleteTree(io, hub) catch {};
     const w = std.Io.Dir.cwd();
-    try w.createDirPath(io, try std.fs.path.join(a, &.{ hub, "models--Org--Name/snapshots/abc123" }));
+    try w.createDirPath(io, try std.fs.path.join(a, &.{ hub, "models--Org--Name/snapshots/0123456789abcdef0123456789abcdef01234567" }));
     try w.createDirPath(io, try std.fs.path.join(a, &.{ hub, "models--Org--Name/refs" }));
-    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ hub, "models--Org--Name/snapshots/abc123/config.json" }), .data = "{\"model_type\": \"qwen4_exp\", \"quantization\": {\"bits\": 6, \"group_size\": 32}, \"max_position_embeddings\": 65536}" });
-    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ hub, "models--Org--Name/refs/main" }), .data = "abc123\n" });
+    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ hub, "models--Org--Name/snapshots/0123456789abcdef0123456789abcdef01234567/config.json" }), .data = "{\"model_type\": \"qwen4_exp\", \"quantization\": {\"bits\": 6, \"group_size\": 32}, \"max_position_embeddings\": 65536}" });
+    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ hub, "models--Org--Name/refs/main" }), .data = "0123456789abcdef0123456789abcdef01234567\n" });
     var weights: [4096]u8 = undefined;
     @memset(&weights, 'x');
-    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ hub, "models--Org--Name/snapshots/abc123/weights.safetensors" }), .data = &weights });
+    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ hub, "models--Org--Name/snapshots/0123456789abcdef0123456789abcdef01234567/weights.safetensors" }), .data = &weights });
     const snapshot = (try cachedSnapshot(a, io, hub, "Org/Name")).?;
-    try std.testing.expect(std.mem.endsWith(u8, snapshot, "abc123"));
+    try std.testing.expect(std.mem.endsWith(u8, snapshot, "0123456789abcdef0123456789abcdef01234567"));
     try std.testing.expectEqualStrings("qwen4_exp", modelType(a, io, snapshot));
     const q = quantization(a, io, snapshot).?;
     try std.testing.expectEqual(@as(u64, 6), q.bits);
     try std.testing.expectEqual(@as(u64, 32), q.group);
     try std.testing.expect((try sizeOf(a, io, snapshot)) >= 4096);
+    const plain = try sizeOf(a, io, snapshot);
+    try w.createDirPath(io, try std.fs.path.join(a, &.{ snapshot, ".tensorfold-original" }));
+    const kept = try std.fs.path.join(a, &.{ snapshot, ".tensorfold-original/weights.safetensors" });
+    try w.writeFile(io, .{ .sub_path = kept, .data = &weights });
+    try std.testing.expectEqual(plain, try sizeOf(a, io, snapshot)); // --slide's snapshot is not the model's size
+    try w.createDirPath(io, try std.fs.path.join(a, &.{ hub, "models--Org--Bad/refs" }));
+    try w.createDirPath(io, try std.fs.path.join(a, &.{ hub, "models--Org--Bad/snapshots" }));
+    try w.writeFile(io, .{ .sub_path = try std.fs.path.join(a, &.{ hub, "models--Org--Bad/refs/main" }), .data = "../../models--Org--Name/snapshots/0123456789abcdef0123456789abcdef01234567" });
+    try std.testing.expect(try cachedSnapshot(a, io, hub, "Org/Bad") == null); // a ref that is not a sha is never joined
     const missing = try cachedSnapshot(a, io, hub, "Org/Other");
     try std.testing.expect(missing == null);
 }

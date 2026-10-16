@@ -3,6 +3,8 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const pull = @import("pull.zig");
 const ranged = @import("pull_parts.zig");
+const single = @import("pull_file.zig");
+const exlr8_pull = @import("pull_exlr8.zig");
 
 /// A fake hub on 127.0.0.1: revision and tree APIs, ranged resolve endpoints, a body cut once, a repo ignoring ranges.
 const FakeHub = struct {
@@ -19,8 +21,8 @@ const FakeHub = struct {
     flaky_git_hex: [40]u8,
     port: u16,
 
-    const weights_path = "/Org/Flash/resolve/rev1sha/weights.safetensors";
-    const config_path = "/Org/Flash/resolve/rev1sha/config.json";
+    const weights_path = "/Org/Flash/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1/weights.safetensors";
+    const config_path = "/Org/Flash/resolve/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1/config.json";
     const flaky_body = "{\"chat_template\": \"{{ messages }}\"}";
     const drafter_config = "{\"model_type\": \"qwen3\", \"architectures\": [\"DFlash2DraftModel\"], \"dflash_config\": {\"block_size\": 8}}";
 
@@ -120,6 +122,10 @@ const FakeHub = struct {
         const line_end = std.mem.indexOf(u8, head, "\r\n") orelse return false;
         var parts = std.mem.tokenizeScalar(u8, head[0..line_end], ' ');
         const method = parts.next() orelse return false;
+        if (std.mem.eql(u8, method, "HEAD")) {
+            sendAll(fd, "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n"); // no redirect: the hub's link is the storage link
+            return true;
+        }
         if (!std.mem.eql(u8, method, "GET")) return false;
         const raw_path = parts.next() orelse return false;
         const path = if (std.mem.indexOfScalar(u8, raw_path, '?')) |q| raw_path[0..q] else raw_path;
@@ -139,27 +145,27 @@ const FakeHub = struct {
             }
         }
         if (std.mem.eql(u8, path, "/api/models/Org/Flash/revision/main")) {
-            respond(fd, "{\"sha\": \"rev1sha\"}");
+            respond(fd, "{\"sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1\"}");
         } else if (std.mem.eql(u8, path, "/api/models/Org/Whole/revision/main")) {
-            respond(fd, "{\"sha\": \"wholesha\"}");
+            respond(fd, "{\"sha\": \"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2\"}");
         } else if (std.mem.eql(u8, path, "/api/models/Org/Draft/revision/main")) {
-            respond(fd, "{\"sha\": \"draftsha\"}");
-        } else if (std.mem.eql(u8, path, "/api/models/Org/Draft/tree/draftsha")) {
+            respond(fd, "{\"sha\": \"ccccccccccccccccccccccccccccccccccccccc3\"}");
+        } else if (std.mem.eql(u8, path, "/api/models/Org/Draft/tree/ccccccccccccccccccccccccccccccccccccccc3")) {
             respond(fd, "[{\"type\": \"file\", \"path\": \"config.json\", \"size\": 27}]");
-        } else if (std.mem.eql(u8, path, "/Org/Draft/resolve/draftsha/config.json")) {
+        } else if (std.mem.eql(u8, path, "/Org/Draft/resolve/ccccccccccccccccccccccccccccccccccccccc3/config.json")) {
             respond(fd, "{\"model_type\": \"gemma4\"}");
         } else if (std.mem.eql(u8, path, "/api/models/Org/DFlash/revision/main")) {
-            respond(fd, "{\"sha\": \"dflashsha\"}");
-        } else if (std.mem.eql(u8, path, "/api/models/Org/DFlash/tree/dflashsha")) {
+            respond(fd, "{\"sha\": \"ddddddddddddddddddddddddddddddddddddddd4\"}");
+        } else if (std.mem.eql(u8, path, "/api/models/Org/DFlash/tree/ddddddddddddddddddddddddddddddddddddddd4")) {
             respond(fd, std.fmt.bufPrint(&tree_buf, "[{{\"type\": \"file\", \"path\": \"config.json\", \"size\": {d}}}]", .{drafter_config.len}) catch return false);
-        } else if (std.mem.eql(u8, path, "/Org/DFlash/resolve/dflashsha/config.json")) {
+        } else if (std.mem.eql(u8, path, "/Org/DFlash/resolve/ddddddddddddddddddddddddddddddddddddddd4/config.json")) {
             respond(fd, drafter_config);
-        } else if (std.mem.eql(u8, path, "/api/models/Org/Flash/tree/rev1sha") or std.mem.eql(u8, path, "/api/models/Org/Whole/tree/wholesha")) {
+        } else if (std.mem.eql(u8, path, "/api/models/Org/Flash/tree/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1") or std.mem.eql(u8, path, "/api/models/Org/Whole/tree/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2")) {
             // The hub's tree sends LFS oids as bare hex.
             const tree = std.fmt.allocPrint(std.testing.allocator, "[{{\"type\": \"file\", \"oid\": \"{s}\", \"path\": \"config.json\", \"size\": {d}}}, {{\"type\": \"file\", \"oid\": \"1111111111111111111111111111111111111111\", \"path\": \"weights.safetensors\", \"size\": {d}, \"lfs\": {{\"oid\": \"{s}\", \"size\": {d}}}}}, {{\"type\": \"file\", \"oid\": \"{s}\", \"path\": \"flaky.json\", \"size\": {d}}}]", .{ &fake.config_git_hex, fake.config.len, fake.weights.len, fake.weights_sha_hex, fake.weights.len, &fake.flaky_git_hex, flaky_body.len }) catch return false;
             defer std.testing.allocator.free(tree);
             respond(fd, tree);
-        } else if (std.mem.eql(u8, path, config_path) or std.mem.eql(u8, path, "/Org/Whole/resolve/wholesha/config.json")) {
+        } else if (std.mem.eql(u8, path, config_path) or std.mem.eql(u8, path, "/Org/Whole/resolve/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2/config.json")) {
             respond(fd, fake.config);
         } else if (std.mem.endsWith(u8, path, "/flaky.json")) {
             if (fake.flaky_requests.fetchAdd(1, .monotonic) > 0) {
@@ -170,7 +176,7 @@ const FakeHub = struct {
             sendAll(fd, std.fmt.bufPrint(&head_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n", .{flaky_body.len}) catch return false);
             sendAll(fd, flaky_body[0 .. flaky_body.len / 2]);
             return false;
-        } else if (std.mem.eql(u8, path, "/Org/Whole/resolve/wholesha/weights.safetensors")) {
+        } else if (std.mem.eql(u8, path, "/Org/Whole/resolve/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2/weights.safetensors")) {
             _ = fake.weight_requests.fetchAdd(1, .monotonic);
             whole(fd, fake.weights);
         } else if (std.mem.eql(u8, path, weights_path)) {
@@ -258,7 +264,7 @@ test "pull downloads, verifies, retries a cut body, resumes and refuses a family
     var out: std.Io.Writer.Allocating = .init(a);
     var err_out: std.Io.Writer.Allocating = .init(a);
     try std.testing.expectEqual(@as(u8, 0), try pull.run(a, io, &out.writer, &err_out.writer, &env, root, "Org/Flash"));
-    const snapshot = try std.fs.path.join(a, &.{ root, "models--Org--Flash/snapshots/rev1sha" });
+    const snapshot = try std.fs.path.join(a, &.{ root, "models--Org--Flash/snapshots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1" });
     const config_link = try std.fs.path.join(a, &.{ snapshot, "config.json" });
     const weights_link = try std.fs.path.join(a, &.{ snapshot, "weights.safetensors" });
     const config_read = try std.Io.Dir.cwd().readFileAlloc(io, config_link, a, .limited(1 << 20));
@@ -266,7 +272,7 @@ test "pull downloads, verifies, retries a cut body, resumes and refuses a family
     const weights_read = try std.Io.Dir.cwd().readFileAlloc(io, weights_link, a, .limited(1 << 20));
     try std.testing.expectEqualSlices(u8, FakeHub.weights_body, weights_read);
     const ref = try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ root, "models--Org--Flash/refs/main" }), a, .limited(64));
-    try std.testing.expectEqualStrings("rev1sha", std.mem.trim(u8, ref, " \r\n"));
+    try std.testing.expectEqualStrings("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1", std.mem.trim(u8, ref, " \r\n"));
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "weights.safetensors") != null);
     try std.testing.expectEqual(@as(u32, 1), fake_hub.weight_requests.load(.monotonic));
     // The blob is named by the hub's bare-hex oid, and the body cut short once came down on the retry.
@@ -307,7 +313,7 @@ test "pull downloads, verifies, retries a cut body, resumes and refuses a family
     var drafter_out: std.Io.Writer.Allocating = .init(a);
     try std.testing.expectEqual(@as(u8, 0), try pull.run(a, io, &drafter_out.writer, &err_out.writer, &env, root, "Org/DFlash"));
     try std.testing.expect(std.mem.indexOf(u8, drafter_out.written(), "DFlash2 drafter (qwen3)") != null);
-    try std.testing.expectEqualStrings(FakeHub.drafter_config, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ root, "models--Org--DFlash/snapshots/dflashsha/config.json" }), a, .limited(1 << 20)));
+    try std.testing.expectEqualStrings(FakeHub.drafter_config, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ root, "models--Org--DFlash/snapshots/ddddddddddddddddddddddddddddddddddddddd4/config.json" }), a, .limited(1 << 20)));
 
     // A bad repo id is usage.
     var bad_err: std.Io.Writer.Allocating = .init(a);
@@ -333,7 +339,7 @@ test "large files come down as shared pieces, and whole files when the hub ignor
     try std.testing.expectEqual(@as(u32, 4), fake_hub.weight_requests.load(.monotonic));
     try std.testing.expect(std.mem.indexOf(u8, out.written(), "weights.safetensors: 0.00 MiB in 4 pieces") != null);
     const flash = try std.fs.path.join(a, &.{ root, "models--Org--Flash" });
-    try std.testing.expectEqualSlices(u8, FakeHub.weights_body, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ flash, "snapshots/rev1sha/weights.safetensors" }), a, .limited(1 << 20)));
+    try std.testing.expectEqualSlices(u8, FakeHub.weights_body, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ flash, "snapshots/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1/weights.safetensors" }), a, .limited(1 << 20)));
     const blob = try std.fs.path.join(a, &.{ flash, "blobs", fake_hub.weights_sha_hex });
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(a, "{s}.ranges.part0", .{blob}), .{}));
 
@@ -341,7 +347,7 @@ test "large files come down as shared pieces, and whole files when the hub ignor
     var out2: std.Io.Writer.Allocating = .init(a);
     try std.testing.expectEqual(@as(u8, 0), try pull.runWith(a, io, &out2.writer, &err_out.writer, &env, root, "Org/Whole", small));
     const whole = try std.fs.path.join(a, &.{ root, "models--Org--Whole" });
-    try std.testing.expectEqualSlices(u8, FakeHub.weights_body, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ whole, "snapshots/wholesha/weights.safetensors" }), a, .limited(1 << 20)));
+    try std.testing.expectEqualSlices(u8, FakeHub.weights_body, try std.Io.Dir.cwd().readFileAlloc(io, try std.fs.path.join(a, &.{ whole, "snapshots/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb2/weights.safetensors" }), a, .limited(1 << 20)));
     const whole_blob = try std.fs.path.join(a, &.{ whole, "blobs", fake_hub.weights_sha_hex });
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, try std.fmt.allocPrint(a, "{s}.ranges", .{whole_blob}), .{}));
 }
@@ -386,4 +392,32 @@ fn hexBytes(text: []const u8) ![32]u8 {
     var out: [32]u8 = undefined;
     _ = try std.fmt.hexToBytes(&out, text);
     return out;
+}
+
+test "an EXLR8 node's whole files land in a relative directory, small files and LFS pieces alike" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const io = std.testing.io;
+    var fake_hub = FakeHub.open() catch return error.SkipZigTest;
+    fake_hub.start();
+    defer fake_hub.stopServer();
+    const dir = try std.fmt.allocPrint(a, ".tf-pull-exlr8-{d}", .{std.Io.Clock.awake.now(io).toNanoseconds()});
+    defer std.Io.Dir.cwd().deleteTree(io, dir) catch {};
+    var sha256: [32]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&sha256, fake_hub.weights_sha_hex);
+    var git_sha1: [20]u8 = undefined;
+    _ = try std.fmt.hexToBytes(&git_sha1, &fake_hub.config_git_hex);
+    const whole = [_]single.Entry{
+        .{ .path = "config.json", .size = FakeHub.config_body.len, .git_sha1 = git_sha1 },
+        .{ .path = "weights.safetensors", .size = FakeHub.weights_body.len, .sha256 = sha256 },
+    };
+    var client: std.http.Client = .{ .allocator = a, .io = io };
+    defer client.deinit();
+    var out: std.Io.Writer.Allocating = .init(a);
+    var err_out: std.Io.Writer.Allocating = .init(a);
+    try std.testing.expectEqual(@as(u32, 2), try exlr8_pull.fetchWhole(a, io, &client, &out.writer, &err_out.writer, try fake_hub.endpoint(a), "Org/Flash", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa1", dir, &whole));
+    const cwd = std.Io.Dir.cwd();
+    try std.testing.expectEqualStrings(FakeHub.config_body, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "config.json" }), a, .limited(1 << 20)));
+    try std.testing.expectEqualSlices(u8, FakeHub.weights_body, try cwd.readFileAlloc(io, try std.fs.path.join(a, &.{ dir, "weights.safetensors" }), a, .limited(1 << 20)));
 }

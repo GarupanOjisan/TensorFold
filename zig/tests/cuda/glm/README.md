@@ -82,7 +82,7 @@ runs the serial chain as before. Its rows depend on the alignment of the sub-chu
 states sit on a grid of 64 rows (`engine.prompt_grid`): the server rounds its chunk starts and the cut before the
 conversation's text down to it (`Info.prefill_grid`, `chunk_plan.Plan.grid`); the 2,048-row chunks of `tf-glm check` start on it anyway.
 Decode windows take the three-kernel chain (`prep`, `step`, `out`) from one row on (`TF_GLM_KDA_WIDE_ROWS`, default 1; 64 was
-v0.6.6's); `glm_kda.cu` already holds those kernels, v1.8 only appended the multi-stream segment variants after line 353, and
+v0.6.6's); `glm_port_kda.cu` already holds those kernels, v1.8 only appended the multi-stream segment variants after line 353, and
 `replay_layers` and the conv shift are unchanged for one stream.
 
 The reference sets `k1`, `k2`, `k3` are `m1`, `m2`, `m3` with `-e TF_GLM_KDA_CHUNKED=1 -e TF_GLM_KDA_WIDE_ROWS=1`.
@@ -156,7 +156,7 @@ Acceptance: `tf-glm check` against the production-setting captures `v18a` (6 pro
   (`[pending, mask x 7]` through the five layers: two-tap dynamic convolutions `_dconv_kernel`, `_prep_kernel`, sliding-window `_dattn_kernel`, the
   o and down projections' fp32 partials all-gathered and added in rank order, then the draft head's top 16 a rank gathered and the selector's
   projection); `chain` (the selector's edge scores and the target's keyed noise, the noisy-confidence stop rule, float64 on the host). Both
-  context updates (1..16 rows) and the block pass replay CUDA graphs. The glue torch did is five small kernels in `glm_glue.cu`
+  context updates (1..16 rows) and the block pass replay CUDA graphs. The glue torch did is five small kernels in `glm_port_glue.cu`
   (`tf_glm_df_*`); `tf_glm_topk` takes its ties by a ballot instead of one thread's walk along the row (the same pairs).
 - Who proposes: a copy first (glm_copy.zig; a round with a copy ahead runs no block, the taps still join), else DFlash2's chain of up to 7 drafts (windows of up to 8
   rows; copies up to 16). The lane core sees DFlash2 as its head: `draftFn` gives the chain as host tokens through the backend's `tree` hook,

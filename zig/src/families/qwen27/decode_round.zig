@@ -15,6 +15,15 @@ const GdnHook = @import("gdn_hook.zig").Hook;
 const GdnPlan = @import("gdn_plan.zig").Plan;
 const Round = @import("round_plan.zig").Round;
 const Taps = @import("taps.zig").Taps;
+const image_rows = @import("image_rows.zig");
+const mrope = @import("core").qwen_vl.rope;
+
+/// Whether `cb` failed on the GPU; its Metal error (out of memory, a timeout) is logged with `what` it ran.
+pub fn gpuFailed(cb: mtl.CommandBuffer, what: []const u8) bool {
+    const msg = cb.failure() orelse return false;
+    std.log.err("qwen27: {s} failed on the GPU: {s}", .{ what, msg });
+    return true;
+}
 
 pub const Runner = struct {
     allocator: std.mem.Allocator,
@@ -30,6 +39,7 @@ pub const Runner = struct {
     owned: std.ArrayList(mtl.Buffer),
     taps: Taps,
     slots: u32,
+    ready: u32, // slots [0, ready) have their K/V rows; a later slot takes its own when first used (ensure)
     capacity: u32,
     active: ?[32]u8 = null,
     failed: bool = false,
@@ -39,9 +49,19 @@ pub const Runner = struct {
     current_round: ?*const Round = null,
     current_gdn: ?*const GdnPlan = null,
     current_attention: ?*const attn.Plan = null,
+    current_placed: image_rows.Placed = .{},
+    /// Each slot's rows' M-RoPE layout from its stream's images (empty: text, plain rope at the cache row).
+    rope: [8]mrope.Layout = @splat(.{}),
+    /// A prompt pass's image rows, while it runs.
+    images: ?image_rows.Images = null,
 
     pub fn init(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32) !Runner {
-        if (slots == 0 or slots > 8 or capacity == 0 or m.frame.capacity % 16 != 0) return error.BadRoundCapacity;
+        return initReady(a, m, slots, capacity, slots);
+    }
+
+    /// A runner of `slots` whose first `ready` take their K/V rows now, the rest when first used (ensure).
+    pub fn initReady(a: std.mem.Allocator, m: *Model, slots: u32, capacity: u32, ready: u32) !Runner {
+        if (slots == 0 or slots > 8 or capacity == 0 or m.frame.capacity % 16 != 0 or ready == 0 or ready > slots) return error.BadRoundCapacity;
         const linear_index = try a.alloc(u32, m.config.layers);
         errdefer a.free(linear_index);
         const attention_index = try a.alloc(u32, m.config.layers);
@@ -90,17 +110,42 @@ pub const Runner = struct {
             for (owned.items) |b| b.deinit();
             owned.deinit(a);
         }
-        const bytes = @as(usize, capacity) * m.config.kvDim() * 2;
-        for (caches) |*cache| {
-            const key = try allocation(a, m.device, &owned, bytes);
-            const value = try allocation(a, m.device, &owned, bytes);
-            cache.* = .{ .keys = .{ .buffer = key }, .values = .{ .buffer = value }, .capacity = capacity };
-        }
+        for (0..na) |layer| for (0..ready) |slot| {
+            caches[layer * slots + slot] = try slotCache(a, m, &owned, capacity);
+        };
         const offsets = try a.alloc(u32, slots);
         errdefer a.free(offsets);
         @memset(offsets, 0);
         const taps = try Taps.init(m.device, m.frame.capacity, @intCast(m.config.hidden));
-        return .{ .allocator = a, .model = m, .gdn = pool, .attention = attention, .scratch = scratch, .bindings = bindings, .caches = caches, .linear_index = linear_index, .attention_index = attention_index, .offsets = offsets, .owned = owned, .taps = taps, .slots = slots, .capacity = capacity };
+        return .{ .allocator = a, .model = m, .gdn = pool, .attention = attention, .scratch = scratch, .bindings = bindings, .caches = caches, .linear_index = linear_index, .attention_index = attention_index, .offsets = offsets, .owned = owned, .taps = taps, .slots = slots, .ready = ready, .capacity = capacity };
+    }
+
+    /// One slot's K/V rows across the attention layers.
+    pub fn slotBytes(r: *const Runner) usize {
+        return r.caches.len / r.slots * 2 * @as(usize, r.capacity) * r.model.config.kvDim() * 2;
+    }
+
+    /// Slot `slot`'s K/V rows (the next unready slot, as free slots are taken lowest first); its new buffers.
+    pub fn ensure(r: *Runner, slot: u32) ![]const mtl.Buffer {
+        if (slot < r.ready) return &.{};
+        if (slot != r.ready) return error.SlotOutOfOrder;
+        const first = r.owned.items.len;
+        errdefer {
+            for (r.owned.items[first..]) |b| b.deinit();
+            r.owned.shrinkRetainingCapacity(first);
+        }
+        const layers = r.caches.len / r.slots;
+        for (0..layers) |layer| r.caches[layer * r.slots + slot] = try slotCache(r.allocator, r.model, &r.owned, r.capacity);
+        r.ready += 1;
+        return r.owned.items[first..];
+    }
+
+    /// The K/V buffers of the ready slots (for a residency set).
+    pub fn readyBuffers(r: *const Runner, a: std.mem.Allocator, out: *std.ArrayList(mtl.Buffer)) !void {
+        for (0..r.caches.len / r.slots) |layer| for (0..r.ready) |slot| {
+            const c = r.caches[layer * r.slots + slot];
+            try out.appendSlice(a, &.{ c.keys.buffer, c.values.buffer });
+        };
     }
 
     pub fn deinit(r: *Runner) void {
@@ -141,7 +186,7 @@ pub const Runner = struct {
 
     fn verifyImpl(r: *Runner, round: *const Round, head: forward.Head, accepted: bool) !void {
         if (r.failed or r.active != null or round.ids.len > r.model.frame.capacity) return error.RoundNotReady;
-        for (round.slots, round.windows) |slot, window| if (slot >= r.slots or r.offsets[slot] != window.start) return error.CachePositionDiffers;
+        for (round.slots, round.windows) |slot, window| if (slot >= r.ready or r.offsets[slot] != window.start) return error.CachePositionDiffers;
         const paths = try r.allocator.alloc([]const u32, round.windows.len);
         defer r.allocator.free(paths);
         @memset(paths, &.{});
@@ -160,19 +205,22 @@ pub const Runner = struct {
         var attention_plan = try r.attentionPlan(round);
         defer attention_plan.deinit();
         try r.model.frame.setRows(round.ids, round.feed_positions);
+        const placed = image_rows.place(&r.model.frame, &r.rope, r.images, r.model.config.mrope_section, round);
         try r.scratch.upload(attention_plan);
         r.current_round = round;
         r.current_gdn = &recurrent;
         r.current_attention = &attention_plan;
+        r.current_placed = placed;
         defer {
             r.current_round = null;
             r.current_gdn = null;
             r.current_attention = null;
+            r.current_placed = .{};
         }
         if (r.capture_taps) r.taps.begin();
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
-        var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head };
+        var stages = forward.Stages{ .model = r.model, .rows = @intCast(round.ids.len), .hooks = .{ .ptr = r, .gdn = gdnForward, .attention = attentionForward, .tap = if (r.capture_taps) tap else null }, .head = head, .images = placed.images };
         r.last_gpu_seconds = @import("core").segments.runCommitting(r.model.device, &.{r.model.queue}, r.model.config.layers, .concurrent, &stages, commit_every) catch |err| {
             r.failed = true;
             return err;
@@ -216,7 +264,7 @@ pub const Runner = struct {
         e.end();
         cb.commit();
         cb.wait();
-        if (cb.failure() != null) {
+        if (gpuFailed(cb, "a round's keep")) {
             r.failed = true;
             return error.RoundGpuFailure;
         }
@@ -267,8 +315,14 @@ pub const Runner = struct {
         r.active = null;
     }
 
+    /// After a GPU failure, once no stream holds a slot: rounds run again, each slot reset by its next prompt.
+    pub fn recover(r: *Runner) void {
+        r.failed = false;
+        r.active = null;
+    }
+
     pub fn reset(r: *Runner, slot: u32) !void {
-        if (r.failed or r.active != null or slot >= r.slots) return error.RoundNotReady;
+        if (r.failed or r.active != null or slot >= r.ready) return error.RoundNotReady;
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
         const cb = r.model.queue.commandBuffer();
@@ -277,7 +331,7 @@ pub const Runner = struct {
         e.end();
         cb.commit();
         cb.wait();
-        if (cb.failure() != null) {
+        if (gpuFailed(cb, "a slot reset")) {
             r.failed = true;
             return error.RoundGpuFailure;
         }
@@ -324,7 +378,7 @@ pub const Runner = struct {
         try r.model.glue.unstack(e, f.get(.mixed), f.get(.key), .{ .rows = rows, .width = 1024, .stride = 2048, .offset = 0 });
         try r.model.glue.unstack(e, f.get(.mixed), f.get(.value), .{ .rows = rows, .width = 1024, .stride = 2048, .offset = 1024 });
         e.barrier();
-        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = f.get(.key), .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = f.get(.query), .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta });
+        try r.attention.preprocess(e, .{ .qg = f.get(.q_gate), .key = f.get(.key), .q_gain = wts.ref(weights.q_norm), .k_gain = wts.ref(weights.k_norm), .norm_q = f.get(.norm_query), .norm_k = f.get(.norm_key), .query = f.get(.query), .rotated_key = f.get(.rotated_key), .positions = f.get(.positions), .rows = rows, .eps = r.model.config.eps, .theta = r.model.config.rope_theta, .h_end = r.current_placed.h_end, .w_end = r.current_placed.w_end, .plane = f.capacity });
         try r.attention.encode(e, &r.scratch, &r.bindings[layer], plan, f.get(.query), f.get(.rotated_key), f.get(.value), f.get(.mixer_out), caches, f.get(.q_gate), r.model.kernels.prompt);
     }
 
@@ -333,6 +387,13 @@ pub const Runner = struct {
         try r.taps.record(r.model.glue, e, layer, hidden, rows);
     }
 };
+
+fn slotCache(a: std.mem.Allocator, m: *Model, owned: *std.ArrayList(mtl.Buffer), capacity: u32) !attn.Cache {
+    const bytes = @as(usize, capacity) * m.config.kvDim() * 2;
+    const key = try allocation(a, m.device, owned, bytes);
+    const value = try allocation(a, m.device, owned, bytes);
+    return .{ .keys = .{ .buffer = key }, .values = .{ .buffer = value }, .capacity = capacity };
+}
 
 fn allocation(a: std.mem.Allocator, device: mtl.Device, owned: *std.ArrayList(mtl.Buffer), bytes: usize) !mtl.Buffer {
     const b = try device.buffer(bytes, mtl.ResourceOptions.shared | mtl.ResourceOptions.untracked);

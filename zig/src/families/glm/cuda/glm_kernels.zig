@@ -1,4 +1,4 @@
-//! GLM's raw CUDA kernels (the glm_kda, glm_exl3 and glm_glue fatbins) launched with the Python host code's geometry
+//! GLM's raw CUDA kernels (the glm_port_kda, glm_exl3 and glm_port_glue fatbins) launched with the Python host code's geometry
 //! (glm_symbols.zig has the spec, with file:line references into v0.6.6).
 const std = @import("std");
 const cuda = @import("cuda");
@@ -63,9 +63,9 @@ pub const Kernels = struct {
     hc_partial: cuda.Function,
     roce_gather: cuda.Function, // TF_GLM_COMM=roce (glm_roce.zig)
     l2pf: cuda.Function,
-    nuc_stats: cuda.Function, // the top_p nucleus draw's device side (glm_glue.cu)
+    nuc_stats: cuda.Function, // the top_p nucleus draw's device side (glm_port_glue.cu)
     nuc_pack: cuda.Function,
-    df_scatter: cuda.Function, // DFlash2's glue (glm_glue.cu)
+    df_scatter: cuda.Function, // DFlash2's glue (glm_port_glue.cu)
     df_scatter_seg: cuda.Function,
     df_scatter_rows: cuda.Function,
     df_rope_rows: cuda.Function,
@@ -78,11 +78,11 @@ pub const Kernels = struct {
     pub fn load(d: *const cuda.Driver) !Kernels {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         var k: Kernels = undefined;
-        k.mods[0] = try cuda.Module.load(d, cuda.kernels.glm_kda);
+        k.mods[0] = try cuda.Module.load(d, cuda.kernels.glm_port_kda);
         errdefer k.mods[0].unload();
         k.mods[1] = try cuda.Module.load(d, cuda.kernels.glm_exl3);
         errdefer k.mods[1].unload();
-        k.mods[2] = try cuda.Module.load(d, cuda.kernels.glm_glue);
+        k.mods[2] = try cuda.Module.load(d, cuda.kernels.glm_port_glue);
         errdefer k.mods[2].unload();
         // the 4-bit draft head: Nemotron's copies of qmm_group.cu and qmm_prefill.cu, and its MLX -> tiled packing (nemotron_ops)
         k.mods[3] = try cuda.Module.load(d, cuda.kernels.qmm_group);

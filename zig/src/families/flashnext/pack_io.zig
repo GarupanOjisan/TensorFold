@@ -28,15 +28,22 @@ pub const Out = struct {
         out.* = undefined;
     }
 
+    /// Takes `bytes` (from `gpa`) even when it fails: then they are freed and every list keeps its length.
     pub fn put(out: *Out, name: []const u8, dtype: []const u8, shape: []const usize, bytes: anytype) !void {
+        errdefer out.gpa.free(bytes);
         const a = out.arena.allocator();
-        try out.names.append(out.gpa, try a.dupe(u8, name));
-        try out.dtypes.append(out.gpa, dtype);
-        const shape_copy = try a.alloc(usize, shape.len);
-        @memcpy(shape_copy, shape);
-        try out.shapes.append(out.gpa, shape_copy);
-        try out.blobs.append(out.gpa, std.mem.sliceAsBytes(bytes));
-        try out.blob_aligns.append(out.gpa, comptime std.mem.Alignment.fromByteUnits(@alignOf(std.meta.Child(@TypeOf(bytes)))));
+        const name_copy = try a.dupe(u8, name);
+        const shape_copy = try a.dupe(usize, shape);
+        try out.names.ensureUnusedCapacity(out.gpa, 1);
+        try out.dtypes.ensureUnusedCapacity(out.gpa, 1);
+        try out.shapes.ensureUnusedCapacity(out.gpa, 1);
+        try out.blobs.ensureUnusedCapacity(out.gpa, 1);
+        try out.blob_aligns.ensureUnusedCapacity(out.gpa, 1);
+        out.names.appendAssumeCapacity(name_copy);
+        out.dtypes.appendAssumeCapacity(dtype);
+        out.shapes.appendAssumeCapacity(shape_copy);
+        out.blobs.appendAssumeCapacity(std.mem.sliceAsBytes(bytes));
+        out.blob_aligns.appendAssumeCapacity(comptime std.mem.Alignment.fromByteUnits(@alignOf(std.meta.Child(@TypeOf(bytes)))));
     }
 
     /// Writes the file with `source` recorded under __metadata__ so a reader can refuse a pack from another checkpoint.
@@ -102,8 +109,11 @@ pub fn hashBytes(bytes: []const u8) [32]u8 {
     return h;
 }
 
-/// The identity's canonical text: the index file's hash, then each shard's name, size and header hash by name.
-pub fn identityString(gpa: std.mem.Allocator, index_sha256: ?[32]u8, shards: []const ShardId) ![]u8 {
+/// The pack layout's version, first in the identity: 3 has width tables, ragged runs untiled, the config's hash.
+pub const pack_format = 3;
+
+/// The identity's text: pack format, index and config hashes (the config names the widths), each shard's id.
+pub fn identityString(gpa: std.mem.Allocator, index_sha256: ?[32]u8, config_sha256: ?[32]u8, shards: []const ShardId) ![]u8 {
     const sorted = try gpa.dupe(ShardId, shards);
     defer gpa.free(sorted);
     std.mem.sort(ShardId, sorted, {}, struct {
@@ -113,7 +123,9 @@ pub fn identityString(gpa: std.mem.Allocator, index_sha256: ?[32]u8, shards: []c
     }.lt);
     var w: std.Io.Writer.Allocating = .init(gpa);
     errdefer w.deinit();
+    try w.writer.print("flashnext pack {d}\n", .{pack_format});
     if (index_sha256) |h| try w.writer.print("index {s}\n", .{&std.fmt.bytesToHex(h, .lower)}) else try w.writer.writeAll("index absent\n");
+    if (config_sha256) |h| try w.writer.print("config {s}\n", .{&std.fmt.bytesToHex(h, .lower)}) else try w.writer.writeAll("config absent\n");
     for (sorted) |s| try w.writer.print("shard {s} {d} {s}\n", .{ s.name, s.size, &std.fmt.bytesToHex(s.header_sha256, .lower) });
     return w.toOwnedSlice();
 }
@@ -134,8 +146,8 @@ fn headerLen(memory: []const u8) !usize {
     return hl;
 }
 
-/// Canonical identity text comes from the index bytes and each shard's mapped bytes, shared by builder and engine.
-pub fn identityFromMapped(gpa: std.mem.Allocator, index_bytes: ?[]const u8, shards: []const MappedShard) ![]u8 {
+/// The identity from the index and config bytes and each shard's mapped bytes, shared by builder and engine.
+pub fn identityFromMapped(gpa: std.mem.Allocator, index_bytes: ?[]const u8, config_bytes: ?[]const u8, shards: []const MappedShard) ![]u8 {
     var ids: std.ArrayList(ShardId) = .empty;
     defer ids.deinit(gpa);
     for (shards) |s| {
@@ -145,11 +157,18 @@ pub fn identityFromMapped(gpa: std.mem.Allocator, index_bytes: ?[]const u8, shar
         const hl = try headerLen(s.bytes[0..size]);
         try ids.append(gpa, .{ .name = s.name, .size = s.size, .header_sha256 = hashBytes(s.bytes[8..][0..hl]) });
     }
-    return identityString(gpa, if (index_bytes) |b| hashBytes(b) else null, ids.items);
+    return identityString(gpa, if (index_bytes) |b| hashBytes(b) else null, if (config_bytes) |b| hashBytes(b) else null, ids.items);
 }
 
-/// A checkpoint identity is the index hash plus each shard size and header hash, and mappings then unmap.
+/// A checkpoint identity is the index and config hashes plus each shard size and header hash; mappings then unmap.
 pub fn sourceIdentity(gpa: std.mem.Allocator, io: Io, model_dir: []const u8) ![]u8 {
+    const config_path = try std.fs.path.join(gpa, &.{ model_dir, "config.json" });
+    defer gpa.free(config_path);
+    const config = Io.Dir.cwd().readFileAlloc(io, config_path, gpa, .limited(1 << 24)) catch |e| switch (e) {
+        error.FileNotFound => null,
+        else => return e,
+    };
+    defer if (config) |c| gpa.free(c);
     const Open = struct { file: Io.File, map: Io.File.MemoryMap };
     var shards: std.ArrayList(MappedShard) = .empty;
     defer shards.deinit(gpa);
@@ -162,14 +181,14 @@ pub fn sourceIdentity(gpa: std.mem.Allocator, io: Io, model_dir: []const u8) ![]
     const index_path = try std.fs.path.join(gpa, &.{ model_dir, "model.safetensors.index.json" });
     defer gpa.free(index_path);
     var mapped = mapFile(io, index_path) catch |e| switch (e) {
-        error.FileNotFound => return identityFromMapped(gpa, null, shards.items),
+        error.FileNotFound => return identityFromMapped(gpa, null, config, shards.items),
         else => return e,
     };
     defer mapped.map.destroy(io);
     defer mapped.file.close(io);
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, mapped.map.memory, .{});
     defer parsed.deinit();
-    const weight_map = parsed.value.object.get("weight_map") orelse return identityFromMapped(gpa, null, shards.items);
+    const weight_map = parsed.value.object.get("weight_map") orelse return identityFromMapped(gpa, null, config, shards.items);
     var names: std.ArrayList([]const u8) = .empty;
     defer {
         for (names.items) |n| gpa.free(n);
@@ -191,7 +210,7 @@ pub fn sourceIdentity(gpa: std.mem.Allocator, io: Io, model_dir: []const u8) ![]
         try maps.append(gpa, .{ .file = shard.file, .map = shard.map });
         try shards.append(gpa, .{ .name = name, .size = shard.len, .bytes = shard.map.memory });
     }
-    const out = try identityFromMapped(gpa, mapped.map.memory, shards.items);
+    const out = try identityFromMapped(gpa, mapped.map.memory, config, shards.items);
     for (maps.items) |*m| {
         m.map.destroy(io);
         m.file.close(io);
@@ -203,7 +222,9 @@ pub fn sourceIdentity(gpa: std.mem.Allocator, io: Io, model_dir: []const u8) ![]
 fn recordedSource(gpa: std.mem.Allocator, header_json: []const u8) ![]u8 {
     var parsed = try std.json.parseFromSlice(std.json.Value, gpa, header_json, .{});
     defer parsed.deinit();
+    if (parsed.value != .object) return error.BadSafetensors;
     const meta = parsed.value.object.get("__metadata__") orelse return error.PackHasNoSource;
+    if (meta != .object) return error.BadSafetensors;
     const source = meta.object.get("tf_source") orelse return error.PackHasNoSource;
     if (source != .string) return error.PackHasNoSource;
     return gpa.dupe(u8, source.string);
@@ -303,33 +324,44 @@ test {
     _ = @import("pack_source_test.zig");
 }
 
-/// A no-dump pack cache is complete when both packs are non-empty and their headers match the checkpoint.
+/// Normal caches require explicit matching source metadata and valid, non-empty tensor ranges.
+pub fn packReady(gpa: std.mem.Allocator, io: Io, path: []const u8, identity: []const u8) !bool {
+    const file = Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    defer file.close(io);
+    const len = try file.length(io);
+    if (len < 8) return false;
+    var buf: [4096]u8 = undefined;
+    var reader = file.reader(io, &buf);
+    var prefix: [8]u8 = undefined;
+    reader.interface.readSliceAll(&prefix) catch return false;
+    const hl = std.mem.readInt(u64, &prefix, .little);
+    if (hl == 0 or hl > len - 8 or hl > 64 << 20) return false;
+    const header = try gpa.alloc(u8, @intCast(hl));
+    defer gpa.free(header);
+    reader.interface.readSliceAll(header) catch return false;
+    const recorded = recordedSource(gpa, header) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer gpa.free(recorded);
+    if (!std.mem.eql(u8, recorded, identity)) return false;
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const tensors = st.parseHeader(arena.allocator(), header, @intCast(len - 8 - hl)) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    var end: usize = 0;
+    for (tensors.values()) |tensor| end = @max(end, tensor.end);
+    return tensors.count() > 0 and end > 0 and end == len - 8 - hl;
+}
+
+/// The decode and prompt packs have complete headers belonging to this checkpoint.
 pub fn packsReady(gpa: std.mem.Allocator, io: Io, cache_dir: []const u8, identity: []const u8) !bool {
-    const pack_path = try std.fmt.allocPrintSentinel(gpa, "{s}/pack.safetensors", .{cache_dir}, 0);
-    defer gpa.free(pack_path);
-    {
-        const mapped = Io.Dir.cwd().openFile(io, pack_path, .{}) catch return false;
-        defer mapped.close(io);
-        const stat = try mapped.stat(io);
-        if (stat.size < 8) return false;
-        const head = try gpa.alloc(u8, @intCast(stat.size));
-        defer gpa.free(head);
-        var buf: [4096]u8 = undefined;
-        var reader = mapped.reader(io, &buf);
-        try reader.interface.readSliceAll(head);
-        checkSourceMapped(gpa, head, identity, pack_path) catch return false;
+    for ([_][]const u8{ "pack.safetensors", "pack_mlx.safetensors" }) |name| {
+        const path = try std.fs.path.join(gpa, &.{ cache_dir, name });
+        defer gpa.free(path);
+        if (!try packReady(gpa, io, path, identity)) return false;
     }
-    const mlx_path = try std.fmt.allocPrintSentinel(gpa, "{s}/pack_mlx.safetensors", .{cache_dir}, 0);
-    defer gpa.free(mlx_path);
-    const mlx = Io.Dir.cwd().openFile(io, mlx_path, .{}) catch return false;
-    defer mlx.close(io);
-    const mlx_stat = try mlx.stat(io);
-    if (mlx_stat.size < 8) return false;
-    const mlx_head = try gpa.alloc(u8, @intCast(mlx_stat.size));
-    defer gpa.free(mlx_head);
-    var mlx_buf: [4096]u8 = undefined;
-    var mlx_reader = mlx.reader(io, &mlx_buf);
-    try mlx_reader.interface.readSliceAll(mlx_head);
-    checkSourceMapped(gpa, mlx_head, identity, mlx_path) catch return false;
     return true;
 }
