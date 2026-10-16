@@ -1,12 +1,4 @@
-//! DFlash2 drafts for GLM-5.3-Flash on two CUDA ranks (v1.8 glm5_next/cuda/dflash2.py, the single-stream `Drafter`): a five
-//! layer block model with two-tap dynamic convolutions and sliding-window attention reads the means of the target's streams
-//! at five layers (the "taps" of every committed row) and, for [pending token, mask x (block - 1)], proposes candidates for
-//! the next block - 1 positions: each rank's top 16 of its half of the vocabulary, merged, with a selector's rows. A chain is
-//! then picked on the host (the selector's edge scores and the target's keyed noise) and cut by a confidence rule. Drafts only
-//! propose; the verify window keeps the serial sample, so the arithmetic need not equal Python's bit for bit.
-//!
-//! Both ranks run `addTaps` and `candidates` with the same all-gathers; rank 0 alone reads the candidates back and picks the
-//! chain, whose tokens ride the next verify command to rank 1.
+//! DFlash2 drafts for GLM-5.3-Flash on two CUDA ranks (v1.8 dflash2.py's Drafter); notes/glm_dflash.md#overview
 const std = @import("std");
 const cuda = @import("cuda");
 const wt = @import("glm_weights.zig");
@@ -94,8 +86,7 @@ pub const Drafter = struct {
     snap_bytes: usize,
     prof: ?*Prof = null, // TF_GLM_DF_PROF: eager block passes timed by piece
 
-    /// The drafter's buffers and caches on this rank (dflash2.Drafter.__init__): the context of `capacity` positions in a
-    /// ring of the window and block when that is shorter (TF_GLM_DRAFT_RING=0 keeps a flat one).
+    /// dflash2.Drafter.__init__: this rank's buffers and caches (a ring when shorter); notes/glm_dflash.md#drafter-init
     pub fn init(gpa: std.mem.Allocator, d: *const cuda.Driver, w: *const wt.Weights, capacity: usize) !Drafter {
         if (w.draft == null) return error.NoDraftModel;
         const dr = &w.draft.?;
@@ -238,8 +229,7 @@ pub const Drafter = struct {
         self.context_end = at;
     }
 
-    /// Moves the caches to `cache` (cacheBytes), their contents with them. The position stays where it is (16-aligned:
-    /// the one-lane _dattn_kernel was captured with POS divisible by 16); the batch copies it into its `meta` each pass.
+    /// Moves the caches and their contents to `cache`; the position stays put; notes/glm_dflash.md#adopt
     pub fn adopt(self: *Drafter, e: *Engine, cache: u64) !void {
         try e.copyDev(cache, self.cache, self.cacheBytes());
         const half = self.cacheBytes() / (2 * self.dr.layers.len);
@@ -263,9 +253,7 @@ pub const Drafter = struct {
         p.last = t;
     }
 
-    /// Eager block passes timed by piece, printed (both ranks run it alike): embed and rope, each layer's input stretch (norm, conv
-    /// projections, qkv), prep/scatter/attention, the o projection with its all-gather, the MLP up to swiglu, the down
-    /// projection with its all-gather, and the head with the candidates' gather and the selector's projection.
+    /// Eager block passes timed by piece and printed (both ranks run it alike); notes/glm_dflash.md#profile
     pub fn profile(self: *Drafter, e: *Engine, io: std.Io) !void {
         var p: Prof = .{ .io = io };
         self.prof = &p;
@@ -385,7 +373,7 @@ pub const Drafter = struct {
         return @call(.auto, body, args);
     }
 
-    /// dflash2.Drafter.add_taps for the first `n` rows of `b`'s taps (the committed rows' stream means at the five layers).
+    /// dflash2.Drafter.add_taps for the first `n` rows of `b`'s taps (the committed rows' stream means at five layers).
     pub fn addTaps(self: *Drafter, e: *Engine, b: *const fwd.Buffers, n: usize) !void {
         const D = self.dr.d;
         var start: usize = 0;
@@ -433,8 +421,7 @@ pub const Drafter = struct {
         try cuda.launch.launch(e.k.df_proj, .{ .grid = .{ .x = @intCast((dr.sel_rank + 7) / 8), .y = @intCast(n - 1) }, .block = .{ .x = 256 } }, e.s, &p);
     }
 
-    /// dflash2.Drafter.candidates: the block pass for `pending` at the context's end. `read`: also bring the merged candidates
-    /// to the host (rank 0 alone); the lists are then valid until the next call.
+    /// dflash2.Drafter.candidates: the block pass for `pending`, `read`: also to the host; notes/glm_dflash.md#block
     pub fn block(self: *Drafter, e: *Engine, pending: u32, read: bool) !void {
         const id: i32 = @intCast(pending);
         try e.upload(self.ids, std.mem.asBytes(&id));
@@ -442,8 +429,7 @@ pub const Drafter = struct {
         if (!read) return;
         const dr = self.dr;
         const nb = dr.block - 1;
-        // v1.10 patch 0092: an id outside the vocabulary is a float's bits read before the copy had landed; the rows are copied
-        // again once the device is idle, and a second failure is an error
+        // v1.10 patch 0092: a bad id is a copy read early; copy again once idle; notes/glm_dflash.md#patch-0092
         for (0..2) |attempt| {
             try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(self.cand_host.ptr, self.cand_all, wt.world * nb * 2 * dr.top_k * 4, e.s.handle), "cuMemcpyDtoHAsync");
             try e.d.check(e.d.api.cuMemcpyDtoHAsync_v2(self.proj_host.ptr, self.proj, nb * dr.sel_rank * f4, e.s.handle), "cuMemcpyDtoHAsync");
@@ -455,7 +441,7 @@ pub const Drafter = struct {
         }
     }
 
-    /// merge_candidates: each row's rank lists (values, then ids as fp32 bits... here pairs) merged by value then id, the top k.
+    /// merge_candidates: each row's rank lists (value and id pairs) merged by value then id, the top k.
     pub fn merge(self: *Drafter, nb: usize) bool {
         const dr = self.dr;
         const k = dr.top_k;

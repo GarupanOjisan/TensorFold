@@ -29,8 +29,7 @@ fn uniform(seed: u64, position: u64, id: u64) f64 {
 extern "c" fn exp(x: f64) f64;
 extern "c" fn log(x: f64) f64;
 
-/// engine.encode_policy's DFlash2 stop rule `fncN:P[:B]` (the product of the noise-aware confidences holds P) or `fcN:P`
-/// (the product of the plain ones); TF_GLM_DFLASH_POLICY, v1.8's production setting `fnc7:0.3`.
+/// TF_GLM_DFLASH_POLICY, the DFlash2 stop rule `fncN:P[:B]` or `fcN:P`; notes/glm_dflash.md#policy
 pub const Policy = struct {
     most: usize = 7,
     confidence: f64 = 0.3,
@@ -72,8 +71,7 @@ fn noisyConfidence(score: []const f64, noise: ?[]const f64, j: usize, beta: f64)
     return ej / sum;
 }
 
-/// dflash2.Drafter.chain: pick candidates with the selector's edges and the target's keyed noise; stop below the
-/// cumulative confidence, always keeping the first draft. `first` is the position of the first draft. Up to `depth` tokens.
+/// dflash2.Drafter.chain: up to `depth` drafts picked by edges and keyed noise; notes/glm_dflash.md#chain
 pub fn chain(self: *const Drafter, depth: usize, anchor: u32, first: u64, sampling: ?Sampling, policy: Policy, out: []u32) usize {
     const dr = self.dr;
     const k = dr.top_k;

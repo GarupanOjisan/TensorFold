@@ -13,12 +13,7 @@ const f4 = df.f4;
 const max_block = df.max_block;
 const int = df.int;
 
-/// Block passes of several lanes' drafters in one launch sequence (v1.10 dflash2_multi.MultiDrafter.candidates): the rows of
-/// every lane's block [pending, mask x (block - 1)] back to back. The row-independent work (embedding, norms, the 4-bit
-/// projections in pieces of 16 rows, the o and down projections' gathers, the head, its top-k and the selector's rows) runs on
-/// all of them; each lane's rotary, `_prep`, cache writes and attention read its own drafter's ring and position, and the
-/// dynamic convolutions run a block at a time (a block's first row mixes no row before it). Each drafter is then left with its
-/// merged candidates as its own `block(read)` leaves them, so its `chain` is unchanged. Eager; drafts only propose.
+/// Block passes of several lanes' drafters in one launch sequence (v1.10 MultiDrafter); notes/glm_dflash.md#batch
 pub const Batch = struct {
     gpa: std.mem.Allocator,
     dr: *const wt.Draft,
@@ -69,10 +64,7 @@ pub const Batch = struct {
     /// The most stacked rows a context update of several lanes takes (a shared window's rows).
     const tmax = fwd.Engine.shared_rows;
 
-    /// dflash2_multi.MultiDrafter's context update over several lanes (`_launch_taps`): lane s's first kept[s] rows of the
-    /// last shared window (its rows from row0s[s], `buf`'s taps) join drafter ds[s]'s context, every row stacked in one pass
-    /// (one graph a row count): fc and its norm, each row's rotary at its own position, and per layer the kv projection,
-    /// `_prep` and the cache writes. false (nothing done): no pool, or more rows than tmax; the caller adds them lane by lane.
+    /// MultiDrafter's context update of several lanes in one pass; false: not done; notes/glm_dflash.md#batch-taps
     pub fn taps(b: *Batch, e: *Engine, ds: []const *Drafter, kept: []const usize, row0s: []const usize, buf: *const fwd.Buffers) !bool {
         const pl = b.pool orelse return false;
         const D = b.dr.d;
@@ -217,10 +209,7 @@ pub const Batch = struct {
         b.mem.free();
     }
 
-    /// v1.10 MultiDrafter's pool: moves the caches of `ds` (every lane's drafter, before any graph holds their addresses) into
-    /// one buffer, drafter s's at s caches in, so `layer` writes and reads every block's ring in one launch each. A flat
-    /// context (no ring) keeps its own caches and the launches per lane.
-    // ponytail: each drafter's own caches stay allocated and unused (about 36 MB a lane); give Drafter.init a no-cache mode if that memory counts
+    /// v1.10 MultiDrafter's pool: every lane's ring caches in one buffer; notes/glm_dflash.md#batch-pool
     pub fn adopt(b: *Batch, e: *Engine, ds: []const *Drafter) !void {
         if (ds.len == 0 or ds.len > b.lanes or ds[0].ring == 0) return;
         b.lane_bytes = ds[0].cacheBytes();
@@ -234,8 +223,7 @@ pub const Batch = struct {
         b.pool = pl;
     }
 
-    /// A 4-bit projection of `rows` rows (x rows q.k apart): 17 to 32 rows in one launch on the 32-row tile (the weights
-    /// read once, v1.10's qmm bucket; drafts only propose, so these bits need not be one lane's), else pieces of up to 16.
+    /// A 4-bit projection of `rows` rows: 17 to 32 on the 32-row tile, else pieces of 16; notes/glm_dflash.md#batch-mm
     fn mm(e: *Engine, x: u64, xs: u64, q: kern.Q4, out: u64, rows: usize, fp32: bool) !void {
         if (rows > piece and rows <= 2 * piece) return kern.qmmShared(e.k, e.s, x, q.k, xs, q, out, rows, fp32);
         var r: usize = 0;
@@ -330,8 +318,7 @@ pub const Batch = struct {
         try b.dconv(e, b.rowb, L.m_base, b.x, b.x, S, 1);
     }
 
-    /// Drafter.block for every drafter of `ds` (each at its context's end, `pend` its pending token), in one pass. `read`:
-    /// also bring each one's merged candidates to the host (rank 0 alone), as its own `block(read)` would.
+    /// Drafter.block for every drafter of `ds` (`pend`: pending tokens) in one pass; notes/glm_dflash.md#batch-blocks
     pub fn blocks(b: *Batch, e: *Engine, ds: []const *Drafter, pend: []const u32, read: bool) !void {
         const dr = b.dr;
         const S = ds.len;
@@ -386,8 +373,7 @@ pub const Batch = struct {
         for (0..S) |s| try b.norm(e, b.x + (s * n + 1) * D * bf, dr.norm, b.hh + s * nb * D * bf, b.hh_xs + s * nb * (D / 64) * f4, nb);
         const vl = b.w.head.n;
         if (M > piece and M <= 2 * piece) {
-            // one launch on the 32-row tile reads the head once (v1.10's qmm bucket); the drafts are hints, so these bits
-            // need not be the one-lane pass's
+            // one launch on the 32-row tile reads the head once (v1.10's qmm bucket); notes/glm_dflash.md#batch-mm
             try kern.qmmShared(e.k, e.s, b.hh, D, b.hh_xs, b.w.draft_head, b.logits, M, false);
         } else {
             var r: usize = 0;

@@ -120,8 +120,7 @@ pub const Loader = struct {
         return (try l.stack(&.{full}, dtype)).ptr;
     }
 
-    /// A dense projection (weights.py `q4`, `stack`): the rank parts of `names` in rows, BF16 as stored or, under
-    /// TF_GLM_DENSE=q4, quantized on the GPU after the tp split, as `qmm.make_dense_q4`.
+    /// A dense projection (weights.py `q4`, `stack`) of the rank parts of `names`; notes/glm_weights.md#mat-loader
     pub fn mat(l: *Loader, names: []const []const u8) !Mat {
         var all: std.ArrayList(u8) = .empty;
         defer all.deinit(l.gpa);
@@ -137,8 +136,7 @@ pub const Loader = struct {
         return l.quantize(raw.ptr, shape.rows, shape.cols, true);
     }
 
-    /// Bf16 rows [n, k] on the device as a dense q4 projection: groups of 64 along k as 4-bit (`mse`: the
-    /// least-squares search, else min/max), else, where k is not a multiple of 64, as FP8 (make_dense_q4's rule).
+    /// Bf16 rows [n, k] on the device as a dense q4 projection (make_dense_q4's rule); notes/glm_weights.md#quantize
     fn quantize(l: *Loader, raw: u64, n: usize, k: usize, mse: bool) !Mat {
         const s = l.src.ops.s;
         if (k % 64 == 0) {

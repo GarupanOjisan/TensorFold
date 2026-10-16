@@ -1,6 +1,4 @@
-//! One rank's half of GLM-5.3-Flash's EXL3 checkpoint on the GPU, laid out as the Python engine lays it out
-//! (v0.6.6 families/glm5_next/cuda/weights.py `load`, split.py `rule`): BF16 projections, rows or columns split
-//! between the two ranks, the routed experts' EXL3 trellises stacked per layer with pointer and width tables.
+//! One rank's half of GLM-5.3-Flash's EXL3 checkpoint on the GPU, as weights.py lays it out; notes/glm_weights.md
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");
@@ -14,12 +12,10 @@ pub const Config = glm_config.Config;
 pub const world = 2;
 pub const prefix = "model.language_model.";
 
-/// How a dense (non-expert) projection is held. TF_GLM_DENSE (v1.8 qmm.dense_kind): `q4`, the default, quantizes the
-/// projections at load to 4-bit groups of 64 (MSE-searched) and the head to FP8; `b16` keeps the checkpoint's BF16.
+/// How a dense (non-expert) projection is held (TF_GLM_DENSE); notes/glm_weights.md#kind
 pub const Kind = enum { b16, q4, f8 };
 
-/// A projection [n, k]: BF16 rows (qmm.B16: ptr), tiled 4-bit groups (qmm.Q4: ptr the words, s and b the bf16 scales and
-/// biases, npad the columns padded to 128) or e4m3 rows with fp32 scales per 128 columns (qmm.F8: ptr, s).
+/// A projection [n, k]: BF16 rows, tiled 4-bit groups or e4m3 rows; notes/glm_weights.md#mat
 pub const Mat = struct {
     kind: Kind = .b16,
     ptr: u64,
@@ -131,8 +127,7 @@ pub const DraftLayer = struct {
     down: kern.Q4, // [D, MLP width]: a row-parallel partial
 };
 
-/// The DFlash2 draft model on this rank (dflash2.Drafter's constructor): config, 4-bit weights (min/max ranges,
-/// TF_GLM_DRAFT_QUANT unset), the selector's projection and, on rank 0 (which picks the chains), its codebooks.
+/// The DFlash2 draft model on this rank (dflash2.Drafter's constructor); notes/glm_weights.md#draft
 pub const Draft = struct {
     d: usize, // hidden size
     hd: usize, // head dim
@@ -223,8 +218,7 @@ pub fn denseKind() !Kind {
     return error.BadDenseKind;
 }
 
-/// Every weight of rank `rank` of the checkpoint in `dir`, uploaded on `ops`'s stream; the dense projections are
-/// quantized on the GPU with `kernels` as TF_GLM_DENSE says.
+/// Every weight of rank `rank` of the checkpoint in `dir`, uploaded on `ops`'s stream, dense ones as TF_GLM_DENSE says.
 pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @import("glm_source.zig").Ops, kernels: *const kern.Kernels, dir: []const u8, cfg: Config, rank: u32, mtp: bool) !Weights {
     // by prefix, so the vision tower's tensors (5-D convolutions past safetensors.max_rank) are never parsed
     var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
@@ -242,8 +236,7 @@ pub fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @imp
     w.embed = try l.upOne(prefix ++ "embed_tokens.weight", .bf16);
     for (w.layers, 0..) |*lw, i| lw.* = try l.layer(i, false);
     w.norm = try l.upOne(prefix ++ "norm.weight", .bf16);
-    // the head: this rank's half of the vocabulary rows, as BF16 rows only until the draft head (min/max 4-bit, from
-    // the BF16 rows as weights.py does) and, under TF_GLM_DENSE=q4, the FP8 head are made from them
+    // the head: this rank's half of the vocabulary rows in BF16, then quantized; notes/glm_weights.md#head
     const head = try ck_head.expect("lm_head.weight", .bf16, &.{ cfg.vocab, cfg.hidden });
     const vl: usize = cfg.vocab / world;
     const hk: usize = cfg.hidden;
@@ -286,9 +279,7 @@ const dump_sets = [_]struct { name: []const u8, parts: []const []const u8 }{
     .{ .name = "mtp_eh", .parts = &.{"layers.45.eh_proj"} },
 };
 
-/// `tf-glm qdump`: the dense quantization of a few tensors of `rank` (the loader's own path), the head's FP8 and
-/// draft-head 4-bit rows too, as raw bytes in `out`: NAME.w, .s, .b (words, scales, biases), head.q8, head.sc,
-/// draft.w, .s, .b. `only` (comma separated names, or empty) picks some.
+/// `tf-glm qdump`: the dense quantization of a few tensors of `rank` as raw bytes in `out`; notes/glm_weights.md#qdump
 pub fn dumpQuant(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @import("glm_source.zig").Ops, kernels: *const kern.Kernels, dir: []const u8, cfg: Config, rank: u32, out: []const u8, only: []const u8) !void {
     var ck = try core.Checkpoint.openModelPrefix(gpa, io, dir, prefix);
     defer ck.close();

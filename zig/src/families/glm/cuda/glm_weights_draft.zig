@@ -32,8 +32,7 @@ fn jget(o: std.json.Value, key: []const u8) !std.json.Value {
     return (if (o == .object) o.object.get(key) else null) orelse error.BadDraftConfig;
 }
 
-/// dflash2.Drafter's weights of the model in `dir` for rank `rank`: KV heads in whole query groups (halves), the MLP in
-/// units of 128 (tp.draft_parts), every matrix 4-bit with min/max ranges on the GPU. `books`: also the host codebooks.
+/// dflash2.Drafter's weights of the model in `dir` for rank `rank`; notes/glm_weights.md#loaddraft
 pub fn loadDraft(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ops: @import("glm_source.zig").Ops, kernels: *const kern.Kernels, w: *Weights, dir: []const u8, rank: u32, books: bool) !void {
     const cfg_path = try std.fs.path.join(gpa, &.{ dir, "config.json" });
     defer gpa.free(cfg_path);
