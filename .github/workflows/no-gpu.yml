@@ -45,8 +45,8 @@ jobs:
           python3 tools/zig/lean_new.py ../lean-base.txt ../lean-head.txt
   zig-windows:
     runs-on: windows-latest
-    # This fork: upstream's Windows build has failed since 1.1.0 (upstream's own runs too); report it without failing the check.
-    continue-on-error: true
+    # This fork: upstream's Windows build fails since 1.1.0 (ashhart/TensorFold#1034); the steps report, the job passes.
+    # Drop continue-on-error once a sync brings upstream's Windows fix and zig-windows passes again.
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
@@ -55,8 +55,11 @@ jobs:
       # The same host unit tests on Windows: the platform layer (zig/src/platform) over the UCRT, Win32 and Winsock.
       - name: zig build test
         run: zig build test
+        continue-on-error: true
       # The server goldens and the Cortheon fuzz harness on Windows too; the goldens skip the signal-driven cases.
       - name: zig build test-golden
         run: zig build test-golden
+        continue-on-error: true
       - name: zig build fuzz-cortheon
         run: zig build fuzz-cortheon
+        continue-on-error: true
