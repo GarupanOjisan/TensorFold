@@ -44,6 +44,8 @@ pub const Settings = struct {
     serial: bool,
     context_tokens: ?i64,
     managed: bool,
+    /// 1 or 2 when attested. A managed run is one rank. An attached run stays null until the server manifest names it.
+    rank_count: ?u8 = null,
 };
 
 const Builder = struct {
@@ -123,7 +125,7 @@ pub fn value(a: Allocator, run_id: []const u8, created_at: []const u8, model: Mo
     try st.put("serial", .{ .bool = settings.serial });
     try st.int("context_tokens", settings.context_tokens);
     try st.put("managed", .{ .bool = settings.managed });
-    try st.int("rank_count", if (settings.managed) @as(?u8, 1) else null);
+    try st.int("rank_count", settings.rank_count orelse if (settings.managed) @as(?u8, 1) else null);
     try top.put("settings", st.value());
     const rows = try a.alloc(Value, samples.len);
     for (samples, rows) |x, *slot| slot.* = try sampleValue(a, x);
@@ -140,6 +142,8 @@ fn sampleValue(a: Allocator, x: suite.Sample) !Value {
     try b.int("repeat", @as(?i32, x.repeat));
     try b.int("seed", @as(?u32, x.seed));
     try b.str("status", @tagName(x.status));
+    try b.str("finish_reason", x.finish_reason);
+    try b.str("route", x.route orelse if (std.mem.eql(u8, x.fixture_id, "chat")) "/v1/chat/completions" else "/v1/completions");
     try b.int("prompt_tokens", x.prompt_tokens);
     try b.int("completion_tokens", x.completion_tokens);
     try b.int("cached_tokens", x.cached_tokens);

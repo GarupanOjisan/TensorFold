@@ -1,5 +1,6 @@
-// EXL3 tiles (after ExLlamaV3, MIT, Copyright (c) 2025 Turboderp): lane L decodes values 8L..8L+7 into B fragments
+// After ExLlamaV3, MIT, Copyright (c) 2025 Turboderp; DeepSeek integration by @jayleaton.
 
+// EXL3 tiles: lane L decodes values 8L..8L+7 straight into its two mma B fragments; port of tensorfold's decode.cuh.
 #pragma once
 
 #include <cstdint>
@@ -15,7 +16,7 @@ __host__ __device__ constexpr int tile_words() {
     return 4 * K2;
 }
 
-// E(p): one past the last stream bit of value p's 16-bit window (format.py's stream_ends).
+// E(p): one past the last stream bit of value p's 16-bit window (exl3_format.zig's streamEnds).
 template <int K2>
 __host__ __device__ constexpr int stream_end(int p) {
     return (K2 & 1) ? ((p + 1) * K2 - ((p + 1) & 1)) / 2 : (p + 1) * (K2 / 2);
@@ -109,13 +110,6 @@ __device__ __forceinline__ uint32_t decode2(uint32_t s0, uint32_t s1) {
     }
 }
 
-// One codebook value.
-template <int CB>
-__device__ __forceinline__ half decode1(uint32_t s) {
-    const uint32_t v = decode2<CB>(s, s);
-    return __ushort_as_half(static_cast<unsigned short>(v & 0xffffu));
-}
-
 // This lane's 8 values of a tile as the B fragments of the tile's two n8 halves (columns 0-7 in b0, 8-15 in b1).
 template <int K2, int CB>
 __device__ __forceinline__ void decode_lane(const uint32_t (&w)[lane_words<K2>()], int lane, uint32_t (&b0)[2],
@@ -129,8 +123,8 @@ __device__ __forceinline__ void decode_lane(const uint32_t (&w)[lane_words<K2>()
 }
 
 // Row and column in the 16x16 tile (row = k, column = n) of this lane's value j (0..7).
-__device__ __forceinline__ int value_row(int lane, int j) { return 2 * (lane & 3) + (j & 1) + 8 * ((j >> 1) & 1); }
-__device__ __forceinline__ int value_col(int lane, int j) { return (lane >> 2) + 8 * (j >> 2); }
+__host__ __device__ constexpr int value_row(int lane, int j) { return 2 * (lane & 3) + (j & 1) + 8 * ((j >> 1) & 1); }
+__host__ __device__ constexpr int value_col(int lane, int j) { return (lane >> 2) + 8 * (j >> 2); }
 
 // mma.m16n8k16, fp16 inputs, fp32 accumulators: d += a @ b.
 __device__ __forceinline__ void mma16816(float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {

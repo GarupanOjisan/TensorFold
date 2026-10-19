@@ -10,8 +10,8 @@ const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
 
-/// How the template writes a call inside <tool_call>: Qwen3-Coder's XML (Nemotron, Qwen3.5), or a JSON object.
-pub const Style = enum { xml, json };
+/// The template's call envelope, with XML parameters or JSON arguments.
+pub const Style = enum { xml, json, gemma, glm };
 
 const probe = "tfprobe_fn";
 const key = "tfprobe_k";
@@ -24,10 +24,12 @@ const value_blanks = 32;
 
 /// The style of `rendered`, a turn that calls `probe` with {key: "v"}; null: markup this grammar does not write.
 pub fn style(rendered: []const u8) ?Style {
+    if (std.mem.indexOf(u8, rendered, "<|tool_call>call:" ++ probe ++ "{") != null) return .gemma;
     const at = std.mem.lastIndexOf(u8, rendered, "<tool_call>") orelse return null;
     const text = rendered[at..];
     if (std.mem.indexOf(u8, text, "<function=" ++ probe ++ ">") != null and std.mem.indexOf(u8, text, "<parameter=" ++ key ++ ">") != null) return .xml;
     if (std.mem.indexOf(u8, text, "\"" ++ probe ++ "\"") != null and std.mem.indexOf(u8, text, "\"arguments\"") != null) return .json;
+    if (std.mem.indexOf(u8, text, "<tool_call>" ++ probe ++ "<arg_key>" ++ key ++ "</arg_key>") != null) return .glm;
     return null;
 }
 
@@ -35,10 +37,14 @@ pub fn style(rendered: []const u8) ?Style {
 pub fn structure(srv: *Server, cx: *Cx, tools: []const Value, parallel: bool, thinking: bool) errors.Refused!api.Structure {
     const probe_turn = (try json.parse(cx.a, "[{\"role\": \"user\", \"content\": \"x\"}, {\"role\": \"assistant\", \"content\": \"\", \"tool_calls\": [{\"id\": \"call_0\", \"type\": \"function\", \"function\": {\"name\": \"" ++ probe ++ "\", \"arguments\": {\"" ++ key ++ "\": \"v\"}}}]}]")).ok;
     var scratch: Cx = .{ .a = cx.a };
-    const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |_| "";
-    const s = style(rendered) orelse return cx.refuse("tool_choice \"required\" or a named function needs a chat template that writes <tool_call> calls (XML parameters or a JSON object), and this one does not: send \"auto\"");
+    const rendered = if (prompt.renderIds(srv, &scratch, probe_turn, &.{}, false, null, false)) |ids| try srv.text.decode(cx.a, ids) else |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.Refused => "",
+    };
+    const s = style(rendered) orelse .json; // unrecognized markup uses the canonical call form the parser accepts
     const text = try build(cx.a, s, tools, parallel);
-    return srv.compiledStructure(cx, .structural_tag, text, "tool_choice \"required\" or a named function", thinking);
+    const field = try std.fmt.allocPrint(cx.a, "tool_choice \"required\" or a named function on backend '{s}'", .{srv.backendName()});
+    return srv.compiledStructure(cx, .structural_tag, text, field, thinking);
 }
 
 /// The structural tag's JSON text (xgrammar's form).
@@ -65,6 +71,7 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
             try constant(a, "</function>"),                                        ws,
             try constant(a, "</tool_call>"),
         }),
+        .gemma => try list(a, &.{ try constant(a, try std.fmt.allocPrint(a, "<|tool_call>call:{s}", .{name})), try arguments(a, schema, "json"), try constant(a, "<tool_call|>") }),
         .json => blk: {
             const props = try json.newObject(a);
             const fixed = try json.newObject(a);
@@ -77,6 +84,11 @@ fn call(a: Allocator, s: Style, name: []const u8, schema: Value) Allocator.Error
             try whole.put(a, "required", try list(a, &.{ .{ .string = "name" }, .{ .string = "arguments" } }));
             break :blk try list(a, &.{ try constant(a, "<tool_call>"), ws, try arguments(a, .{ .object = whole }, "json"), ws, try constant(a, "</tool_call>") });
         },
+        // GLM's template writes NAME<arg_key>K</arg_key><arg_value>V</arg_value>... with no blanks: xgrammar's glm_xml
+        .glm => try list(a, &.{
+            try constant(a, try std.fmt.allocPrint(a, "<tool_call>{s}", .{name})), try arguments(a, schema, "glm_xml"),
+            try constant(a, "</tool_call>"),
+        }),
     };
     return node(a, "sequence", &.{.{ "elements", elements }});
 }
@@ -114,7 +126,8 @@ fn node(a: Allocator, kind: []const u8, entries: []const struct { []const u8, Va
 test "the probe call's markup picks the style" {
     try std.testing.expectEqual(Style.xml, style("<think></think><tool_call>\n<function=tfprobe_fn>\n<parameter=tfprobe_k>\nv\n</parameter>\n</function>\n</tool_call>\n").?);
     try std.testing.expectEqual(Style.json, style("<tool_call>\n{\"name\": \"tfprobe_fn\", \"arguments\": {\"tfprobe_k\": \"v\"}}\n</tool_call>").?);
-    try std.testing.expectEqual(@as(?Style, null), style("<|tool_call>call:tfprobe_fn{tfprobe_k:<|\"|>v<|\"|>}<tool_call|>"));
+    try std.testing.expectEqual(Style.gemma, style("<|tool_call>call:tfprobe_fn{tfprobe_k:<|\"|>v<|\"|>}<tool_call|>").?);
+    try std.testing.expectEqual(Style.glm, style("</think><tool_call>tfprobe_fn<arg_key>tfprobe_k</arg_key><arg_value>v</arg_value></tool_call>").?);
 }
 
 test "a required call's grammar names every offered tool and its schema; one call without parallel" {
@@ -131,4 +144,23 @@ test "a required call's grammar names every offered tool and its schema; one cal
     const single = try build(a, .json, tools.array[0..1], false);
     try std.testing.expect(std.mem.indexOf(u8, single, "\"type\":\"star\"") == null and std.mem.indexOf(u8, single, "\"type\":\"or\"") == null);
     try std.testing.expect(std.mem.indexOf(u8, single, "\"const\":\"get_weather\"") != null);
+    const glm = try build(a, .glm, tools.array[0..1], false);
+    try std.testing.expect(std.mem.indexOf(u8, glm, "\"value\":\"<tool_call>get_weather\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, glm, "\"style\":\"glm_xml\"") != null);
+}
+
+test "GLM required tools keep their name, schema and parallel policy" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const picked = style("<tool_call>tfprobe_fn<arg_key>tfprobe_k</arg_key><arg_value>v</arg_value></tool_call>") orelse return error.TestExpectedStyle;
+    try std.testing.expectEqualStrings("glm", @tagName(picked));
+    const tools = (try json.parse(a, "[{\"name\":\"weather\",\"parameters\":{\"type\":\"object\",\"properties\":{\"city\":{\"type\":\"string\"}},\"required\":[\"city\"]}},{\"name\":\"clock\"}]")).ok;
+    const single = try build(a, picked, tools.array[0..1], false);
+    for ([_][]const u8{ "<tool_call>weather", "glm_xml", "city", "</tool_call>" }) |text| try std.testing.expect(std.mem.indexOf(u8, single, text) != null);
+    try std.testing.expect(std.mem.indexOf(u8, single, "clock") == null);
+    try std.testing.expect(std.mem.indexOf(u8, single, "\"type\":\"star\"") == null);
+    const many = try build(a, picked, tools.array, true);
+    try std.testing.expect(std.mem.indexOf(u8, many, "<tool_call>clock") != null);
+    try std.testing.expect(std.mem.indexOf(u8, many, "\"type\":\"star\"") != null);
 }

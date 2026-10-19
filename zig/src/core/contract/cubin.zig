@@ -18,12 +18,21 @@ const entry_fields = 48;
 pub const Kernel = struct { sm: u32, name: []const u8, usage: limits.Usage };
 
 /// One SM's ELF image in a fatbin.
-pub const Image = struct { sm: u32, elf: []const u8 };
+pub const Image = struct { sm: u32, elf: []const u8, owned: bool = false };
+
+/// Release the image list and any decompressed payloads; plain images continue to borrow the input bytes.
+pub fn freeImages(a: std.mem.Allocator, imgs: []Image) void {
+    for (imgs) |im| if (im.owned) a.free(im.elf);
+    a.free(imgs);
+}
 
 /// Every ELF image in a fatbin, with its SM; a plain ELF cubin is one image of an unknown SM (0).
 pub fn images(a: std.mem.Allocator, bytes: []const u8) ![]Image {
     var out: std.ArrayList(Image) = .empty;
-    errdefer out.deinit(a);
+    errdefer {
+        for (out.items) |im| if (im.owned) a.free(im.elf);
+        out.deinit(a);
+    }
     if (bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x7fELF")) {
         try out.append(a, .{ .sm = 0, .elf = bytes });
         return out.toOwnedSlice(a);
@@ -34,7 +43,7 @@ pub fn images(a: std.mem.Allocator, bytes: []const u8) ![]Image {
         const header: usize = read(u16, bytes, at + 6);
         const total = std.math.cast(usize, read(u64, bytes, at + 8)) orelse return error.BadFatbin;
         const end = std.math.add(usize, at + header, total) catch return error.BadFatbin;
-        if (end > bytes.len) return error.BadFatbin;
+        if (header < 16 or end > bytes.len) return error.BadFatbin;
         var entry = at + header;
         while (entry + 32 <= end) {
             const entry_header: usize = read(u32, bytes, entry + 4);
@@ -43,8 +52,15 @@ pub fn images(a: std.mem.Allocator, bytes: []const u8) ![]Image {
             if (entry_header < entry_fields or next > end) return error.BadFatbin;
             const flags = read(u64, bytes, entry + 40);
             if (read(u16, bytes, entry) == elf_kind) {
-                if (flags & 0x2000 != 0) return error.CompressedFatbin;
-                try out.append(a, .{ .sm = read(u32, bytes, entry + 28), .elf = bytes[entry + entry_header .. next] });
+                const payload_bytes = bytes[entry + entry_header .. next];
+                const decoded = try @import("fatbin_zstd.zig").unpack(a, payload_bytes);
+                errdefer if (decoded) |owned| a.free(owned);
+                if (decoded == null and flags & 0x2000 != 0) return error.CompressedFatbin;
+                try out.append(a, .{
+                    .sm = read(u32, bytes, entry + 28),
+                    .elf = decoded orelse payload_bytes,
+                    .owned = decoded != null,
+                });
             }
             entry = next;
         }
@@ -116,6 +132,34 @@ pub fn kernels(a: std.mem.Allocator, elf: []const u8, sm: u32) ![]Kernel {
         try out.append(a, .{ .sm = sm, .name = name, .usage = u });
     };
     return out.toOwnedSlice(a);
+}
+
+/// The nvcc release that built an image, from its .note.nv.tkinfo ("release 13.2"); null when it names none.
+pub fn release(a: std.mem.Allocator, elf: []const u8) !?limits.Nvcc {
+    const all = try sections(a, elf);
+    defer a.free(all);
+    for (all) |s| if (std.mem.eql(u8, s.name, ".note.nv.tkinfo") and s.kind != sht_nobits) {
+        const text = try contents(elf, s);
+        const at = std.mem.indexOf(u8, text, "release ") orelse continue;
+        var parts = std.mem.splitAny(u8, text[at + "release ".len ..], ".,");
+        const major = std.fmt.parseInt(u32, parts.next() orelse continue, 10) catch continue;
+        const minor = std.fmt.parseInt(u32, parts.next() orelse continue, 10) catch continue;
+        return .{ .major = major, .minor = minor };
+    };
+    return null;
+}
+
+/// The release that built `bytes`' image for `sm`, else the one every image names (MixedCompilers when they differ).
+pub fn releaseFor(a: std.mem.Allocator, bytes: []const u8, sm: u32) !?limits.Nvcc {
+    const imgs = try images(a, bytes);
+    defer freeImages(a, imgs);
+    for (imgs) |im| if (im.sm == sm) return release(a, im.elf);
+    var seen: ?limits.Nvcc = null;
+    for (imgs) |im| if (try release(a, im.elf)) |rel| {
+        if (seen) |s| if (!std.meta.eql(s, rel)) return error.MixedCompilers;
+        seen = rel;
+    };
+    return seen;
 }
 
 /// The value a global .nv.info record of `attr` keeps for symbol `sym` (EIATTR_REGCOUNT's symbol, count).
@@ -202,7 +246,7 @@ test "a cubin's registers, static shared bytes and launch bounds" {
         const elf = try synthetic(a, 143, 1060, 256, packed_regs);
         defer a.free(elf);
         const imgs = try images(a, elf);
-        defer a.free(imgs);
+        defer freeImages(a, imgs);
         try std.testing.expectEqual(@as(usize, 1), imgs.len);
         for ([_]u32{ 86, 121 }, [_]u32{ 1060, 36 }) |sm, static| {
             const ks = try kernels(a, imgs[0].elf, sm);
@@ -213,6 +257,46 @@ test "a cubin's registers, static shared bytes and launch bounds" {
         }
     }
     try std.testing.expectError(error.NotAFatbin, images(a, "not a fatbin"));
+}
+
+/// A tiny ELF64 whose only data section is a .note.nv.tkinfo holding `text`.
+fn noted(a: std.mem.Allocator, text: []const u8) ![]u8 {
+    const names = "\x00.shstrtab\x00.note.nv.tkinfo\x00";
+    const data_at = 64;
+    const note_at = data_at + names.len;
+    const shoff = std.mem.alignForward(usize, note_at + text.len, 8);
+    const out = try a.alloc(u8, shoff + 3 * 64);
+    @memset(out, 0);
+    @memcpy(out[0..4], "\x7fELF");
+    out[4] = 2;
+    std.mem.writeInt(u64, out[0x28..0x30], shoff, .little);
+    std.mem.writeInt(u16, out[0x3a..0x3c], 64, .little);
+    std.mem.writeInt(u16, out[0x3c..0x3e], 3, .little);
+    std.mem.writeInt(u16, out[0x3e..0x40], 1, .little);
+    @memcpy(out[data_at..][0..names.len], names);
+    @memcpy(out[note_at..][0..text.len], text);
+    const rows = [_][4]u64{ .{ 0, 0, 0, 0 }, .{ 1, 3, data_at, names.len }, .{ 11, 7, note_at, text.len } };
+    for (rows, 0..) |r, i| {
+        const h = shoff + 64 * i;
+        std.mem.writeInt(u32, out[h..][0..4], @intCast(r[0]), .little);
+        std.mem.writeInt(u32, out[h + 4 ..][0..4], @intCast(r[1]), .little);
+        std.mem.writeInt(u64, out[h + 24 ..][0..8], r[2], .little);
+        std.mem.writeInt(u64, out[h + 32 ..][0..8], r[3], .little);
+    }
+    return out;
+}
+
+test "the nvcc release an image's .note.nv.tkinfo names, and none without one" {
+    const a = std.testing.allocator;
+    const built = try noted(a, "\x00ptxas\x00Cuda compilation tools, release 13.2, V13.2.78\x00Build cuda_13.2.r13.2\x00");
+    defer a.free(built);
+    try std.testing.expectEqual(@as(?limits.Nvcc, .{ .major = 13, .minor = 2 }), try release(a, built));
+    const odd = try noted(a, "Cuda compilation tools, release thirteen");
+    defer a.free(odd);
+    try std.testing.expectEqual(@as(?limits.Nvcc, null), try release(a, odd));
+    const bare = try synthetic(a, 143, 1060, 256, true);
+    defer a.free(bare);
+    try std.testing.expectEqual(@as(?limits.Nvcc, null), try release(a, bare));
 }
 
 test "a fatbin entry whose header ends before its flags is refused, not read past" {
@@ -238,4 +322,161 @@ test "a section or launch bound past what the image holds is refused" {
     try std.testing.expectError(error.BadElf, kernels(a, elf, 121));
     std.mem.writeInt(u64, elf[0x28..0x30], std.math.maxInt(u64) - 8, .little);
     try std.testing.expectError(error.BadElf, kernels(a, elf, 121));
+}
+
+/// A fatbin of one uncompressed entry an image, as `images` reads it.
+fn fatbinOf(a: std.mem.Allocator, imgs: []const Image) ![]u8 {
+    var size: usize = 16;
+    for (imgs) |im| size += 64 + im.elf.len;
+    const out = try a.alloc(u8, size);
+    @memset(out, 0);
+    std.mem.writeInt(u32, out[0..4], fatbin_magic, .little);
+    std.mem.writeInt(u16, out[6..8], 16, .little);
+    std.mem.writeInt(u64, out[8..16], size - 16, .little);
+    var at: usize = 16;
+    for (imgs) |im| {
+        std.mem.writeInt(u16, out[at..][0..2], elf_kind, .little);
+        std.mem.writeInt(u32, out[at + 4 ..][0..4], 64, .little);
+        std.mem.writeInt(u64, out[at + 8 ..][0..8], im.elf.len, .little);
+        std.mem.writeInt(u32, out[at + 28 ..][0..4], im.sm, .little);
+        @memcpy(out[at + 64 ..][0..im.elf.len], im.elf);
+        at += 64 + im.elf.len;
+    }
+    return out;
+}
+
+test "an image's compiler is its own SM image's, else the one every image names; images that differ are refused" {
+    const a = std.testing.allocator;
+    const r132 = try noted(a, "Cuda compilation tools, release 13.2, V13.2.78");
+    defer a.free(r132);
+    const r130 = try noted(a, "Cuda compilation tools, release 13.0, V13.0.88");
+    defer a.free(r130);
+    const bare = try synthetic(a, 143, 1060, 256, true);
+    defer a.free(bare);
+    const mixed = try fatbinOf(a, &.{ .{ .sm = 120, .elf = r132 }, .{ .sm = 89, .elf = r130 } });
+    defer a.free(mixed);
+    try std.testing.expectEqual(@as(?limits.Nvcc, .{ .major = 13, .minor = 2 }), try releaseFor(a, mixed, 120));
+    try std.testing.expectEqual(@as(?limits.Nvcc, .{ .major = 13, .minor = 0 }), try releaseFor(a, mixed, 89));
+    try std.testing.expectError(error.MixedCompilers, releaseFor(a, mixed, 121)); // no sm_121 image, two compilers
+    const same = try fatbinOf(a, &.{ .{ .sm = 120, .elf = r132 }, .{ .sm = 89, .elf = bare }, .{ .sm = 86, .elf = r132 } });
+    defer a.free(same);
+    try std.testing.expectEqual(@as(?limits.Nvcc, .{ .major = 13, .minor = 2 }), try releaseFor(a, same, 121));
+    const none = try fatbinOf(a, &.{.{ .sm = 89, .elf = bare }});
+    defer a.free(none);
+    try std.testing.expectEqual(@as(?limits.Nvcc, null), try releaseFor(a, none, 121));
+}
+
+/// A standard zstd frame with raw and RLE blocks, independent of the decoder under test.
+fn zstdOf(a: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, "\x28\xb5\x2f\xfd\xa0");
+    var size: [4]u8 = undefined;
+    std.mem.writeInt(u32, &size, @intCast(bytes.len), .little);
+    try out.appendSlice(a, &size);
+    var at: usize = 0;
+    var last: usize = 0;
+    while (at < bytes.len) {
+        var end = at + 1;
+        while (end < bytes.len and bytes[end] == bytes[at]) : (end += 1) {}
+        const rle = end - at >= 8;
+        if (!rle) {
+            end = at + 1;
+            while (end < bytes.len and (end + 8 > bytes.len or !std.mem.allEqual(u8, bytes[end..][0..8], bytes[end]))) : (end += 1) {}
+        }
+        var header: [3]u8 = undefined;
+        std.mem.writeInt(u24, &header, @as(u24, @intCast(end - at)) << 3 | @as(u24, if (rle) 2 else 0), .little);
+        last = out.items.len;
+        try out.appendSlice(a, &header);
+        try out.appendSlice(a, bytes[at..if (rle) at + 1 else end]);
+        at = end;
+    }
+    out.items[last] |= 1;
+    return out.toOwnedSlice(a);
+}
+
+test "zstd fatbin images recover the exact ELF and compiler resource records" {
+    const a = std.testing.allocator;
+    const elf = try synthetic(a, 143, 1060, 256, false);
+    defer a.free(elf);
+    const compressed = try zstdOf(a, elf);
+    defer a.free(compressed);
+    try std.testing.expect(compressed.len < elf.len);
+    const fat = try fatbinOf(a, &.{.{ .sm = 121, .elf = compressed }});
+    defer a.free(fat);
+    const imgs = try images(a, fat);
+    defer freeImages(a, imgs);
+    const ks = try kernels(a, imgs[0].elf, imgs[0].sm);
+    defer a.free(ks);
+    try std.testing.expectEqualSlices(u8, elf, imgs[0].elf);
+    try std.testing.expectEqual(limits.Usage{ .regs = 143, .static = 36, .bound = 256 }, ks[0].usage);
+}
+
+test "release selection reads compressed and plain SM images together" {
+    const a = std.testing.allocator;
+    const elf = try noted(a, "Cuda compilation tools, release 13.2, V13.2.78");
+    defer a.free(elf);
+    const compressed = try zstdOf(a, elf);
+    defer a.free(compressed);
+    const fat = try fatbinOf(a, &.{ .{ .sm = 120, .elf = compressed }, .{ .sm = 89, .elf = elf } });
+    defer a.free(fat);
+    const want: ?limits.Nvcc = .{ .major = 13, .minor = 2 };
+    try std.testing.expectEqual(want, try releaseFor(a, fat, 120));
+    try std.testing.expectEqual(want, try releaseFor(a, fat, 89));
+    try std.testing.expectEqual(want, try releaseFor(a, fat, 121));
+}
+
+fn unpackCheck(a: std.mem.Allocator, bytes: []const u8) !void {
+    const imgs = try images(a, bytes);
+    defer freeImages(a, imgs);
+    for (imgs) |im| {
+        const ks = try kernels(a, im.elf, im.sm);
+        defer a.free(ks);
+        try std.testing.expectEqual(@as(u32, 143), ks[0].usage.regs);
+    }
+}
+
+test "compressed ownership unwinds every allocation and a later malformed image" {
+    const a = std.testing.allocator;
+    const elf = try synthetic(a, 143, 1060, 256, false);
+    defer a.free(elf);
+    const compressed = try zstdOf(a, elf);
+    defer a.free(compressed);
+    const fat = try fatbinOf(a, &.{ .{ .sm = 120, .elf = compressed }, .{ .sm = 121, .elf = compressed } });
+    defer a.free(fat);
+    try std.testing.checkAllAllocationFailures(a, unpackCheck, .{fat});
+    std.mem.writeInt(u32, fat[16 + 64 + compressed.len + 4 ..][0..4], 32, .little);
+    try std.testing.expectError(error.BadFatbin, images(a, fat));
+}
+
+test "zstd payload flags, padding, checksum and truncated frames are handled explicitly" {
+    const a = std.testing.allocator;
+    const elf = try synthetic(a, 143, 1060, 256, false);
+    defer a.free(elf);
+    const compressed = try zstdOf(a, elf);
+    defer a.free(compressed);
+    var framed: std.ArrayList(u8) = .empty;
+    defer framed.deinit(a);
+    try framed.appendSlice(a, compressed);
+    framed.items[4] |= 4;
+    var hash: [4]u8 = undefined;
+    std.mem.writeInt(u32, &hash, @truncate(std.hash.XxHash64.hash(0, elf)), .little);
+    try framed.appendSlice(a, &hash);
+    try framed.appendSlice(a, &@as([7]u8, @splat(0)));
+    const fat = try fatbinOf(a, &.{.{ .sm = 121, .elf = framed.items }});
+    defer a.free(fat);
+    std.mem.writeInt(u64, fat[56..64], 0x2000, .little);
+    try unpackCheck(a, fat);
+    fat[80 + compressed.len] ^= 1;
+    try std.testing.expectError(error.BadZstdFatbin, images(a, fat));
+    fat[80 + compressed.len] ^= 1;
+    fat[fat.len - 1] = 1;
+    try std.testing.expectError(error.BadZstdFatbin, images(a, fat));
+    const short = try fatbinOf(a, &.{.{ .sm = 121, .elf = compressed[0 .. compressed.len - 1] }});
+    defer a.free(short);
+    try std.testing.expectError(error.BadZstdFatbin, images(a, short));
+    const legacy = try fatbinOf(a, &.{.{ .sm = 121, .elf = elf }});
+    defer a.free(legacy);
+    std.mem.writeInt(u64, legacy[56..64], 0x2000, .little);
+    try std.testing.expectError(error.CompressedFatbin, images(a, legacy));
 }

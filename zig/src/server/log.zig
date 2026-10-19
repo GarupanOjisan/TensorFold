@@ -1,5 +1,6 @@
 //! Server output: ``[tensorfold]`` lines on stdout, and the live status line they clear first.
 const std = @import("std");
+const platform = @import("sys");
 const Conn = @import("http_conn.zig").Conn;
 const afterChars = @import("reply_text.zig").afterChars;
 
@@ -8,6 +9,10 @@ var mutex: std.Io.Mutex = .init;
 var shown = false; // the live line is on screen
 var line_start = true; // the newest write ended its line, so a redraw cannot split it
 var quiet = false;
+
+pub const Test = if (@import("builtin").is_test) struct {
+    pub threadlocal var sink: ?struct { ctx: *anyopaque, call: *const fn (*anyopaque, []const u8) void } = null;
+} else struct {};
 
 pub fn init(io_: std.Io, silent: bool) void {
     global_io = io_;
@@ -23,22 +28,24 @@ const clear = "\r\x1b[2K";
 fn writeOut(bytes: []const u8) void {
     var off: usize = 0;
     while (off < bytes.len) {
-        const rc = std.posix.system.write(1, bytes[off..].ptr, bytes.len - off);
-        if (std.posix.errno(rc) != .SUCCESS or rc <= 0) return;
+        const rc = platform.c.write(1, bytes[off..].ptr, bytes.len - off);
+        if (platform.c.errno(rc) != .SUCCESS or rc <= 0) return;
         off += @intCast(rc);
     }
 }
 
 /// One ``[tensorfold] ...`` line.
 pub fn line(comptime fmt: []const u8, args: anytype) void {
-    if (quiet or @import("builtin").is_test) return; // a test's stdout is the build runner's channel
+    if (@import("builtin").is_test) {
+        if (Test.sink == null) return;
+    } else if (quiet) return;
     var buf: [8192]u8 = undefined;
     var w: std.Io.Writer = .fixed(&buf);
     w.print("[tensorfold] " ++ fmt ++ "\n", args) catch {
         buf[buf.len - 1] = '\n';
         w.end = buf.len;
     };
-    raw(w.buffered());
+    if (@import("builtin").is_test) Test.sink.?.call(Test.sink.?.ctx, w.buffered()) else raw(w.buffered());
 }
 
 /// Text as given, the live line cleared first.

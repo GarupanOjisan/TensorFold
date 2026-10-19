@@ -15,22 +15,40 @@ pub const Stream = struct {
         return .{ .d = d, .handle = s };
     }
 
+    /// A non-blocking stream at `priority`, clamped to the context's range (lower numbers run first).
+    pub const Priority = enum { default, highest };
+
+    pub fn initPriority(d: *const Driver, priority: Priority) Error!Stream {
+        var least: c_int = 0;
+        var greatest: c_int = 0;
+        try d.check(d.api.cuCtxGetStreamPriorityRange(&least, &greatest), "cuCtxGetStreamPriorityRange");
+        var s: abi.Stream = null;
+        const p: c_int = switch (priority) {
+            .default => 0,
+            .highest => greatest,
+        };
+        try d.check(d.api.cuStreamCreateWithPriority(&s, abi.stream_non_blocking, p), "cuStreamCreateWithPriority");
+        return .{ .d = d, .handle = s };
+    }
+
+    /// A stream its caller owns, such as a host framework's (null: the legacy default stream); never deinit it.
+    pub fn borrowed(d: *const Driver, handle: abi.Stream) Stream {
+        return .{ .d = d, .handle = handle };
+    }
+
     pub fn deinit(self: *Stream) void {
+        @import("copy_source.zig").synchronizeStream(self.d, self.handle) catch {};
         _ = self.d.api.cuStreamDestroy_v2(self.handle);
         self.* = undefined;
     }
 
     pub fn synchronize(self: Stream) Error!void {
-        try self.d.check(self.d.api.cuStreamSynchronize(self.handle), "cuStreamSynchronize");
+        try @import("copy_source.zig").synchronizeStream(self.d, self.handle);
     }
 
     /// True once every queued item has finished.
     pub fn done(self: Stream) Error!bool {
-        self.d.check(self.d.api.cuStreamQuery(self.handle), "cuStreamQuery") catch |e| switch (e) {
-            error.NotReady => return false,
-            else => return e,
-        };
-        return true;
+        return @import("copy_source.zig").streamDone(self.d, self.handle);
     }
 
     pub fn wait(self: Stream, event: Event) Error!void {
@@ -56,6 +74,11 @@ pub const Event = struct {
 
     pub fn record(self: Event, stream: Stream) Error!void {
         try self.d.check(self.d.api.cuEventRecord(self.handle, stream.handle), "cuEventRecord");
+    }
+
+    /// A record a capture keeps as an event record node: outside waits after a launch wait for that point of it.
+    pub fn recordExternal(self: Event, stream: Stream) Error!void {
+        try self.d.check(self.d.api.cuEventRecordWithFlags(self.handle, stream.handle, abi.event_record_external), "cuEventRecordWithFlags");
     }
 
     pub fn synchronize(self: Event) Error!void {

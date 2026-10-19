@@ -76,7 +76,7 @@ function infoCommand(repo) {
 
 async function pullCommand(spec) {
   const [repo, revision = 'main'] = spec.split('@')
-  record({ kind: 'pull', repo, revision, args: argv })
+  record({ kind: 'pull', repo, revision, args: argv, endpoint: env.HF_ENDPOINT ?? null, hasHubToken: 'HF_TOKEN' in env })
   if (env.FAKE_PULL_FAIL) { console.error(`${repo}: the hub's file tree is unreachable (ConnectionRefused)`); return 1 }
   const files = Number(env.FAKE_PULL_FILES ?? 3)
   const size = Number(env.FAKE_PULL_SIZE ?? 64 * 1024)
@@ -131,7 +131,15 @@ async function serveCommand(args) {
   if (graphFile && existsSync(graphFile)) graph = { ...graph, ...JSON.parse(readFileSync(graphFile, 'utf8')) }
   const saveGraph = () => { if (graphFile) writeFileSync(graphFile, JSON.stringify(graph), { mode: 0o600 }) }
   let learning = false
-  record({ kind: 'serve', args, pid: process.pid, hasKey: keys.length > 0, noUpdateCheck: env.TENSORFOLD_NO_UPDATE_CHECK ?? null, secretEnv: Object.keys(env).filter((k) => /API_KEY|TOKEN|SECRET/.test(k) && k !== 'TENSORFOLD_API_KEY') })
+  const cacheRoom = env.FAKE_PROMPT_CACHE_ROOM_GIB == null ? null : Number(env.FAKE_PROMPT_CACHE_ROOM_GIB)
+  const cacheArg = flag(args, '--prompt-cache-gib')
+  const requestedCache = cacheArg == null ? null : Number(cacheArg)
+  const promptCacheGiB = requestedCache ?? Math.min(16, cacheRoom ?? 16)
+  record({ kind: 'serve', args, promptCacheGiB, pid: process.pid, hasKey: keys.length > 0, noUpdateCheck: env.TENSORFOLD_NO_UPDATE_CHECK ?? null, secretEnv: Object.keys(env).filter((k) => /API_KEY|TOKEN|SECRET/.test(k) && k !== 'TENSORFOLD_API_KEY') })
+  if (cacheRoom != null && requestedCache != null && requestedCache > cacheRoom) {
+    console.error(`tensorfold: --prompt-cache-gib ${requestedCache} exceeds the ${cacheRoom} GiB left for kept states`)
+    process.exit(1)
+  }
   console.error(`[tensorfold] loading ${model}`)
   await sleep(Number(env.FAKE_SERVE_LOAD_MS ?? 50))
   if (env.FAKE_SERVE_FAIL) { console.error(`tensorfold: ${env.FAKE_SERVE_FAIL}`); process.exit(1) }

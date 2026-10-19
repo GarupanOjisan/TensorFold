@@ -16,12 +16,12 @@ const benchmark = @import("benchmark.zig");
 const checkpoint_cli = @import("checkpoint_cli");
 
 const usage_line = "usage: tensorfold serve [-h] [--host HOST] [--port PORT] [--name NAME] [--chat-template FILE]" ++
-    " [--alias ALIAS] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard]" ++
+    " [--alias ALIAS] [--allowed-host NAME] [--allowed-origin ORIGIN] [--api-key API_KEY] [--api-key-file API_KEY_FILE] [--metrics-open] [--dashboard]" ++
     " [--context CONTEXT] [--speed-up SETTINGS] [--prompt-cache-gib PROMPT_CACHE_GIB]" ++
     " [--prompt-cache-over-cap] [--learn] [--learn-dir LEARN_DIR] [--learn-gib LEARN_GIB]" ++
     " [--learn-conversations] [--learn-daily-gib LEARN_DAILY_GIB] [--recall] [--recall-dir RECALL_DIR]" ++
     " [--recall-gib RECALL_GIB] [--recall-read-only] [--max-tokens MAX_TOKENS]" ++
-    " [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P]" ++
+    " [--temperature TEMPERATURE] [--top-p TOP_P] [--top-k TOP_K] [--min-p MIN_P] [--prompt-seed]" ++
     " [--thinking | --no-thinking] [--reasoning-effort {low,medium,high,xhigh}]" ++
     " [--thinking-budget THINKING_BUDGET] [--loop-guard] [--no-drafts] [--drafter DRAFTER]" ++
     " [--drafter-bits {0,4}] [--record RECORD] [--keep-warm SECONDS] [--compact-at COMPACT_AT]" ++
@@ -64,11 +64,19 @@ pub fn main(init: std.process.Init) !u8 {
     log.init(io, false);
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "capabilities") and std.mem.eql(u8, argv[2], "--json")) {
         var out: std.Io.Writer.Allocating = .init(a);
-        try cli.capabilities(&out.writer, engines.capabilities(a));
+        var caps = engines.capabilities(a);
+        caps.optional_libraries = try @import("sys").optional_libraries.probe(a, io, @import("sys"));
+        try cli.capabilities(&out.writer, caps);
         try std.Io.File.stdout().writeStreamingAll(io, out.written());
         return 0;
     }
-    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "benchmark")) return benchmark.main(init, argv[2..], engines.capabilities(a));
+    if (argv.len >= 2 and std.mem.eql(u8, argv[1], "benchmark")) {
+        // the benchmark runs its serve child under POSIX signals and waits; Windows refuses it by name
+        if (comptime @import("builtin").os.tag == .windows) {
+            std.debug.print("tensorfold benchmark is not supported on Windows yet: run tensorfold serve and a client against it\n", .{});
+            return 2;
+        } else return benchmark.main(init, argv[2..], engines.capabilities(a));
+    }
     if (argv.len < 2 or !std.mem.eql(u8, argv[1], "serve")) {
         std.debug.print("usage: tensorfold-native capabilities --json | models | info MODEL | pull REPO[@REVISION] | slide rollback FOLDER | serve MODEL [flags] | benchmark MODEL [flags]\n", .{});
         return 2;
@@ -90,7 +98,10 @@ pub fn main(init: std.process.Init) !u8 {
     const dir = try hub.resolve(a, io, init.environ_map, args.model, &problem) orelse return fail(problem);
     // A drafter is named like a model: a directory, or a repo id `tensorfold pull` cached.
     if (args.drafter) |d| args.drafter = try hub.resolve(a, io, init.environ_map, d, &problem) orelse return fail(problem);
-    const model_type = modelType(a, io, dir);
+    const model_type = modelType(a, io, dir, &problem) catch |e| {
+        if (e == error.OutOfMemory) return e;
+        return fail(problem);
+    };
     // the model folder held while this process reads it, so a rollback refuses it: exclusive with --slide, else shared
     var unheld: []const u8 = "";
     const held = api.originals.serving(a, dir, args.slide, &unheld) catch |e| switch (e) {
@@ -114,7 +125,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer up.text.deinit();
     var record: ?*@import("engine_api").recall_store.Store = null;
     defer if (record) |r| r.close(); // after the engine below has stopped reading it
-    defer up.engine.close(up.engine.ctx);
+    var closer: Closer = .{ .opened = up.engine };
+    defer closer.closeOnce();
     const served = hub.servedName(args.name, args.model, dir);
     problem = "";
     record = recall_open.open(gpa, io, a, args, up.text, served, &problem) catch |e| {
@@ -123,6 +135,7 @@ pub fn main(init: std.process.Init) !u8 {
     if (record) |r| if (!up.engine.engine.attachRecall(r)) return fail(not_lanes);
     return serve.run(gpa, io, args, .{
         .engine = up.engine.engine,
+        .stop = .{ .ctx = &closer, .close = Closer.close, .halt = Closer.halt },
         .text = up.text.text(),
         .served = served,
         .recall = record,
@@ -154,9 +167,8 @@ fn fail(message: []const u8) u8 {
     return 1;
 }
 
-fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8) []const u8 {
-    const path = std.fs.path.join(a, &.{ dir, "config.json" }) catch return "unknown";
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(16 << 20)) catch return "unknown";
+fn modelType(a: std.mem.Allocator, io: std.Io, dir: []const u8, problem: *[]const u8) ![]const u8 {
+    const bytes = (try @import("checkpoint_config").read(a, io, dir, problem)) orelse return "unknown";
     const doc = std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{}) catch return "unknown";
     if (doc != .object) return "unknown";
     const t = doc.object.get("model_type") orelse return "unknown";
@@ -182,3 +194,23 @@ fn sampling(a: std.mem.Allocator, io: std.Io, dir: []const u8, args: cli.Args) !
     if (args.min_p) |t| try out.put(a, "min_p", .{ .float = t });
     return if (out.count() > 0) json.Value{ .object = out } else null;
 }
+
+const Closer = struct {
+    opened: api.Opened,
+    closed: bool = false,
+    fn closeOnce(c: *Closer) void {
+        if (c.closed) return;
+        c.closed = true;
+        c.opened.close(c.opened.ctx);
+    }
+    fn close(p: *anyopaque) void {
+        const c: *Closer = @ptrCast(@alignCast(p));
+        c.closeOnce();
+    }
+    fn halt(p: *anyopaque, reason: []const u8) void {
+        const c: *Closer = @ptrCast(@alignCast(p));
+        if (comptime @hasField(api.Opened, "halt")) {
+            if (c.opened.halt) |f| f(c.opened.ctx, reason);
+        }
+    }
+};

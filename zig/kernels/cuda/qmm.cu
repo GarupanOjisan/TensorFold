@@ -1,4 +1,4 @@
-// Device code of src/tensorfold/cuda/kernels/qmm.cu [v1.8] (lines 1-253, ATen includes dropped).
+// Device code of src/tensorfold/cuda/kernels/qmm.cu (lines 1-230, comments and ATen includes dropped).
 
 #include <algorithm>
 #include <cooperative_groups.h>
@@ -7,34 +7,16 @@
 
 #include "qmm_frag.cuh"
 
-// Lane matmul: acc = fma(xs, b, fma(P, s, acc)) per group in order, K slices set by shape, so no row affects another.
 namespace tf_qmm {
 
 using namespace qmm_frag;
-
-// Tile shapes: BM rows by BN columns a block, WM x WN warps, each warp (BM / WM) x (BN / WN).
-template <int GS, int BM, int BN, int WM, int WN, int STAGES>
-struct Tile {
-    static constexpr int THREADS = WM * WN * 32;
-    static constexpr int MT = BM / WM / 16;               // m16 tiles a warp
-    static constexpr int NT = BN / WN / 8;                // n8 tiles a warp
-    static constexpr int ROW = GS * 2;                    // bytes of one input row a group
-    static constexpr int CHUNKS = ROW / 16;
-    static constexpr int X = BM * ROW;                    // stage bytes: inputs,
-    static constexpr int W = BN * GS / 2;                 // weights,
-    static constexpr int S = BN * 2;                      // scales, biases (bf16),
-    static constexpr int XS = BM * 4;                     // and input sums (fp32)
-    static constexpr int STAGE = X + W + 2 * S + XS;
-    static constexpr int PARTIALS = MT * NT * 4 * THREADS * 4;   // a K slice's partial, parked for the cluster sum
-    static constexpr int SMEM = STAGES * STAGE > PARTIALS ? STAGES * STAGE : PARTIALS;
-};
 
 template <int GS, int BM, int BN, int WM, int WN, int STAGES, bool F32, bool CLUSTER, bool PIPE = false>
 __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
         const __nv_bfloat16* __restrict__ x, const float* __restrict__ xs, const uint32_t* __restrict__ w,
         const __nv_bfloat16* __restrict__ scales, const __nv_bfloat16* __restrict__ biases,
         void* __restrict__ out, float* __restrict__ part, int M, int N, int K, int SK, int npad, int ldx, int group) {
-    using T = Tile<GS, BM, BN, WM, WN, STAGES>;
+    using T = LaneTile<GS, BM, BN, WM, WN, STAGES>;
     extern __shared__ __align__(128) unsigned char buf[];
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int wm = warp / WN, wn = warp % WN;
@@ -43,7 +25,6 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
     const int m0 = at.x, n0 = at.y, slice = blockIdx.z, g0 = slice * per;
 
     auto stage = [&](int s) { return buf + s * T::STAGE; };
-    // one group's inputs, weights, scales, biases and input sums into stage s
     auto load = [&](int s, int g, int m0) {
         unsigned char* p = stage(s);
         for (int c = tid; c < BM * T::CHUNKS; c += T::THREADS) {
@@ -55,15 +36,9 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
         unsigned char* pw = p + T::X;
         constexpr int TILE_BYTES = 64 * GS / 2;           // one stored 64-column tile's group block
         for (int c = tid; c < T::W / 16; c += T::THREADS) {
-            if constexpr (BN >= 64) {
-                const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
-                const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
-                cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
-            } else {                                      // part of a stored tile: its n8 tiles are contiguous
-                const size_t tile = static_cast<size_t>(n0 / 64) * KG + g;
-                cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + (n0 % 64) * GS / 2 +
-                                  c * 16);
-            }
+            const int t = c / (TILE_BYTES / 16), off = c % (TILE_BYTES / 16);
+            const size_t tile = static_cast<size_t>(n0 / 64 + t) * KG + g;
+            cp16(pw + c * 16, reinterpret_cast<const unsigned char*>(w) + tile * TILE_BYTES + off * 16);
         }
         unsigned char* ps = pw + T::W;
         for (int c = tid; c < 2 * (T::S / 16); c += T::THREADS) {
@@ -84,7 +59,6 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
             for (int j = 0; j < T::NT; ++j)
 #pragma unroll
                 for (int e = 0; e < 4; ++e) acc[i][j][e] = 0.0f;
-        // acc = fma(xs, b, fma(p, s, acc)) per output, the order every row gets
         auto epilogue = [&](float (&acc_)[T::MT][T::NT][4], const float (&d_)[T::MT][T::NT][4],
                             const float (&s_)[T::NT][2], const float (&b_)[T::NT][2], const float (&x_)[T::MT][2]) {
 #pragma unroll
@@ -179,7 +153,6 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
 #if __CUDA_ARCH__ < 900
             __trap();                                     // no clusters before sm_90: the host never launches this
 #else
-            // K slices of a tile form a cluster: slice 0 adds peers' partials in slice order, as reduce_kernel does
             constexpr int E = T::MT * T::NT * 4;
             auto cluster = cooperative_groups::this_cluster();
             float* mine = reinterpret_cast<float*>(buf);
@@ -240,7 +213,6 @@ __global__ void __launch_bounds__(WM * WN * 32) qmm_kernel(
     }
 }
 
-// The K slices' partial sums added in slice order, then rounded once.
 template <bool F32>
 __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__ out, long long total, int SK) {
     const long long i = static_cast<long long>(blockIdx.x) * blockDim.x + threadIdx.x;
@@ -250,28 +222,9 @@ __global__ void reduce_kernel(const float* __restrict__ part, void* __restrict__
     if (F32) reinterpret_cast<float*>(out)[i] = acc;
     else reinterpret_cast<__nv_bfloat16*>(out)[i] = __float2bfloat16_rn(acc);
 }
-
 } // namespace tf_qmm
 
-// The instantiations a decode window launches (rows <= 16, groups of 64); notes/qmm.md#instantiations
-#define TF_QMM_INSTANTIATE(BN, WN, STAGES, F32, CLUSTER)                                                         \
-    template __global__ void tf_qmm::qmm_kernel<64, 16, BN, 1, WN, STAGES, F32, CLUSTER, false>(                \
-        const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, \
-        float*, int, int, int, int, int, int, int);
-#define TF_QMM_ALL(BN, WN, STAGES)                  \
-    TF_QMM_INSTANTIATE(BN, WN, STAGES, false, false) \
-    TF_QMM_INSTANTIATE(BN, WN, STAGES, false, true)  \
-    TF_QMM_INSTANTIATE(BN, WN, STAGES, true, false)  \
-    TF_QMM_INSTANTIATE(BN, WN, STAGES, true, true)
-TF_QMM_ALL(64, 4, 4)
-TF_QMM_ALL(128, 8, 4)
-TF_QMM_ALL(128, 4, 6)
-// A shared window of 17 to 32 rows on one 32-row tile (qmm.py bucket, qmm.cu dispatch case 32): each weight read once.
-#define TF_QMM32(F32, CLUSTER)                                                                                  \
-    template __global__ void tf_qmm::qmm_kernel<64, 32, 64, 1, 4, 4, F32, CLUSTER, false>(                     \
-        const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*, void*, \
-        float*, int, int, int, int, int, int, int);
-TF_QMM32(false, false)
-TF_QMM32(false, true)
-TF_QMM32(true, false)
-TF_QMM32(true, true)
+// Decode lane: groups of 32, 16 rows, 64 columns, one by four warps, four stages, bf16 out.
+template __global__ void tf_qmm::qmm_kernel<32, 16, 64, 1, 4, 4, false, false, false>(
+    const __nv_bfloat16*, const float*, const uint32_t*, const __nv_bfloat16*, const __nv_bfloat16*,
+    void*, float*, int, int, int, int, int, int, int);
