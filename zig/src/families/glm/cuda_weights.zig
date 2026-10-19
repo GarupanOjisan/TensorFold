@@ -45,6 +45,7 @@ pub const Weights = struct {
     head: u64 = 0, // bf16 [share.vocab][dims]
     mtp: ?Mtp = null,
     exl3_shx: bool = true, // EXL3: every layer's gate and up share one input rotation (a prompt rotates each row once)
+    exl3_half_bits: u32 = 0, // EXL3: every layer's trellis width (2 * bits), set by the first layer
     buffers: std.ArrayList(cuda.DeviceBuffer) = .empty,
     named: std.ArrayList(Named) = .empty,
 
@@ -360,6 +361,8 @@ const Loader = struct {
         if (c.exl3) { // the MTP layer's experts too
             x3 = try exl3.load(L, i, count, d, c.moe_inter, cut);
             if (!x3.?.shx) L.w.exl3_shx = false;
+            if (L.w.exl3_half_bits == 0) L.w.exl3_half_bits = x3.?.half_bits;
+            if (x3.?.half_bits != L.w.exl3_half_bits) return error.NotExl3Mcg4; // the scratch is sized for one width
         } else routed = try L.nvfp4Experts(i);
         const sh = L.w.share.shared;
         inline for (.{ "gate_proj", "up_proj" }) |x| try L.rows(try L.get("layers.{d}.mlp.shared_experts." ++ x ++ ".weight", .{i}), sh.lo, sh.hi, c.shared_inter, .bf16);

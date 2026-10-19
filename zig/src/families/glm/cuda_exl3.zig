@@ -1,4 +1,4 @@
-//! GLM-5.3-Flash's EXL3 routed experts on CUDA (Mia-AiLab's checkpoint: 4-bit mcg trellis experts, the rest bf16).
+//! GLM-5.3-Flash's EXL3 routed experts on CUDA (Mia-AiLab's checkpoint: 4-bit mcg trellis experts, the rest bf16; 3-bit experts too).
 
 const std = @import("std");
 const modelopt = @import("core").modelopt;
@@ -23,7 +23,7 @@ pub fn isExl3(gpa: std.mem.Allocator, config_json: []const u8) bool {
     return m == .string and std.mem.eql(u8, m.string, "exl3");
 }
 
-/// The EXL3 checkpoints the kernels read: 4-bit routed experts on the "mcg" codebook (everything else bf16).
+/// The EXL3 checkpoints the kernels read: 3- or 4-bit routed experts on the "mcg" codebook (everything else bf16).
 pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why) !void {
     const parsed = try std.json.parseFromSlice(std.json.Value, gpa, config_json, .{});
     defer parsed.deinit();
@@ -32,8 +32,13 @@ pub fn admit(gpa: std.mem.Allocator, config_json: []const u8, why: *modelopt.Why
         return error.UnsupportedQuant;
     };
     const bits = q.get("bits") orelse std.json.Value{ .null = {} };
-    if (bits != .integer or bits.integer != 4) {
-        why.set("EXL3 at {f} bits: the CUDA family reads 4-bit EXL3 experts", .{std.json.fmt(bits, .{})});
+    const whole: f64 = switch (bits) { // exllamav3 may write the width as a float
+        .integer => |n| @floatFromInt(n),
+        .float => |f| f,
+        else => 0,
+    };
+    if (whole != 3 and whole != 4) {
+        why.set("EXL3 at {f} bits: the CUDA family reads 3- and 4-bit EXL3 experts", .{std.json.fmt(bits, .{})});
         return error.UnsupportedQuant;
     }
     const book = q.get("codebook") orelse std.json.Value{ .null = {} };
@@ -55,10 +60,14 @@ pub const Experts = struct {
     suh_d: u64,
     svh_d: u64,
     k2: u64, // independent per-expert projection widths in the common module
+    half_bits: u32 = 8, // the width every trellis of the layer has (2 * bits: 8 at 4 bits, 6 at 3)
     shx: bool, // every expert's gate and up share one input rotation: a prompt rotates a row once, not once a pick
 };
 
-const tile = 128; // a 16 x 16 tile's bytes at 4 bits
+/// A 16 x 16 tile's bytes at `bits` (128 at 4 bits, 96 at 3).
+fn tileBytes(bits: usize) usize {
+    return 32 * bits;
+}
 
 /// Layer `i`'s EXL3 experts through `L` (cuda_weights' loader): gate, up by `cut`'s tile columns, down by its rows.
 pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Span) !Experts {
@@ -66,6 +75,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
     const width = cut.len();
     var out: Experts = undefined;
     out.shx = true;
+    var bits: usize = 0; // the first trellis's width; every other trellis of the layer must match it
     const Mat = struct { k: usize, n: usize, by_cols: bool };
     const mats = [_]Mat{
         .{ .k = dims, .n = inter, .by_cols = true },
@@ -78,7 +88,10 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
         const nt = (if (m.by_cols) width else m.n) / 16;
         for (0..count) |e| {
             const t = try L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".trellis", .{ i, e });
-            if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != m.k / 16 or t.dim(1) != m.n / 16 or t.dim(2) != 64) return error.NotExl3Mcg4;
+            if (t.dtype != .i16 or t.rank != 3 or t.dim(0) != m.k / 16 or t.dim(1) != m.n / 16) return error.NotExl3Mcg4;
+            if (bits == 0) bits = t.dim(2) / 16;
+            if ((bits != 3 and bits != 4) or t.dim(2) != 16 * bits) return error.NotExl3Mcg4;
+            const tile = tileBytes(bits);
             const marker = L.get("layers.{d}.mlp.experts.{d}." ++ proj ++ ".mcg", .{ i, e }) catch return error.NotExl3Mcg4;
             if (marker.dtype != .i32 or marker.numel() != 1 or marker.bytes.len != 4 or
                 std.mem.readInt(u32, marker.bytes[0..4], .little) != @import("core").exl3_load.markers[0].value)
@@ -90,7 +103,7 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
         }
         const base = try L.put("layers.{d}.moe.exl3." ++ tw, .{i});
         for (0..count) |e| {
-            const ptr = base + e * kt * nt * tile;
+            const ptr = base + e * kt * nt * tileBytes(bits);
             try L.host.appendSlice(L.gpa, std.mem.asBytes(&ptr));
         }
         @field(out, tw) = try L.put("layers.{d}.moe.exl3." ++ tw ++ "_ptrs", .{i});
@@ -114,10 +127,11 @@ pub fn load(L: anytype, i: u32, count: usize, dims: usize, inter: usize, cut: Sp
         @field(out, sv) = try L.put("layers.{d}.moe.exl3." ++ sv, .{i});
     }
     for (0..count) |_| {
-        const bits: i32 = 8;
-        try L.host.appendSlice(L.gpa, std.mem.asBytes(&bits));
+        const k2: i32 = @intCast(2 * bits);
+        try L.host.appendSlice(L.gpa, std.mem.asBytes(&k2));
     }
     out.k2 = try L.put("layers.{d}.moe.exl3.k2", .{i});
+    out.half_bits = @intCast(2 * bits);
     return out;
 }
 
@@ -129,10 +143,10 @@ pub const top_k = 8;
 /// Rows a call to the common experts takes: each call reads every expert's weights, so a prompt pass needs few calls.
 pub const chunk_rows = 1024;
 fn layer(w: Experts, count: usize, dims: usize, width: usize, limit: f32) common.Layer {
-    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = 8, .shared_input = w.shx };
+    return .{ .gate = w.gt, .up = w.ut, .down = w.dt, .gate_k2 = w.k2, .up_k2 = w.k2, .down_k2 = w.k2, .suh_g = w.suh_g, .suh_u = w.suh_u, .svh_g = w.svh_g, .svh_u = w.svh_u, .suh_d = w.suh_d, .svh_d = w.svh_d, .experts = count, .dims = dims, .width = width, .codebook = .mcg, .limit = limit, .act_mode = 0, .uniform_k2 = w.half_bits, .shared_input = w.shx };
 }
-fn shape(dims: usize, width: usize) common.Layer {
-    const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .shx = false };
+fn shape(dims: usize, width: usize, half_bits: u32) common.Layer {
+    const w: Experts = .{ .gt = 0, .ut = 0, .dt = 0, .k2 = 0, .half_bits = half_bits, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .shx = false };
     return layer(w, cuda.grouped.max_experts, dims, width, 0);
 }
 /// A chunk's compacted picks ahead of the common scratch, 256-aligned; the usize keeps @min from narrowing to u7.
@@ -140,12 +154,13 @@ fn picksBytes(rows: usize) usize {
     const cap: usize = @min(rows, chunk_rows);
     return std.mem.alignForward(usize, cap * top_k * 4, 256);
 }
-pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool) [4]usize {
+/// `half_bits`: the layers' trellis width (2 * bits); only 4-bit layers take the fused prompt path.
+pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool, half_bits: u32) [4]usize {
     const n: usize = @min(rows, chunk_rows);
-    var l = shape(dims, width);
+    var l = shape(dims, width, half_bits);
     l.shared_input = shx;
     if (prefill and common.prompt.eligible(l)) return .{ picksBytes(rows) + (common.prompt.bytes(l, n, top_k) catch unreachable), 4, 4, 4 };
-    return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width), n, top_k) catch unreachable), 4, 4, 4 };
+    return .{ picksBytes(rows) + (common.scratchBytes(shape(dims, width, half_bits), n, top_k) catch unreachable), 4, 4, 4 };
 }
 /// `height` rows of `width` bytes, `spitch` apart at `src`, to `dpitch` apart at `dst`, in one call.
 fn copyRows(stream: cuda.Stream, dst: u64, dpitch: usize, src: u64, spitch: usize, width: usize, height: usize, what: []const u8) !void {
@@ -177,7 +192,7 @@ pub fn run(k: *const Kernels, ek: *const experts.Kernels, stream: cuda.Stream, w
     }
 }
 
-test "EXL3 admission: Mia-AiLab's block passes; other widths and codebooks are refused by name" {
+test "EXL3 admission: Mia-AiLab's block and 3-bit experts pass; other widths and codebooks are refused by name" {
     const gpa = std.testing.allocator;
     const mia =
         \\{"quantization_config": {"quant_method": "exl3", "bits": 4, "codebook": "mcg", "head_bits": 16}}
@@ -187,8 +202,12 @@ test "EXL3 admission: Mia-AiLab's block passes; other widths and codebooks are r
     try admit(gpa, mia, &why);
     try std.testing.expect(!isExl3(gpa, "{\"quantization_config\": {\"quant_method\": \"modelopt\"}}"));
     try std.testing.expect(!isExl3(gpa, "{}"));
-    try std.testing.expectError(error.UnsupportedQuant, admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 3, \"codebook\": \"mcg\"}}", &why));
-    try std.testing.expectEqualStrings("EXL3 at 3 bits: the CUDA family reads 4-bit EXL3 experts", why.text());
+    try admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 3, \"codebook\": \"mcg\"}}", &why);
+    try admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 3.0, \"codebook\": \"mcg\"}}", &why);
+    try std.testing.expectError(error.UnsupportedQuant, admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 3.5, \"codebook\": \"mcg\"}}", &why));
+    try std.testing.expectEqualStrings("EXL3 at 3.5 bits: the CUDA family reads 3- and 4-bit EXL3 experts", why.text());
+    try std.testing.expectError(error.UnsupportedQuant, admit(gpa, "{\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 2, \"codebook\": \"mcg\"}}", &why));
+    try std.testing.expectEqualStrings("EXL3 at 2 bits: the CUDA family reads 3- and 4-bit EXL3 experts", why.text());
     try std.testing.expectError(error.UnsupportedQuant, admit(gpa, "{\"text_config\": {\"quantization_config\": {\"quant_method\": \"exl3\", \"bits\": 4, \"codebook\": \"mul1\"}}}", &why));
     try std.testing.expectEqualStrings("EXL3 codebook \"mul1\": the CUDA family reads \"mcg\"", why.text());
 }

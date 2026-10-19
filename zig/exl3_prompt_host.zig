@@ -85,10 +85,12 @@ test "exl3 prompt: dispatch rotates once per row only with verified shared scale
 }
 
 test "exl3 prompt: scratch omits global split partials and shared rotation storage is independent of pick count" {
-    const shared = glm.exl3.scratchBytes(1024, 512, 256, true, true)[0];
-    const separate = glm.exl3.scratchBytes(1024, 512, 256, true, false)[0];
-    const decode = glm.exl3.scratchBytes(1024, 512, 256, false, false)[0];
+    const shared = glm.exl3.scratchBytes(1024, 512, 256, true, true, 8)[0];
+    const separate = glm.exl3.scratchBytes(1024, 512, 256, true, false, 8)[0];
+    const decode = glm.exl3.scratchBytes(1024, 512, 256, false, false, 8)[0];
     try std.testing.expect(shared < separate and separate < decode);
+    // 3-bit layers skip the fused prompt path, so a prompt sizes the common grouped scratch, as decode does
+    try std.testing.expectEqual(glm.exl3.scratchBytes(1024, 512, 256, false, false, 6)[0], glm.exl3.scratchBytes(1024, 512, 256, true, true, 6)[0]);
     if (comptime @hasDecl(ex, "prompt")) {
         const l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = 9, .codebook = .mcg, .uniform_k2 = 8, .shared_input = true };
         const bytes = try ex.prompt.bytes(l, 1024, 8);

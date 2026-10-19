@@ -111,7 +111,7 @@ fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: S
         .rank = try r.zeros((if (wide) P else 1) * 4),
         .hist = try r.zeros((if (wide) (P + 1023) / 1024 * E else 1) * 4),
     };
-    const sz = glm.exl3.scratchBytes(rows, D, N, prompt, s.shx);
+    const sz = glm.exl3.scratchBytes(rows, D, N, prompt, s.shx, 8);
     const sc: glm.exl3.Scratch = .{ .picks = try r.zeros(sz[0]), .xg = try r.zeros(sz[1]), .xu = try r.zeros(sz[2]), .z = try r.zeros(sz[3]) };
     const ey = try r.zeros(rows * slots * D * 4);
     const xd = try r.zeros(P * N * 2);
