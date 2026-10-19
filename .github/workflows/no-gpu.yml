@@ -11,11 +11,11 @@ jobs:
   zig:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
       # zig build test is the host unit tests. No GPU. The Python suite is not this check.
@@ -45,9 +45,11 @@ jobs:
           python3 tools/zig/lean_new.py ../lean-base.txt ../lean-head.txt
   zig-windows:
     runs-on: windows-latest
+    # This fork: upstream's Windows build has failed since 1.1.0 (upstream's own runs too); report it without failing the check.
+    continue-on-error: true
     steps:
-      - uses: actions/checkout@v4
-      - uses: mlugg/setup-zig@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.17.0
       # The same host unit tests on Windows: the platform layer (zig/src/platform) over the UCRT, Win32 and Winsock.
