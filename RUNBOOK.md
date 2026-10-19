@@ -76,6 +76,12 @@ candidate output bit against the arithmetic decoder, but the independent FP64
 oracle samples at most two rows and three 128-column blocks. Its worst-column
 metrics are explicitly labelled `worst_sampled`; they are not whole-matrix bounds.
 
+Plain prefill windows of at least 32 rows share decoded weight tiles across four
+SIMDgroups when the pipeline supports 128 threads. Smaller windows, filtered
+routes and indexed experts keep the eight-row kernel. If the prefill pipeline
+is unavailable, the operator uses that existing path. The benchmark's arithmetic
+reference disables the optional prefill pipeline to keep its comparison valid.
+
 The borrowed-buffer API in `zig/src/core/exl3_projection.zig` encodes BF16
 inputs, FP16-rounded rotated inputs, compensated FP32 projection dots and BF16
 or F32 outputs. Scratch holds row intermediates, never a dequantized matrix.
@@ -123,6 +129,8 @@ The archives require glibc 2.28 or newer and an NVIDIA driver providing `libcuda
 CUDA serves Nemotron 3.5 Lightning, qualified on GB10 (`linux-aarch64`, greedy and sampled) and on Ampere cards with
 compute capability 8.6 (`linux-x86_64`, greedy: the RTX 30 series, RTX A6000, A10 and A40), and checked on an RTX PRO 6000 Blackwell (compute
 capability 12.0, `linux-x86_64`).
+Flash Next also serves on CUDA from its MLX 4-bit checkpoint, on the built-in kernels, run on a GB10: see
+[Flash Next on CUDA](docs/recipes/flash-next-cuda.md).
 
 On a GB10 arm64 host (an x86_64 host uses `linux-x86_64` in the same commands):
 
@@ -157,7 +165,24 @@ budget free for the next states.
 `TF_HEAT_HIGH` and `TF_HEAT_LOW`, in degrees Celsius and set together, make each prompt chunk wait while the hottest
 thermal zone (under `/sys/class/thermal`, or `TF_HEAT_ROOT`) is above the high band, until it is at or under the low one.
 The server logs `heat_wait_s`, a cancel ends the wait, and the reply's tokens do not change.
+On three GB10s serving GLM-5.3-Flash NVFP4 at TP=3, a 1,035,295-token prompt without the bands kept one host's hottest
+zone at 94 C or more for most of the prompt (97.7 C at the top); `TF_HEAT_HIGH=92` and `TF_HEAT_LOW=88` held all three
+at 93.0 C or under, and the first token came 10% later.
 Archives whose names contain `host-only` are CPU verification artifacts and cannot serve CUDA inference.
+
+### GB10 CPU pinning for long CUDA runs
+
+In [#1033](https://github.com/ashhart/TensorFold/issues/1033), @Bizuayeu reports two CPU threads spinning per CUDA rank,
+even between requests, heating the CPU during long reply runs. Pinning each rank to efficiency cores reduced that heat.
+
+Logical CPUs `0-4,10-14` are the Cortex-A725 efficiency cores, confirmed on two GB10 units. Verify the CPU layout (`lscpu -e`) on
+each host. Add `taskset -c 0-4,10-14` before each rank's existing native launch,
+or add `--cpuset-cpus=0-4,10-14` after `docker run` and before the image name in each rank's container launch.
+Keep the existing model, GPU, network and rank options.
+
+On GLM-5.3-Flash NVFP4, version 1.0.12 plus #1016-#1018, TP=2, with heat bands of 92/88 C, @Bizuayeu's pinned run
+completed 40/40 replies, peaking at 85.1 C; the unrestricted run stopped at the seventh reply at 94.7 C.
+Decode throughput fell 1.1% and prefill throughput 2.7%. These are the contributor's measurements, not 1.1.0 results.
 
 ## Flash Next and paired Metal serving
 

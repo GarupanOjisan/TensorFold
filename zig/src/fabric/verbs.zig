@@ -1,9 +1,10 @@
 //! The system's verbs library by dlopen (Apple's librdma, Linux libibverbs): every entry point resolved by name.
 const std = @import("std");
+const platform = @import("sys");
 const builtin = @import("builtin");
-const abi = @import("verbs_abi.zig");
+pub const abi = @import("verbs_abi.zig");
 
-pub const Error = error{ LibraryUnavailable, MissingSymbol, NoDeviceList, NoSuchDevice, VerbsFailed, BadDeviceList, NoUsableGid };
+pub const Error = platform.optional_libraries.Failure || error{ LibraryUnavailable, MissingSymbol, NoDeviceList, NoSuchDevice, VerbsFailed, BadDeviceList, NoUsableGid };
 pub const max_links = 8;
 
 /// Physical devices in bond order; a duplicate or empty component cannot name an independent link.
@@ -50,24 +51,28 @@ pub const Api = struct {
 /// Exported by rdma-core 34+ but not in every header; used only when present.
 const GidEx = *const fn (ctx: Ctx, port: u32, index: u32, entry: *abi.GidEntry, flags: u32, size: usize) callconv(.c) c_int;
 const InOrder = *const fn (qp: *abi.Qp, op: c_int, flags: u32) callconv(.c) c_int;
+/// ibv_query_qp: the QP's state as the device holds it (not every library exports it; used only when present).
+pub const QueryQp = *const fn (qp: *abi.Qp, attr: *abi.QpAttr, mask: c_int, init: *abi.QpInitAttr) callconv(.c) c_int;
 
 pub const Verbs = struct {
-    lib: std.DynLib,
+    lib: platform.DynLib,
     api: Api,
     gid_ex: ?GidEx = null,
     in_order: ?InOrder = null,
+    query_qp: ?QueryQp = null,
 
     pub fn open(path: ?[:0]const u8) Error!Verbs {
-        var lib = std.DynLib.openZ((path orelse default_path).ptr) catch return error.LibraryUnavailable;
+        var lib = platform.DynLib.openZ((path orelse default_path).ptr) catch return platform.optional_libraries.unavailable(.verbs);
         errdefer lib.close();
         var api: Api = undefined;
         const info = @typeInfo(Api).@"struct";
         inline for (info.field_names, info.field_types) |name, T| {
-            @field(api, name) = lib.lookup(T, name) orelse return error.MissingSymbol;
+            @field(api, name) = lib.lookup(T, name) orelse return platform.optional_libraries.unavailable(.verbs);
         }
         var v: Verbs = .{ .lib = lib, .api = api };
         v.gid_ex = v.lib.lookup(GidEx, "_ibv_query_gid_ex");
         v.in_order = v.lib.lookup(InOrder, "ibv_query_qp_data_in_order");
+        v.query_qp = v.lib.lookup(QueryQp, "ibv_query_qp");
         return v;
     }
 
@@ -195,7 +200,7 @@ test "a data-device GID scan skips zero entries and prefers link-local over an I
 }
 
 test "verbs smoke: open the device list and close it (TF_FABRIC_VERBS=1)" {
-    const flag = std.c.getenv("TF_FABRIC_VERBS") orelse return error.SkipZigTest;
+    const flag = platform.c.getenv("TF_FABRIC_VERBS") orelse return error.SkipZigTest;
     if (flag[0] != '1') return error.SkipZigTest;
     var v = Verbs.open(null) catch |err| {
         std.debug.print("verbs: {s} unavailable ({s})\n", .{ default_path, @errorName(err) });

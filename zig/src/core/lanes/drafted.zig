@@ -4,12 +4,15 @@ const Allocator = std.mem.Allocator;
 const be = @import("backend.zig");
 const Model = @import("config.zig").Model;
 const Stream = @import("stream.zig").Stream;
+const Held = @import("stream.zig").Held;
 const dr = @import("drafter.zig");
 
 /// What the wrapper knows of a drafting stream.
 const Lane = struct {
     rows: bool = false, // the drafter has absorbed the row before the next draft (it can draft)
     filler: u32 = 0, // drafts the next verify takes as fillers instead (a prompt restored whole: no row to draft from)
+    tree_first: ?u32 = null, // the first token of the grown tree read back this round, until a verify carries it
+    offered: u32 = 0, // the grown tree's nodes the last verify carried, told to the drafter with its kept rows
 };
 
 pub const Drafted = struct {
@@ -44,7 +47,7 @@ pub const Drafted = struct {
     }
 
     pub fn backend(x: *Drafted) be.Backend {
-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        return .{ .ptr = x, .first_before_draft = x.target.first_before_draft, .vtable = &.{ .prefill = prefill, .first = first, .first_masked = firstMasked, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .held = held, .probabilities = probabilities, .tree = tree, .release = release } };
     }
 
     /// The target's facts with the drafter's depth, step cost, prior, plain guard and batching; chains drafted late.
@@ -60,7 +63,15 @@ pub const Drafted = struct {
         m.plain_guard = d.plain_guard;
         m.draft_streams = d.batched;
         m.draft_probabilities = false;
-        m.head_trees = false;
+        m.head_trees = d.trees;
+        if (d.tree_nodes > 0) {
+            // the drafter grows its own trees, best first, and prices their nodes
+            m.drafts = @min(d.tree_nodes, if (target.exact_width > 1) target.exact_width - 1 else 0);
+            m.draft_probabilities = x.drafter.vtable.chances != null;
+            m.head_trees = false;
+        }
+        if (d.window_costs.len > 0) m.window_costs = d.window_costs;
+        if (d.lane_costs.len > 0) m.lane_costs = d.lane_costs;
         return m;
     }
 
@@ -76,6 +87,13 @@ pub const Drafted = struct {
     /// The target's prompt pass, then the drafter absorbs its rows but the last; a later failure releases both.
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
         const x = self(ptr);
+        if (s.drafts) if (x.target.vtable.prefill_features) |streamed| { // chunk by chunk: no whole prompt's taps held
+            try x.lanes.ensureUnusedCapacity(x.gpa, 1);
+            try x.drafter.open(s);
+            x.lanes.putAssumeCapacity(s, .{});
+            errdefer x.dropStream(s);
+            return streamed(x.target.ptr, s, x.drafter.taps(), .{ .ptr = x, .take = take });
+        };
         try x.target.prefill(s);
         if (!s.drafts) return;
         errdefer x.dropStream(s);
@@ -88,6 +106,17 @@ pub const Drafted = struct {
         const n: u32 = @intCast(ids.len - 1 - from);
         const f = try x.target.features(s, x.drafter.taps(), from, n);
         try x.drafter.absorb(&.{.{ .stream = s, .features = f, .start = from, .follow = ids[from + 1 ..] }});
+    }
+
+    /// A prompt chunk's rows but the prompt's last (absorbed with the first token, as `prefill` leaves it).
+    fn take(ptr: *anyopaque, s: *Stream, f: be.Features, start: u64) anyerror!void {
+        const x = self(ptr);
+        const ids = s.prompt();
+        const last = ids.len - 1;
+        if (start >= last) return;
+        var rows = f;
+        rows.rows = @intCast(@min(f.rows, last - start));
+        try x.drafter.absorb(&.{.{ .stream = s, .features = rows, .start = start, .follow = ids[@intCast(start + 1)..] }});
     }
 
     fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {
@@ -113,6 +142,12 @@ pub const Drafted = struct {
         const x = self(ptr);
         x.windows.clearRetainingCapacity();
         try x.windows.appendSlice(x.gpa, windows);
+        // a window carrying the stream's grown tree (allocation may keep only its first nodes): how many it offers
+        for (windows) |w| if (x.lanes.getPtr(w.stream)) |lane| {
+            const head = lane.tree_first orelse continue;
+            lane.offered = if (w.held == 0 and w.tokens.len > 0 and w.tokens[0] == head) @intCast(w.tokens.len) else 0;
+            lane.tree_first = null;
+        };
         var total: usize = 0;
         for (windows) |w| {
             if (w.held > 0 and w.tokens.len != 0) return error.MixedDrafts;
@@ -142,6 +177,17 @@ pub const Drafted = struct {
         return x.target.verify(x.windows.items, out);
     }
 
+    /// One stream's held drafts as host tokens for a grammar to walk (fillers: the pending token, kept for the verify).
+    fn held(ptr: *anyopaque, s: *Stream, out: []u32) anyerror!void {
+        const x = self(ptr);
+        const lane = x.lanes.getPtr(s) orelse return error.NotDrafting;
+        if (lane.filler > 0) {
+            @memset(out, s.pending.?);
+            return;
+        }
+        try x.drafter.held(&.{s}, &.{out});
+    }
+
     /// The target keeps from the windows it verified (host tokens): the round loop's, position for position.
     fn keep(ptr: *anyopaque, windows: []const be.Window, paths: []const []const u32) anyerror!void {
         const x = self(ptr);
@@ -157,15 +203,18 @@ pub const Drafted = struct {
         x.holds.clearRetainingCapacity();
         try x.firsts.resize(x.gpa, requests.len);
         for (requests, x.firsts.items) |r, *tok| {
-            if (r.lanes != null) return error.TreesNotBuilt;
+            if (r.lanes != null and !x.drafter.facts().trees) return error.TreesNotBuilt;
             const lane = x.lanes.getPtr(r.stream) orelse return error.NotDrafting;
             lane.filler = 0; // a new request supersedes fillers a copy round left unused
             var pending: u32 = undefined;
             if (r.rows) |rows| {
-                for (rows, 0..) |row, i| if (row != i) return error.TreesNotBuilt;
-                const n: u32 = @intCast(rows.len);
+                // a tree's kept path names the window's rows out of order: the features of all up to its last
+                var prefix = true;
+                for (rows, 0..) |row, i| prefix = prefix and row == i;
+                const n: u32 = @intCast(if (prefix) rows.len else rows[rows.len - 1] + 1);
                 const f = try x.target.features(r.stream, x.drafter.taps(), r.start, n);
-                try x.absorbs.append(x.gpa, .{ .stream = r.stream, .features = f, .start = r.start, .follow = r.follow[0..rows.len] });
+                try x.absorbs.append(x.gpa, .{ .stream = r.stream, .features = f, .start = r.start, .follow = r.follow[0..rows.len], .rows = if (prefix) null else rows, .offered = lane.offered });
+                lane.offered = 0;
                 pending = r.follow[rows.len - 1];
                 lane.rows = true;
             } else {
@@ -187,10 +236,27 @@ pub const Drafted = struct {
                 lane.filler = r.depth;
                 continue;
             }
-            try x.holds.append(x.gpa, .{ .stream = r.stream, .pending = pending, .position = r.position, .depth = r.depth });
+            try x.holds.append(x.gpa, .{ .stream = r.stream, .pending = pending, .position = r.position, .depth = r.depth, .lanes = r.lanes });
         }
         if (x.absorbs.items.len > 0) try x.drafter.absorb(x.absorbs.items);
         if (x.holds.items.len > 0) try x.drafter.hold(x.holds.items);
+    }
+
+    /// A drafter-grown tree's node chances (false: none, so the rule's per-depth rates price it).
+    fn probabilities(ptr: *anyopaque, s: *Stream, out: []f64) anyerror!bool {
+        const x = self(ptr);
+        if (!x.lanes.contains(s)) return false;
+        return x.drafter.chances(s, out);
+    }
+
+    /// A drafter-grown tree as host tokens and parents; null: the drafter holds a chain or nothing grown.
+    fn tree(ptr: *anyopaque, s: *Stream, gpa: Allocator) anyerror!?Held {
+        const x = self(ptr);
+        const lane = x.lanes.getPtr(s) orelse return null;
+        if (lane.filler > 0) return null;
+        const grown = try x.drafter.tree(s, gpa) orelse return null;
+        lane.tree_first = if (grown.tokens) |t| (if (t.len > 0) t[0] else null) else null;
+        return grown;
     }
 
     fn dropStream(x: *Drafted, s: *Stream) void {

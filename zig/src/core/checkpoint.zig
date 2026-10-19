@@ -60,11 +60,20 @@ pub const Checkpoint = struct {
     files: std.ArrayList(st.File) = .empty,
     used: std.StringHashMapUnmanaged(void) = .empty,
 
+    /// Prepended to the names get, has and skip take ("language_model." for Bolt's LM beside its vision tower).
+    scope: []const u8 = "",
+
+    fn scoped(self: *const Checkpoint, buf: *[320]u8, name: []const u8) ![]const u8 {
+        if (self.scope.len == 0) return name;
+        return std.fmt.bufPrint(buf, "{s}{s}", .{ self.scope, name });
+    }
+
     /// Every shard of `dir`, mapped.
     pub fn openModel(gpa: std.mem.Allocator, io: Io, dir: []const u8) !Checkpoint {
         return openModelPrefix(gpa, io, dir, null);
     }
     pub fn openModelPrefix(gpa: std.mem.Allocator, io: Io, dir: []const u8, prefix: ?[]const u8) !Checkpoint {
+        try @import("save_guard").check(io, dir);
         const paths = try shardFiles(gpa, io, dir);
         defer freeShardFiles(gpa, paths);
         var ck: Checkpoint = .{ .gpa = gpa, .io = io };
@@ -90,7 +99,9 @@ pub const Checkpoint = struct {
     }
 
     /// The tensor named `name`, marked as used; a missing name is an error naming it.
-    pub fn get(self: *Checkpoint, name: []const u8) !Tensor {
+    pub fn get(self: *Checkpoint, short: []const u8) !Tensor {
+        var buf: [320]u8 = undefined;
+        const name = try self.scoped(&buf, short);
         for (self.files.items) |*f| if (f.get(name)) |t| {
             try self.used.put(self.gpa, f.names.getKey(name).?, {});
             return t;
@@ -110,13 +121,17 @@ pub const Checkpoint = struct {
     }
 
     /// Whether any file holds `name` (it is not marked as used).
-    pub fn has(self: *const Checkpoint, name: []const u8) bool {
+    pub fn has(self: *const Checkpoint, short: []const u8) bool {
+        var buf: [320]u8 = undefined;
+        const name = self.scoped(&buf, short) catch return false;
         for (self.files.items) |*f| if (f.get(name) != null) return true;
         return false;
     }
 
     /// Marks every name starting with `prefix` as used: a part the loader leaves out on purpose.
-    pub fn skip(self: *Checkpoint, prefix: []const u8) !void {
+    pub fn skip(self: *Checkpoint, short: []const u8) !void {
+        var buf: [320]u8 = undefined;
+        const prefix = try self.scoped(&buf, short);
         for (self.files.items) |*f| for (f.names.keys()) |k| {
             if (std.mem.startsWith(u8, k, prefix)) try self.used.put(self.gpa, k, {});
         };
@@ -308,4 +323,22 @@ test "release keeps a map that fell back to reads (no mmap): its heap copy is th
     const t = try ck.get("x");
     ck.release();
     try std.testing.expectEqualSlices(u8, image[image.len - n ..], t.bytes);
+}
+
+test "Save recovery: an unresolved partial save refuses actual checkpoint reopening" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const image = try testImage(a, "probe", 32);
+    defer a.free(image);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = image });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".tensorfold-save-pending", .data = "unfinished" });
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    if (Checkpoint.openModel(a, io, dir)) |opened| {
+        var ck = opened;
+        ck.close();
+        return error.UncertainCheckpointReopened;
+    } else |err| try std.testing.expectEqual(error.CheckpointSaveUncertain, err);
 }

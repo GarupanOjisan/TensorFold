@@ -20,6 +20,8 @@ test "parse and capabilities share the table" {
     try std.testing.expectEqual(@as(u8, 0), (try parse(a, &.{ "m", "--drafter-bits", "0" }, &u)).drafter_bits);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter-bits", "8" }, &u));
     try std.testing.expectEqualStrings("/r", (try parse(a, &.{ "m", "--record", "/r" }, &u)).record.?);
+    try std.testing.expectEqualStrings("fp8", (try parse(a, &.{ "m", "--kv-cache", "fp8" }, &u)).kv_cache);
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--kv-cache", "int4" }, &u));
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--reasoning-effort", "max" }, &u));
     try std.testing.expectEqual(@as(?f64, 12.5), (try parse(a, &.{ "m", "--prompt-cache-gib", "12.5" }, &u)).prompt_cache_gib);
     try std.testing.expectEqual(@as(?f64, 0), (try parse(a, &.{ "m", "--prompt-cache-gib", "0" }, &u)).prompt_cache_gib);
@@ -97,4 +99,23 @@ test "an engine is asked for what the flags say, and the defaults of the flags n
     try std.testing.expectEqual(@as(?f64, 0.5), gpu.mtp_confidence);
     try std.testing.expectEqual(@as(?i64, 3), gpu.keep);
     try std.testing.expectEqualStrings("matrix=off", gpu.policy);
+}
+
+test "runtime library: capabilities serializes found and missing dependencies with escaped descriptions" {
+    const libs = @import("sys").optional_libraries;
+    const specs = [_]libs.Spec{ libs.spec(.nccl), libs.spec(.cublaslt) };
+    var rows: [2]libs.Status = undefined;
+    for (specs, &rows, 0..) |s, *row, i| row.* = .{ .name = s.name, .feature = s.feature, .soname = s.names[0], .found = i == 0, .install = s.install };
+    rows[1].install = "install the \"runtime\"";
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try capabilities(&out.writer, .{ .version = "test", .optional_libraries = &rows });
+    const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.written(), .{});
+    defer parsed.deinit();
+    const values = parsed.value.object.get("optional_libraries").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), values.len);
+    try std.testing.expect(values[0].object.get("found").?.bool);
+    try std.testing.expect(!values[1].object.get("found").?.bool);
+    try std.testing.expectEqualStrings("libnccl.so.2", values[0].object.get("soname").?.string);
+    try std.testing.expectEqualStrings(rows[1].install, values[1].object.get("install").?.string);
 }

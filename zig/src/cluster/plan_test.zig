@@ -1,5 +1,6 @@
 //! Kimi K3 on four 512 GiB M3 Ultras: the default layout, layouts from a config, determinism, and refusals.
 const std = @import("std");
+const platform = @import("sys");
 const node = @import("node.zig");
 const model = @import("model.zig");
 const estimate = @import("estimate.zig");
@@ -13,7 +14,7 @@ pub fn studio(i: usize, memory: u64, wired_mb: u64) node.Inventory {
     var buf: [16]u8 = undefined;
     return .{
         .id = 1000 + i,
-        .name = .of(std.fmt.bufPrint(&buf, "studio{d}", .{i + 1}) catch unreachable),
+        .name = .of(std.fmt.bufPrint(&buf, "node-{c}", .{@as(u8, 'a') + @as(u8, @intCast(i))}) catch unreachable),
         .chip = .of("Apple M3 Ultra"),
         .gpu_cores = 80,
         .memory = memory,
@@ -34,7 +35,7 @@ pub fn k3(a: std.mem.Allocator) !checkpoint.Checkpoint {
         const size: u64 = if (i == 0) 2_341_216_112 else if (i < s.layers) (if (kda) 16_990_911_504 else 16_567_501_776) else if (i == s.layers) 4_697_664_072 else if (i == s.layers + 1) 92_289_328 else 802_448_352;
         f.* = .{ .name = try std.fmt.allocPrint(a, "model-{d:0>5}-of-{d:0>6}.safetensors", .{ i + 1, s.layers + 3 }), .size = size };
     }
-    if (std.testing.environ.getPosix("TF_K3_DIR")) |dir| {
+    if (platform.getenv("TF_K3_DIR")) |dir| {
         const text = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, try std.fs.path.join(a, &.{ dir, "files.tsv" }), a, .limited(1 << 20));
         files = try estimate.manifest(a, text);
     }

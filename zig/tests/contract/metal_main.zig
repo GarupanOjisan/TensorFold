@@ -8,18 +8,26 @@ const affine_k = @import("metal_affine.zig");
 const topk_k = @import("metal_topk.zig");
 const tile_k = @import("metal_tile.zig");
 const limits_k = @import("metal_limits.zig");
+const h3_k = @import("metal_h3.zig");
+const h3_topk = @import("metal_h3_topk.zig");
+const drama3_k = @import("metal_drama3.zig");
 
+const flash_pool = @import("metal_flashnext_pool.zig");
+const flash = @import("metal_flashnext.zig");
+const gemma = @import("metal_gemma4.zig");
+const gemma_embed = @import("metal_gemma4_embed.zig");
+const gemma_mixed = @import("metal_gemma4_mixed.zig");
 const g = contract.gates;
-const usage = "usage: tf-kernel-contract [--only TEXT] [--no-gates] [--no-limits] [--offline DIR] [--seed N] [--repro]";
+const usage = "usage: tf-kernel-contract [--only TEXT] [--no-gates] [--no-limits] [--offline DIR] [--seed N] [--repro] [--rotary-long] [--rotary-accuracy FILE]";
 
-const Opts = struct { only: ?[]const u8 = null, gates: bool = true, limits: bool = true, offline: ?[]const u8 = null, seed: u64 = 0x6b63, repro: bool = false };
+const Opts = struct { only: ?[]const u8 = null, gates: bool = true, limits: bool = true, offline: ?[]const u8 = null, seed: u64 = 0x6b63, repro: bool = false, rotary_long: bool = false, rotary_accuracy: ?[]const u8 = null };
 
 fn parse(args: []const [:0]const u8) !Opts {
     var o = Opts{};
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         const a = args[i];
-        if (std.mem.eql(u8, a, "--repro")) o.repro = true else if (std.mem.eql(u8, a, "--no-gates")) o.gates = false else if (std.mem.eql(u8, a, "--no-limits")) o.limits = false else if (i + 1 < args.len and std.mem.eql(u8, a, "--only")) {
+        if (std.mem.eql(u8, a, "--rotary-long")) o.rotary_long = true else if (std.mem.eql(u8, a, "--repro")) o.repro = true else if (std.mem.eql(u8, a, "--no-gates")) o.gates = false else if (std.mem.eql(u8, a, "--no-limits")) o.limits = false else if (i + 1 < args.len and std.mem.eql(u8, a, "--only")) {
             i += 1;
             o.only = args[i];
         } else if (i + 1 < args.len and std.mem.eql(u8, a, "--offline")) {
@@ -28,6 +36,9 @@ fn parse(args: []const [:0]const u8) !Opts {
         } else if (i + 1 < args.len and std.mem.eql(u8, a, "--seed")) {
             i += 1;
             o.seed = try std.fmt.parseInt(u64, args[i], 0);
+        } else if (i + 1 < args.len and std.mem.eql(u8, a, "--rotary-accuracy")) {
+            i += 1;
+            o.rotary_accuracy = args[i];
         } else {
             std.debug.print("{s}\n", .{usage});
             return error.Usage;
@@ -71,10 +82,24 @@ pub fn main(init: std.process.Init) !u8 {
     const a = std.heap.page_allocator;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     const o = parse(args) catch return 2;
+    if (o.rotary_long) std.debug.print("MODE rotary-long: FP64 references through position 1048639; pooling ends at the allocation limit\n", .{});
     const pool = mtl.objc.Pool.push();
     defer pool.pop();
     const device = try mtl.Device.init();
     defer device.deinit();
+    var receipt: ?std.json.Parsed(tf.flashnext_vision_contract.rotary_accuracy.Receipt) = null;
+    defer if (receipt) |*value| value.deinit();
+    var needs_receipt = false;
+    for (std.enums.values(tf.flashnext_vision_contract.Which)) |w| {
+        if (w != .mask and (wanted(o, tf.flashnext_vision_contract.name(w, false)) or wanted(o, tf.flashnext_vision_contract.name(w, true)))) needs_receipt = true;
+    }
+    if (o.gates and needs_receipt) {
+        const deployment = @import("rotary_deployment.zig");
+        receipt = deployment.load(a, init.io, o.rotary_accuracy, try deployment.current(a, init.io, device)) catch |err| {
+            std.debug.print("rotary probes refuse this deployment: run tf-rotary-sweep and pass --rotary-accuracy FILE ({s})\n", .{@errorName(err)});
+            return err;
+        };
+    }
     const queue = try device.queue();
     defer queue.deinit();
     const tensor = device.tensorUnits();
@@ -83,7 +108,43 @@ pub fn main(init: std.process.Init) !u8 {
         try @import("metal_repro.zig").affineInf(a, device, queue);
         return 0;
     }
+    if (o.gates) try @import("metal_delta_slots.zig").run(a, device, queue, o.only, o.seed);
+    try gemma.requireComplete(gemma.entries);
+    var gemma_list: std.ArrayList(*gemma.Probe) = .empty;
+    defer {
+        for (gemma_list.items) |p| {
+            p.deinit();
+            a.destroy(p);
+        }
+        gemma_list.deinit(a);
+    }
     var kernels: std.ArrayList(g.Kernel) = .empty;
+    for (gemma.all_entries) |v| {
+        if (!wanted(o, v.name)) continue;
+        if (!tensor) {
+            std.debug.print("UNSUPPORTED {s}: tensor units required; Gemma coverage unchecked\n", .{v.name});
+            return error.TensorUnitsRequired;
+        }
+        try gemma.append(a, device, queue, v, false, &gemma_list, &kernels);
+        if (v.geo.hidden == 5376 and (v.kind != 1 or std.mem.endsWith(u8, v.name, "sliding"))) {
+            try gemma.append(a, device, queue, v, true, &gemma_list, &kernels);
+        }
+    }
+    var embeddings: [24]gemma_embed.Probe = undefined;
+    var embed_made: usize = 0;
+    defer for (embeddings[0..embed_made]) |*p| p.deinit();
+    for (gemma_embed.entries) |v| {
+        if (!wanted(o, v.name)) continue;
+        embeddings[embed_made] = try gemma_embed.Probe.init(a, device, queue, v);
+        embed_made += 1;
+    }
+    for (embeddings[0..embed_made]) |*p| try kernels.append(a, p.kernel());
+    var mixed = gemma_mixed.Probe.init(a, device, queue);
+    defer mixed.deinit();
+    if (wanted(o, mixed.kernel().spec.name)) {
+        if (!tensor) return error.TensorUnitsRequired;
+        try kernels.append(a, mixed.kernel());
+    }
     var rows_list: std.ArrayList(*rows_k.Row) = .empty;
     var proj_list: std.ArrayList(*affine_k.Proj) = .empty;
     defer for (rows_list.items) |r| r.deinit();
@@ -94,6 +155,36 @@ pub fn main(init: std.process.Init) !u8 {
         r.* = try rows_k.Row.init(a, device, queue, w);
         try rows_list.append(a, r);
         try kernels.append(a, r.kernel());
+    }
+    var flash_list: [8]flash.Probe = undefined;
+    var flash_made: usize = 0;
+    defer for (flash_list[0..flash_made]) |*probe| probe.deinit();
+    var pool_list: [4]flash_pool.Probe = undefined;
+    var pool_made: usize = 0;
+    defer for (pool_list[0..pool_made]) |*probe| probe.deinit();
+    for (std.enums.values(tf.flashnext_vision_contract.Which)) |w| for ([_]f64{ 0, 4 }) |factor| {
+        if ((w == .mask and factor != 0) or !wanted(o, tf.flashnext_vision_contract.name(w, factor > 1))) continue;
+        if (tf.flashnext_vision_contract.isPool(w)) {
+            pool_list[pool_made] = try flash_pool.Probe.init(a, device, queue, w);
+            pool_list[pool_made].factor = factor;
+            pool_list[pool_made].long_positions = o.rotary_long;
+            pool_list[pool_made].accuracy = if (receipt) |*value| &value.value else null;
+            pool_made += 1;
+            try kernels.append(a, pool_list[pool_made - 1].kernel());
+        } else {
+            flash_list[flash_made] = try flash.Probe.init(a, device, queue, w);
+            flash_list[flash_made].factor = factor;
+            flash_list[flash_made].long_positions = o.rotary_long;
+            flash_list[flash_made].accuracy = if (receipt) |*value| &value.value else null;
+            flash_made += 1;
+            try kernels.append(a, flash_list[flash_made - 1].kernel());
+        }
+    };
+    var d3norm: ?drama3_k.Norm = null;
+    defer if (d3norm) |*n| n.deinit();
+    if (wanted(o, drama3_k.spec().name)) {
+        d3norm = try drama3_k.Norm.init(a, device, queue);
+        try kernels.append(a, d3norm.?.kernel());
     }
     var topk: ?topk_k.TopK = null;
     defer if (topk) |*t| t.deinit();
@@ -108,6 +199,21 @@ pub fn main(init: std.process.Init) !u8 {
         try proj_list.append(a, p);
         try kernels.append(a, p.kernel());
     };
+    var h3_list: std.ArrayList(*h3_k.H3) = .empty;
+    defer for (h3_list.items) |x| x.deinit();
+    if (tensor) for (std.enums.values(h3_k.Which)) |w| {
+        if (!wanted(o, h3_k.spec(w).name)) continue;
+        const x = try a.create(h3_k.H3);
+        x.* = try h3_k.H3.init(a, device, queue, w);
+        try h3_list.append(a, x);
+        try kernels.append(a, x.kernel());
+    };
+    var h3_top: ?h3_topk.TopK = null;
+    defer if (h3_top) |*x| x.deinit();
+    if (wanted(o, h3_topk.spec().name)) {
+        h3_top = try h3_topk.TopK.init(a, device, queue);
+        try kernels.append(a, h3_top.?.kernel());
+    }
     var tile_p = try tf.tile_qmm.Pipelines.load(device);
     defer tile_p.deinit();
     var tiles: [2 * tf.tile_qmm.bit_widths.len]tile_k.Tile = undefined;
@@ -122,10 +228,18 @@ pub fn main(init: std.process.Init) !u8 {
     for (tiles[0..ntiles]) |*x| try kernels.append(a, x.kernel());
     var t: g.Tally = .{};
     const t0 = std.Io.Clock.awake.now(init.io);
-    if (o.gates) try g.runAll(a, kernels.items, o.seed, &t);
+    if (o.gates) {
+        try g.runAll(a, kernels.items, o.seed, &t);
+        for (flash_list[0..flash_made]) |*probe| try probe.rowCountInvariant();
+    }
     const t1 = std.Io.Clock.awake.now(init.io);
     var lim: usize = 0;
-    if (o.limits) lim = try limits_k.gate(a, init.io, device, o.offline);
+    if (o.limits) {
+        lim = try limits_k.gate(a, init.io, device, o.offline);
+        lim += try gemma.limits(a, device, o.only);
+        lim += try gemma_embed.limits(a, device, o.only);
+        lim += try gemma_mixed.limits(a, device, o.only);
+    }
     const t2 = std.Io.Clock.awake.now(init.io);
     const ms = struct {
         fn of(x: std.Io.Timestamp, y: std.Io.Timestamp) i64 {

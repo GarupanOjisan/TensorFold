@@ -1,6 +1,7 @@
 //! API keys held as SHA-256 digests with labels; a restricted key file reread on change or SIGHUP.
 const std = @import("std");
-const posix = std.posix;
+const platform = @import("sys");
+const posix = platform.posix;
 const builtin = @import("builtin");
 const log = @import("log.zig");
 const Allocator = std.mem.Allocator;
@@ -84,11 +85,11 @@ pub const Store = struct {
         const path = s.path.?;
         const pathz = try s.gpa.dupeSentinel(u8, path, 0);
         defer s.gpa.free(pathz);
-        const fd = posix.openatZ(posix.AT.FDCWD, pathz, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true }, 0) catch return error.Unsafe;
-        defer _ = posix.system.close(fd);
+        const fd = openKeys(pathz) catch return error.Unsafe;
+        defer _ = platform.c.close(fd);
         const st = meta(fd, null) orelse return error.Unsafe;
-        if ((st.mode & posix.S.IFMT) != posix.S.IFREG or st.mode & 0o044 != 0) {
-            problem.* = "API key file must be a regular file unreadable by other users; use chmod 600";
+        if ((st.mode & platform.c.S.IFMT) != platform.c.S.IFREG or st.mode & 0o066 != 0) {
+            problem.* = "API key file must be a regular file unreadable and unwritable by other users; use chmod 600";
             return error.Invalid;
         }
         if (st.size > 1 << 20) {
@@ -101,7 +102,7 @@ pub const Store = struct {
         const text = try a.alloc(u8, (1 << 20) + 1);
         var got: usize = 0;
         while (got < text.len) {
-            const n = posix.read(fd, text[got..]) catch return error.Unsafe;
+            const n = readKeys(fd, text[got..]) catch return error.Unsafe;
             if (n == 0) break;
             got += n;
         }
@@ -233,15 +234,12 @@ fn isSpace(cp: u21) bool {
     };
 }
 
-/// The paths only a key opens (``auth_http.gated``).
+/// Every route needs a key except the explicit public page, health and opened metrics paths.
 pub fn gated(raw_path: []const u8, metrics_open: bool) bool {
     const path = routePath(raw_path);
+    if (path.len == 0 or std.mem.eql(u8, path, "/health") or std.mem.eql(u8, path, "/slide") or publicAsset(path)) return false;
     if (metrics_open and (std.mem.eql(u8, path, "/metrics") or std.mem.eql(u8, path, "/v1/metrics"))) return false;
-    if (std.mem.eql(u8, path, "/v1") or std.mem.startsWith(u8, path, "/v1/")) return true;
-    for ([_][]const u8{ "/metrics", "/dashboard", "/stats", "/memory", "/tokenize", "/detokenize", "/models", "/messages", "/messages/count_tokens", "/chat/completions", "/completions", "/decisions", "/responses" }) |p| if (std.mem.eql(u8, path, p)) return true;
-    if (std.mem.startsWith(u8, path, "/responses/")) return true;
-    for ([_][]const u8{ "/chat/completions", "/completions", "/decisions", "/models" }) |end| if (std.mem.endsWith(u8, path, end)) return true;
-    return false;
+    return true;
 }
 
 /// A request path without its query and trailing slashes.
@@ -254,9 +252,13 @@ pub fn routePath(raw: []const u8) []const u8 {
 pub fn loopback(host: []const u8) bool {
     if (std.ascii.eqlIgnoreCase(host, "localhost")) return true;
     const ip = std.Io.net.IpAddress.parse(host, 0) catch return false;
+    return loopbackAddress(ip);
+}
+
+pub fn loopbackAddress(ip: std.Io.net.IpAddress) bool {
     return switch (ip) {
         .ip4 => |v4| v4.bytes[0] == 127,
-        .ip6 => |v6| std.mem.eql(u8, &v6.bytes, &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }),
+        .ip6 => |v6| std.mem.eql(u8, &v6.bytes, &[16]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }) or (std.mem.eql(u8, v6.bytes[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255 }) and v6.bytes[12] == 127),
     };
 }
 
@@ -297,7 +299,7 @@ test "auth cleanup on every initialization allocation failure" {
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "keys", .data = "ops: sk-file\nsk-unlabelled\n" });
     const path = try std.fmt.allocPrintSentinel(gpa, ".zig-cache/tmp/{s}/keys", .{tmp.sub_path}, 0);
     defer gpa.free(path);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(posix.AT.FDCWD, path, 0o600, 0));
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.fchmodat(posix.AT.FDCWD, path, 0o600, 0));
     const Case = struct {
         fn run(a: Allocator, file: ?[]const u8) !void {
             var problem: []const u8 = "";
@@ -311,6 +313,19 @@ test "auth cleanup on every initialization allocation failure" {
     try std.testing.checkAllAllocationFailures(gpa, Case.run, .{@as(?[]const u8, path)});
 }
 
+/// The key file opened for reading, never through a link.
+fn openKeys(pathz: [*:0]const u8) !platform.c.fd_t {
+    if (builtin.os.tag != .windows) return posix.openatZ(posix.AT.FDCWD, pathz, .{ .ACCMODE = .RDONLY, .NOFOLLOW = true, .NONBLOCK = true }, 0);
+    const fd = platform.c.open(pathz, .{ .ACCMODE = .RDONLY });
+    return if (fd < 0) error.OpenFailed else fd;
+}
+
+fn readKeys(fd: platform.c.fd_t, buf: []u8) !usize {
+    if (builtin.os.tag != .windows) return posix.read(fd, buf);
+    const n = platform.c.read(fd, buf.ptr, buf.len);
+    return if (n < 0) error.ReadFailed else @intCast(n);
+}
+
 /// A file's type and permission bits, size, identity and mtime: statx on Linux (its libc has no stat), stat elsewhere.
 const Meta = struct { mode: u32, size: u64, dev: u64, ino: u64, mtime_ns: i128 };
 
@@ -320,10 +335,22 @@ fn meta(fd: posix.fd_t, path: ?[*:0]const u8) ?Meta {
         const linux = std.os.linux;
         var sx: linux.Statx = undefined;
         const want: linux.STATX = .{ .TYPE = true, .MODE = true, .INO = true, .SIZE = true, .MTIME = true };
-        const rc = if (path) |p| std.c.statx(posix.AT.FDCWD, p, 0, want, &sx) else std.c.statx(fd, "", 0x1000, want, &sx); // AT_EMPTY_PATH
+        const rc = if (path) |p| platform.c.statx(posix.AT.FDCWD, p, 0, want, &sx) else platform.c.statx(fd, "", 0x1000, want, &sx); // AT_EMPTY_PATH
         if (rc != 0) return null;
         const dev = (@as(u64, sx.dev_major) << 32) | sx.dev_minor;
         return .{ .mode = sx.mode, .size = sx.size, .dev = dev, .ino = sx.ino, .mtime_ns = @as(i128, sx.mtime.sec) * std.time.ns_per_s + sx.mtime.nsec };
+    }
+    if (builtin.os.tag == .windows) {
+        // NTFS keeps access in ACLs, not mode bits: the type and size are checked, and the profile's ACL is the guard
+        var st: platform.c.Stat = undefined;
+        const f = if (path) |p| platform.c.open(p, .{ .ACCMODE = .RDONLY }) else fd;
+        if (f < 0) return null;
+        defer if (path != null) {
+            _ = platform.c.close(f);
+        };
+        if (platform.c.fstat(f, &st) != 0) return null;
+        const t = st.mtime();
+        return .{ .mode = (st.mode & platform.c.S.IFMT) | 0o600, .size = @intCast(st.size), .dev = st.dev, .ino = st.ino, .mtime_ns = @as(i128, t.nsec) + @as(i128, t.sec) * std.time.ns_per_s };
     }
     var st: posix.Stat = undefined;
     const rc = if (path) |p| posix.system.stat(p, &st) else posix.system.fstat(fd, &st);
@@ -333,6 +360,7 @@ fn meta(fd: posix.fd_t, path: ?[*:0]const u8) ?Meta {
 }
 
 test "the key file: refused while others can read it, read at 0600, reread after an edit" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // refusal by mode bits; NTFS keeps access in ACLs
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -341,11 +369,15 @@ test "the key file: refused while others can read it, read at 0600, reread after
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "keys", .data = "ops: sk-one\n" });
     const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/keys", .{tmp.sub_path}, 0);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(posix.AT.FDCWD, path, 0o644, 0));
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.fchmodat(posix.AT.FDCWD, path, 0o644, 0));
     var problem: []const u8 = "";
     try std.testing.expectError(error.KeyFile, Store.init(a, &.{}, "", path, false, &problem));
     try std.testing.expect(std.mem.indexOf(u8, problem, "chmod 600") != null);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(posix.AT.FDCWD, path, 0o600, 0));
+    for ([_]platform.c.mode_t{ 0o620, 0o602, 0o622 }) |mode| {
+        try std.testing.expectEqual(@as(c_int, 0), platform.c.fchmodat(posix.AT.FDCWD, path, mode, 0));
+        try std.testing.expectError(error.KeyFile, Store.init(a, &.{}, "", path, false, &problem));
+    }
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.fchmodat(posix.AT.FDCWD, path, 0o600, 0));
     var s = try Store.init(std.testing.allocator, &.{"sk-cli"}, "sk-env", path, false, &problem);
     defer s.deinit();
     try std.testing.expectEqualStrings("cli-1", s.match(a, "Bearer sk-cli", null).?);
@@ -361,6 +393,7 @@ test "the key file: refused while others can read it, read at 0600, reread after
 }
 
 test "a request's key label outlives a reload of the key file" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest; // refusal by mode bits; NTFS keeps access in ACLs
     const gpa = std.testing.allocator;
     const io = std.testing.io;
     var arena: std.heap.ArenaAllocator = .init(gpa);
@@ -370,7 +403,7 @@ test "a request's key label outlives a reload of the key file" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "keys", .data = "ops: sk-one\n" });
     const path = try std.fmt.allocPrintSentinel(a, ".zig-cache/tmp/{s}/keys", .{tmp.sub_path}, 0);
-    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(posix.AT.FDCWD, path, 0o600, 0));
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.fchmodat(posix.AT.FDCWD, path, 0o600, 0));
     var problem: []const u8 = "";
     var s = try Store.init(gpa, &.{}, "", path, false, &problem);
     defer if (s.file_arena) |*keys| keys.deinit();
@@ -380,8 +413,23 @@ test "a request's key label outlives a reload of the key file" {
     try std.testing.expectEqualStrings("ci", s.match(a, null, "sk-two").?); // another request rereads the file
     try std.testing.expectEqualStrings("ops", label);
     const kept = s.match(a, null, "sk-two").?;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.fchmodat(posix.AT.FDCWD, path, 0o644, 0));
+    try std.testing.expectEqual(@as(c_int, 0), platform.c.fchmodat(posix.AT.FDCWD, path, 0o644, 0));
     s.checked_ns = null;
     try std.testing.expect(s.match(a, "Bearer sk-one", null) == null); // a refused reload frees the file's keys too
     try std.testing.expectEqualStrings("ci", kept);
+}
+
+test {
+    _ = @import("auth_routes_test.zig");
+}
+
+pub fn gatedRequest(method: []const u8, raw_path: []const u8, metrics_open: bool) bool {
+    return !std.mem.eql(u8, method, "GET") or gated(raw_path, metrics_open);
+}
+
+fn publicAsset(path: []const u8) bool {
+    for ([_][]const u8{ "data.js", "panel.js", "flat.js", "scene.js", "tower.js", "fx.js", "bloom.js", "layout.js" }) |name| {
+        if (std.mem.startsWith(u8, path, "/slide/") and std.mem.eql(u8, path[7..], name)) return true;
+    }
+    return false;
 }

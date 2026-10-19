@@ -1,8 +1,8 @@
 # Image input
 
 This page describes image input in the Python engine, frozen at 0.6.6, until [The native server](#the-native-server),
-which covers the native binary: it reads images for GLM-5.3-Flash and Qwen3.8-27B on a Mac and refuses `--vision`
-for other models. Install the Python engine from the
+which covers the native binary: it reads images for GLM-5.3-Flash, Qwen3.8-27B and Qwen3.8 Flash Next on a Mac and
+refuses `--vision` for other models. Install the Python engine from the
 [`v0.6.6` tag](https://github.com/ashhart/TensorFold/tree/v0.6.6) for the rest.
 Parts of it came from pull requests: GLM-5.3-Flash images by @mgoldwasser
 ([#101](https://github.com/ashhart/TensorFold/pull/101)), Flash Next images on CUDA by @shantanugoel
@@ -146,8 +146,9 @@ For Qwen, each image request carries its own multimodal rotary positions and con
 ## The native server
 
 `tensorfold-native serve` takes `--vision`, `--vision-max-images` (default 4) and `--vision-image-tokens` (default
-4,096; 13,312 for Nemotron 3.5 Super VL) for engines that read images: GLM-5.3-Flash and Qwen3.8-27B on one Mac,
-and Nemotron 3.5 Super VL on CUDA. Other native engines refuse the flag at startup.
+4,096; 13,312 for Nemotron 3.5 Super VL) for engines that read images: GLM-5.3-Flash, Qwen3.8-27B, Qwen3.8 Flash Next, Gemma 4
+[31B](recipes/gemma-4-native.md#images) and [12B](recipes/gemma-4-12b-native.md#images) and Step-5-Preview on one
+Mac, and Nemotron 3.5 Super VL on CUDA. Other native engines refuse the flag at startup.
 
 - Images arrive as `image_url` data URLs in user messages and tool results. With `--vision-urls` (it needs
   `--vision`), a part may name a public HTTPS URL instead, fetched as 0.6.6 fetched it: port 443 without credentials
@@ -165,9 +166,16 @@ and Nemotron 3.5 Super VL on CUDA. Other native engines refuse the flag at start
   server loads it at the first JPEG from the file `TENSORFOLD_LIBTURBOJPEG` names, else `lib/` beside the server's
   folder, beside the server, Homebrew's `jpeg-turbo` on macOS, then the system's library path. It checks the version
   libjpeg-turbo writes into the library and refuses JPEG images by name when the library is missing or another
-  release; PNG images still serve. WebP is refused by name until a decoder exists; other formats are refused.
-- The limits and the processing are 0.6.6's: EXIF and XMP orientation, alpha composited over white, the GLM5-Next
-  processor's sizing and Pillow's bicubic resampler. The decoder gives 0.6.6's pixels for every picture in
+  release; PNG images still serve.
+- WebP is decoded by libwebp 1.6.0's decoder library (`libwebpdecoder`, the release Pillow 13.0.0 bundles), to the
+  RGB bytes Pillow 13.0.0 gives the same file (lossy and lossless, with and without alpha, EXIF-oriented:
+  `zig/tests/fixtures/picture/webp.json`, from `tools/zig/picture_webp_fixtures.py`). TensorFold does not ship it
+  either; the server loads it at the first WebP from the file `TENSORFOLD_LIBWEBP` names, else `lib/` beside the
+  server's folder, beside the server, Homebrew's `webp` on macOS, then the system's library path, and refuses WebP
+  images by name when it is missing or another release (`WebPGetDecoderVersion`). Animated WebP is refused as
+  animated pictures are. Other formats are refused.
+- The limits and the processing are 0.6.6's: EXIF and XMP orientation, alpha composited over white, the model's
+  processor's sizing (GLM5-Next's, or Gemma 4's PIL processor) and Pillow's bicubic resampler. The decoder gives 0.6.6's pixels for every picture in
   `zig/tests/fixtures/lfm2/images.json` and `zig/tests/fixtures/picture/edges.json`, except where it departs on
   purpose: a CMYK JPEG is refused, and a JPEG holding several pictures (MPO) gives its first, which 0.6.6 refused.
 - Images are counted from the request's image parts. A user or tool message whose text spells the model's image
@@ -198,10 +206,38 @@ tower there. With an image, drafted replies equal `"draft": false`, four request
 turn resumes past its image and equals a fresh server's reply, and DFlash2 keeps 2.6 to 3.0 tokens a round where the
 same asks without the image get 2.8 to 3.4.
 
+### Qwen3.8 Flash Next
+
+With `--vision`, Flash Next loads its checkpoint's image tower beside the language model, one stream or several
+(`--parallel`). It is the 27B's tower (the same 333 bf16 `vision_tower.*` tensors and processor) with 2,560-wide output,
+run by the same code (`zig/src/core/qwen_vl/`); images are prepared as above. Its rows replace the `<|image_pad|>`
+embeddings in all four of the model's hyper-connection streams, and the prompt pass turns them by interleaved M-RoPE
+(sections 11, 11 and 10 over the first 64 dimensions). The positions are transformers' `get_rope_index` shifted so that
+the text after the last image keeps its own slot: decoding, drafts and later tokens run as for text. Text-only requests
+get the tokens they got without the flag.
+
+- **Prompt cache:** image and video conversations resume past their images. The shift moves every position before the
+  request's last image, so a kept state is named by the shift as well as the tokens and images: a later turn with the
+  same images resumes, and a turn that adds an image reads its prompt again. The tower skips the images a resumed state
+  already holds. Replies equal the cache off's in multi-turn image and video chats, on one stream and shared sessions.
+- **Memory:** the tower and its scratch take 1.73 GiB at the default 4,096 image tokens, counted against the load limit;
+  a request's rows take 20 KiB a visual token while its prompt pass runs.
+- **Checks on an M5 Ultra:** five test pictures got the grids and patches of transformers' Pillow processor bit for bit;
+  the tower's rows came closer to transformers' float32 `Qwen4ExpVisionModel` than its bf16 run does (mean row error 1.4
+  to 3.1% against 1.8 to 5.7%). Six fixed image prompts gave drafted replies equal to `"draft": false`, the same tokens
+  on one stream and on shared sessions, and the expected answers. A 441-token picture takes 53 ms in the tower.
+- **Video:** `video_url` parts as described below, in the Qwen3-VL layout: each pair of frames is one image, and its
+  block is `<X.Y seconds><|vision_start|>` and its `<|video_pad|>` rows then `<|vision_end|>`, inside the template's own
+  `<|vision_start|>…<|vision_end|>`, as transformers 5.17's `Qwen3VLProcessor` writes it. Frames are sampled at 2 a
+  second (at least 4; at most 256, where the processor allows 768), the clip's pixels kept between 65,536 and 16,777,216
+  and inside the request's `--vision-video-tokens` share, and resized with torch's antialiased uint8 bicubic. On three
+  test clips the served prompt was as long as the processor's (239, 387 and 8,215 tokens); a 30-second 720p clip takes
+  3.2 s to its first token.
+
 ### Video on the native server
 
-With `--vision`, GLM-5.3-Flash also reads `video_url` parts in user messages, as transformers 5.19's
-`Glm5NextProcessor` prepares them:
+With `--vision`, GLM-5.3-Flash also reads `video_url` parts in user messages (Flash Next too, in its own layout above),
+as transformers 5.19's `Glm5NextProcessor` prepares them:
 - **Sampling:** 2 frames a second, deduplicated and padded to an even count, at most 256 frames.
 - **Frame pairs:** each pair of frames is one image to the tower.
 - **Prompt:** the template's `<|begin_of_video|><|video|><|end_of_video|>` holds one
@@ -258,3 +294,17 @@ Tests cover input validation, bounded fetching, expanded prompt accounting, cach
 Hardware qualification is separate from these tests: each backend and chip needs real image understanding, drafted/serial equality, concurrency, chunked-prefill and memory checks before a release claim.
 Checkpoint metadata must describe the decoder separately from MTP: the `mlp_layer_types` list must match `num_hidden_layers` for Transformers validation. Preserve the separate MTP configuration and weights.
 Image input stays experimental until the hardware matrix is complete, and makes no throughput claim.
+
+## Native CUDA: Qwen3.5/3.8
+
+`tensorfold-native serve <checkpoint> --vision` loads the checkpoint's vision tower beside the language model on the
+Qwen CUDA engine (`families/qwen3_5/cuda_vision.zig`, kernels in `qwen_vision.cu`, its Linears on cuBLASLt). The
+server prepares each image as it does on a Mac: core/picture decodes it and core/qwen_vl resizes and cuts it with the
+checkpoint's processor settings, so an image's patches, grid and cache identity are the same on both backends. The
+tower and the scratch of one 16,384-patch call are allocated at startup and counted as model memory, so the stream
+budget never has to make room for an image. A request's images go through the tower before its prompt; their rows
+replace the `<|image_pad|>` placeholders in the prompt chunks, which rotate at M-RoPE's t, h and w positions
+(interleaved sections 11, 11 and 10), and the reply's rows rotate at their position plus the layout's shift, as
+transformers' `get_rope_index` lays them out. Text-only requests keep their bits. One image holds at most 4,096
+tokens (one tower call); `--vision-image-tokens` bounds a request's images together. JPEG needs libturbojpeg on the
+machine (PNG decodes everywhere); video parts are refused.

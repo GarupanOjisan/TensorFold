@@ -1,17 +1,53 @@
 //! CUDA memory admission arithmetic, and the host pool read from /proc/meminfo and validated, without a device.
+const cuda = @import("cuda");
 const std = @import("std");
 const gib: f64 = 1 << 30;
 
-/// The bytes of the checkpoint's safetensors files: what its weights need on the device, near enough to refuse early.
-pub fn weightBytes(io: std.Io, dir: []const u8) u64 {
-    var d = std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true }) catch return 0;
+/// Bytes of the checkpoint's safetensors (the weight map's files, else the folder's own), near enough to refuse early.
+pub fn weightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
+    var d = try std.Io.Dir.cwd().openDir(io, dir, .{ .iterate = true });
     defer d.close(io);
+    return mapped(gpa, io, d) catch |err| switch (err) {
+        error.NoIndex, error.NoWeightMap => try listed(io, d),
+        else => return err,
+    };
+}
+
+/// The files model.safetensors.index.json's weight map names, each once.
+fn mapped(gpa: std.mem.Allocator, io: std.Io, d: std.Io.Dir) !u64 {
+    const text = d.readFileAlloc(io, "model.safetensors.index.json", gpa, .limited(1 << 26)) catch |err| {
+        if (err == error.FileNotFound) return error.NoIndex;
+        return err;
+    };
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+    defer parsed.deinit();
+    const map = if (parsed.value == .object) parsed.value.object.get("weight_map") else null;
+    if (map == null) return error.NoWeightMap;
+    if (map.? != .object) return error.InvalidWeightMap;
+    var seen: std.StringHashMapUnmanaged(void) = .empty;
+    defer seen.deinit(gpa);
+    var total: u64 = 0;
+    var it = map.?.object.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* != .string) return error.InvalidWeightMap;
+        if ((try seen.getOrPut(gpa, e.value_ptr.string)).found_existing) continue;
+        const st = try d.statFile(io, e.value_ptr.string, .{});
+        if (st.kind != .file) return error.InvalidWeightFile;
+        total = std.math.add(u64, total, st.size) catch return error.WeightSizeOverflow;
+    }
+    return total;
+}
+
+/// The folder's own *.safetensors, for a checkpoint without an index.
+fn listed(io: std.Io, d: std.Io.Dir) !u64 {
     var total: u64 = 0;
     var it = d.iterate();
-    while (it.next(io) catch null) |e| {
+    while (try it.next(io)) |e| {
         if (!std.mem.endsWith(u8, e.name, ".safetensors")) continue;
-        const st = d.statFile(io, e.name, .{}) catch continue;
-        total += st.size;
+        const st = try d.statFile(io, e.name, .{});
+        if (st.kind != .file) return error.InvalidWeightFile;
+        total = std.math.add(u64, total, st.size) catch return error.WeightSizeOverflow;
     }
     return total;
 }
@@ -42,6 +78,14 @@ pub fn meminfo(text: []const u8) ?MemInfo {
     const t = total orelse return null;
     const a = available orelse return null;
     return if (t > 0 and a <= t) .{ .total = t, .available = a } else null;
+}
+
+/// --prompt-cache-gib in pinned host memory (8 GiB unasked), at most half of what /proc/meminfo has available.
+pub fn hostCacheBytes(a: std.mem.Allocator, io: std.Io, asked: ?f64) u64 {
+    const want: u64 = if (asked) |g| (if (g > 0) std.math.lossyCast(u64, g * (1 << 30)) else 0) else 8 << 30;
+    const text = procText(a, io, "/proc/meminfo") orelse return 0;
+    const m = meminfo(text) orelse return 0;
+    return @min(want, m.available / 2);
 }
 
 /// A /proc file's text, streamed: procfs reports size 0, and a positional read (readFileAlloc) stops there.
@@ -110,13 +154,23 @@ pub fn admit(room: u64, stream: u64, free: u32, asked: u32, fixed: bool) error{ 
     return if (fixed) error.TooMany else fits;
 }
 
+/// The room admission adds streams in: none for a family that allocated at open every stream it can serve.
+pub fn growRoom(room: u64, grows: bool) u64 {
+    return if (grows) room else 0;
+}
+
 /// Kept prompt states' budget: --prompt-cache-gib (0: none), else 16 GiB, never past what the streams leave of `room`.
 pub fn cacheBytes(asked: ?f64, room: u64, streams: u64) u64 {
     const want: u64 = if (asked) |g| (if (g > 0) std.math.lossyCast(u64, g * gib) else 0) else 16 << 30;
     return @min(room -| streams, want);
 }
 
-/// Integrated GPUs require validated host counts; discrete devices use CUDA's counts.
+/// Linux integrated devices use procfs; Windows retains the unified reserve but reads the CUDA pool.
+pub fn hostCounts(unified: bool, windows: bool) bool {
+    return unified and !windows;
+}
+
+/// Integrated GPUs on Linux require validated /proc/meminfo counts; Windows and discrete devices use CUDA's counts.
 pub fn counts(unified: bool, card: MemInfo, text: ?[]const u8) error{HostMemoryUnavailable}!MemInfo {
     if (unified) return meminfo(text orelse return error.HostMemoryUnavailable) orelse error.HostMemoryUnavailable;
     return card;
@@ -144,9 +198,22 @@ test "the memory plan: reserve, cap, and admission that fails closed" {
     try std.testing.expectEqual(@as(u32, 5), try admit(5 * g + 1, g, 0, 8, false)); // auto serves what fits
     try std.testing.expectError(error.TooMany, admit(5 * g, g, 0, 8, true)); // a fixed --parallel refuses
     try std.testing.expectError(error.NoStream, admit(g - 1, g, 0, 8, false));
-    try std.testing.expectEqual(@as(u32, 2), try admit(2 * g, g + g / 2, 1, 4, false)); // one stream on the engine's own buffers
+    // one stream on the engine's own buffers
+    try std.testing.expectEqual(@as(u32, 2), try admit(2 * g, g + g / 2, 1, 4, false));
     try std.testing.expectEqual(@as(u32, 1), try admit(g - 1, g, 1, 8, false));
     try std.testing.expectError(error.TooMany, admit(2 * g, g, 1, 4, true));
+}
+
+test "a family that allocates every stream at open is admitted only the streams it holds" {
+    const g: u64 = 1 << 30;
+    // 64 slots allocated, room for one more: a fixed 65 refuses instead of adopting a lane with no slot
+    try std.testing.expectError(error.TooMany, admit(growRoom(g, false), g, 64, 65, true));
+    // auto planned 3 that fit: room left over for another stream adds no lane
+    try std.testing.expectEqual(@as(u32, 3), try admit(growRoom(g, false), g, 3, 8, false));
+    // streams paid for at open stay admitted when nothing is left
+    try std.testing.expectEqual(@as(u32, 8), try admit(growRoom(0, false), g, 8, 8, true));
+    // a family that grows streams after its open keeps the room
+    try std.testing.expectEqual(@as(u32, 65), try admit(growRoom(g, true), g, 64, 65, true));
 }
 
 test "the prompt cache: 16 GiB unless the flag sizes it, inside what the streams leave" {
@@ -198,4 +265,91 @@ test "memory limit refuses an oversized finite value and the rounded u64 boundar
     try std.testing.expectError(error.Invalid, limitBytes("17179869184"));
     try std.testing.expectError(error.Invalid, limitBytes("17179869183.9999995")); // parses to 2^34: 2^64 bytes
     try std.testing.expectEqual(@as(?u64, std.math.maxInt(u64) - 2047), try limitBytes("17179869183.9999980926513671875"));
+}
+
+pub fn readPool(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, problem: *[]const u8) !?Pool {
+    const unified = (try ctx.attribute(.integrated)) != 0;
+    const card = try ctx.memInfo();
+    const host_counts = hostCounts(unified, @import("sys").windows);
+    const text = if (host_counts) procText(a, io, "/proc/meminfo") else null;
+    defer if (text) |bytes| a.free(bytes);
+    const available = counts(host_counts, .{ .total = card.total, .available = card.free }, text) catch {
+        problem.* = "cannot read or parse /proc/meminfo's MemTotal and MemAvailable; refusing CUDA unified-memory admission";
+        return null;
+    };
+    const reserve_text = if (std.c.getenv("TENSORFOLD_MEMORY_RESERVE_GIB")) |p| std.mem.span(p) else null;
+    const limit_text = if (std.c.getenv("TENSORFOLD_CUDA_MEMORY_LIMIT_GB")) |p| std.mem.span(p) else null;
+    const reserve = reserveBytes(reserve_text, available.total, unified) catch {
+        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_MEMORY_RESERVE_GIB={s}: a number of GiB from {d} to the memory's size", .{ reserve_text orelse "", floor(unified).least });
+        return null;
+    };
+    const limit = limitBytes(limit_text) catch {
+        problem.* = try std.fmt.allocPrint(a, "TENSORFOLD_CUDA_MEMORY_LIMIT_GB={s}: a positive number of GiB whose byte count fits in a 64-bit size", .{limit_text orelse ""});
+        return null;
+    };
+    return .{ .free = available.available, .total = available.total, .reserve = reserve, .limit = limit, .unified = unified };
+}
+
+test "the weights' bytes: each file the weight map names once, under a folder too; without an index the folder's own" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "tensors");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-00001-of-00001.safetensors", .data = &@as([10]u8, @splat('w')) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tensors/native-QB.safetensors", .data = &@as([7]u8, @splat('q')) });
+    try tmp.dir.writeFile(io, .{ .sub_path = "stray.safetensors", .data = &@as([100]u8, @splat('s')) });
+    var path: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try std.testing.expectEqual(@as(u64, 110), try weightBytes(a, io, dir)); // no index: model and stray, not tensors/
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"a":"model-00001-of-00001.safetensors","b":"tensors/native-QB.safetensors","c":"model-00001-of-00001.safetensors"}}
+    });
+    try std.testing.expectEqual(@as(u64, 17), try weightBytes(a, io, dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "[]" }); // no weight map: the folder's own
+    try std.testing.expectEqual(@as(u64, 110), try weightBytes(a, io, dir));
+}
+
+fn checkedWeightBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
+    return weightBytes(a, io, dir);
+}
+
+test "named shard failures and malformed indexes cannot become a smaller estimate" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "tensors");
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "0123456789" });
+    var path: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"a":"model.safetensors","b":"tensors/missing.safetensors"}}
+    });
+    try std.testing.expectError(error.FileNotFound, checkedWeightBytes(a, io, dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"a":"model.safetensors","b":7}}
+    });
+    try std.testing.expectError(error.InvalidWeightMap, checkedWeightBytes(a, io, dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"a":"tensors"}}
+    });
+    try std.testing.expectError(error.InvalidWeightFile, checkedWeightBytes(a, io, dir));
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{" });
+    if (checkedWeightBytes(a, io, dir)) |_| return error.TestUnexpectedResult else |_| {}
+}
+
+test "an index allocation failure is reported instead of counting the flat directory" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"a":"model.safetensors"}}
+    });
+    var path: [64]u8 = undefined;
+    const dir = try std.fmt.bufPrint(&path, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    var bytes: [0]u8 = .{};
+    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+    try std.testing.expectError(error.OutOfMemory, checkedWeightBytes(fixed.allocator(), io, dir));
 }

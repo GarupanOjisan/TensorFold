@@ -1,11 +1,12 @@
 //! Ordered mailbox words: MCDMA's libmcdma-rpc (ABI 1, rpc/mcdma_rpc.h) by dlopen, or its same rules in Zig.
 const std = @import("std");
+const platform = @import("sys");
 const builtin = @import("builtin");
 const layout = @import("layout.zig");
 
 pub const abi: u32 = 1;
 
-pub const Error = error{ LibraryUnavailable, MissingSymbol, WrongAbi };
+pub const Error = platform.optional_libraries.Failure || error{ LibraryUnavailable, MissingSymbol, WrongAbi };
 
 /// A release store and an acquire wait on a mailbox word; wait returns the word, or 0 at the timeout.
 pub const Words = struct {
@@ -30,20 +31,20 @@ pub fn load(w: *const u64) u64 {
 
 /// CLOCK_MONOTONIC in nanoseconds, the clock libmcdma-rpc waits on.
 pub fn nowNs() u64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    var ts: platform.c.timespec = undefined;
+    _ = platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
 /// Sleep about `ns` nanoseconds (the library's short step between polls).
 pub fn pause(ns: u64) void {
-    const ts: std.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
-    _ = std.c.nanosleep(&ts, null);
+    const ts: platform.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
+    _ = platform.c.nanosleep(&ts, null);
 }
 
 pub fn checkedNowNs() error{ClockUnavailable}!u64 {
-    var ts: std.c.timespec = undefined;
-    if (std.c.clock_gettime(.MONOTONIC, &ts) != 0 or ts.sec < 0 or ts.nsec < 0 or ts.nsec >= std.time.ns_per_s) return error.ClockUnavailable;
+    var ts: platform.c.timespec = undefined;
+    if (platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts) != 0 or ts.sec < 0 or ts.nsec < 0 or ts.nsec >= std.time.ns_per_s) return error.ClockUnavailable;
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
 }
 
@@ -74,14 +75,11 @@ const ContentsFn = *const fn (buffer: ?*anyopaque) callconv(.c) ?*anyopaque;
 const ReleaseFn = *const fn (buffer: ?*anyopaque) callconv(.c) void;
 
 /// Where MCDMA installs the helper (rpc/Makefile PREFIX=/usr/local), after MCDMA_RPC_LIBRARY.
-const default_paths = if (builtin.os.tag == .macos)
-    [_][:0]const u8{"/usr/local/lib/libmcdma-rpc.dylib"}
-else
-    [_][:0]const u8{ "/usr/local/lib/libmcdma-rpc.so", "/usr/lib/libmcdma-rpc.so" };
+const default_paths = platform.optional_libraries.rpcPaths(builtin.os.tag);
 
 /// libmcdma-rpc opened at run time; the three Metal functions are optional, as the header says.
 pub const Library = struct {
-    lib: std.DynLib,
+    lib: platform.DynLib,
     abi_fn: AbiFn,
     wait_word: WaitFn,
     store_word: StoreFn,
@@ -92,25 +90,37 @@ pub const Library = struct {
     /// Open `path`, else MCDMA_RPC_LIBRARY, else the install prefix; refuse any ABI but 1.
     pub fn open(path: ?[:0]const u8) Error!Library {
         if (path) |p| return openPath(p);
-        if (std.c.getenv("MCDMA_RPC_LIBRARY")) |env| {
+        if (platform.c.getenv("MCDMA_RPC_LIBRARY")) |env| {
             const p = std.mem.span(env);
             if (p.len > 0) return openPath(p);
         }
-        for (default_paths) |p| return openPath(p) catch |err| switch (err) {
+        return openCandidates(default_paths);
+    }
+
+    pub fn openCandidates(paths: []const [:0]const u8) Error!Library {
+        for (paths) |p| return openCandidate(p) catch |err| switch (err) {
             error.LibraryUnavailable => continue,
+            error.McdmaRpcUnavailable => return platform.optional_libraries.unavailable(.mcdma_rpc),
             else => return err,
         };
-        return error.LibraryUnavailable;
+        return platform.optional_libraries.unavailable(.mcdma_rpc);
     }
 
     pub fn openPath(path: [:0]const u8) Error!Library {
-        var lib = std.DynLib.openZ(path.ptr) catch return error.LibraryUnavailable;
+        return openCandidate(path) catch |err| switch (err) {
+            error.LibraryUnavailable, error.McdmaRpcUnavailable => return platform.optional_libraries.unavailable(.mcdma_rpc),
+            else => return err,
+        };
+    }
+
+    fn openCandidate(path: [:0]const u8) Error!Library {
+        var lib = platform.DynLib.openZ(path.ptr) catch return error.LibraryUnavailable;
         errdefer lib.close();
         var l: Library = .{
             .lib = lib,
-            .abi_fn = lib.lookup(AbiFn, "mcdma_rpc_abi") orelse return error.MissingSymbol,
-            .wait_word = lib.lookup(WaitFn, "mcdma_rpc_wait_word") orelse return error.MissingSymbol,
-            .store_word = lib.lookup(StoreFn, "mcdma_rpc_store_word") orelse return error.MissingSymbol,
+            .abi_fn = lib.lookup(AbiFn, "mcdma_rpc_abi") orelse return error.McdmaRpcUnavailable,
+            .wait_word = lib.lookup(WaitFn, "mcdma_rpc_wait_word") orelse return error.McdmaRpcUnavailable,
+            .store_word = lib.lookup(StoreFn, "mcdma_rpc_store_word") orelse return error.McdmaRpcUnavailable,
         };
         if (l.abi_fn() != abi) return error.WrongAbi;
         if (builtin.os.tag == .macos) {
@@ -171,5 +181,5 @@ test "native waits follow the library's sequence rule" {
 }
 
 test "a missing library is reported, not guessed" {
-    try std.testing.expectError(error.LibraryUnavailable, Library.openPath("/nonexistent/libmcdma-rpc.dylib"));
+    try std.testing.expectError(error.McdmaRpcUnavailable, Library.openPath("/nonexistent/libmcdma-rpc.dylib"));
 }

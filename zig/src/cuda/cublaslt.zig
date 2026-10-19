@@ -1,6 +1,7 @@
 //! cuBLASLt opened at run time: descriptors, layouts, heuristics and matmul, with fp32 compute only (no TF32 or fast modes).
 
 const std = @import("std");
+const platform = @import("sys");
 const abi = @import("abi.zig");
 
 pub const Status = c_int;
@@ -34,7 +35,7 @@ pub const pref_max_workspace_bytes: c_int = 1;
 /// What D gets after the product: nothing, or a bias over its columns added in f32 before D's one rounding.
 pub const Epilogue = enum(u32) { none = 1, bias = 4 };
 
-pub const Error = error{ LibraryUnavailable, MissingSymbol, CublasFailed, NoAlgorithm, Invalid };
+pub const Error = platform.optional_libraries.Failure || error{ LibraryUnavailable, MissingSymbol, CublasFailed, NoAlgorithm, Invalid };
 
 const S = Status;
 const CPtr = ?*const anyopaque;
@@ -60,22 +61,31 @@ pub const Api = struct {
 };
 
 pub const Library = struct {
-    lib: std.DynLib,
+    lib: platform.DynLib,
     api: Api,
 
-    /// The CUDA 13 soname first, then the unversioned link name.
+    /// The CUDA 13 soname first, then the unversioned link name; on Windows the toolkit's DLL.
     pub fn open() Error!Library {
-        for ([_][]const u8{ "libcublasLt.so.13", "libcublasLt.so" }) |path| {
-            return openPath(path) catch |e| switch (e) {
+        const names: []const []const u8 = if (@import("builtin").os.tag == .windows) &.{"cublasLt64_13.dll"} else &.{ "libcublasLt.so.13", "libcublasLt.so" };
+        for (names) |path| {
+            return openCandidate(path) catch |e| switch (e) {
                 error.LibraryUnavailable => continue,
+                error.MissingSymbol => return platform.optional_libraries.unavailable(.cublaslt),
                 else => return e,
             };
         }
-        return error.LibraryUnavailable;
+        return platform.optional_libraries.unavailable(.cublaslt);
     }
 
     pub fn openPath(path: []const u8) Error!Library {
-        var lib = std.DynLib.open(path) catch return error.LibraryUnavailable;
+        return openCandidate(path) catch |e| switch (e) {
+            error.LibraryUnavailable, error.MissingSymbol => platform.optional_libraries.unavailable(.cublaslt),
+            else => e,
+        };
+    }
+
+    fn openCandidate(path: []const u8) Error!Library {
+        var lib = platform.DynLib.open(path) catch return error.LibraryUnavailable;
         errdefer lib.close();
         var api: Api = undefined;
         const info = @typeInfo(Api).@"struct";
