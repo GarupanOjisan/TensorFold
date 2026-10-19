@@ -1,4 +1,4 @@
-//! GLM-5.3-Flash's EXL3 routed experts on CUDA (Mia-AiLab's checkpoint: 4-bit mcg trellis experts, the rest bf16; 3-bit experts too).
+//! GLM-5.3-Flash's EXL3 routed experts on CUDA (3- or 4-bit mcg trellis experts, the rest bf16).
 
 const std = @import("std");
 const modelopt = @import("core").modelopt;
