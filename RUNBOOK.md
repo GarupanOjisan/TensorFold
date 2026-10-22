@@ -170,6 +170,34 @@ zone at 94 C or more for most of the prompt (97.7 C at the top); `TF_HEAT_HIGH=9
 at 93.0 C or under, and the first token came 10% later.
 Archives whose names contain `host-only` are CPU verification artifacts and cannot serve CUDA inference.
 
+### Two GB10 ranks for GLM-5.3-Flash
+
+GLM-5.3-Flash on two DGX Spark GB10s (native CUDA, TP=2) needs the same settings on both ranks. Missing one of them
+falls back to NCCL for every gather, can deadlock during rank setup, or refuses `--vision`. For a long run, also pin
+each rank to the efficiency cores in the section below.
+
+RoCE. `ibv_devinfo` lists the functions whose port state is PORT_ACTIVE. Put both in `TF_ROCE_HCA` on each rank
+(or in `NCCL_IB_HCA` when `TF_ROCE_HCA` is unset). Names follow the cabled cages; one reported pair is
+`rocep1s0f0,roceP2p1s0f0`. A ConnectX-7 exposes two PCIe functions, and naming both is what fills a single cable.
+With neither variable set, startup logs `RoCE all-gather: NoHca (); NCCL carries every gather` and every gather
+stays on NCCL. Confirm that line is absent. `TF_ROCE=0` forces NCCL. `TF_ROCE_MAX_KB` caps one RoCE shard in KiB
+(4096 when unset). See [ashhart/TensorFold#1030](https://github.com/ashhart/TensorFold/issues/1030).
+
+NCCL. Use `libnccl.so.2` from `nvidia-nccl-cu13` 2.30.7 or newer. Upstream's two-GB10 checks use 2.30.7. 2.30.7 and
+2.32.3 ran; 2.28.9 deadlocked at startup or after a few requests; 2.29.x was not tested
+([#1060](https://github.com/ashhart/TensorFold/issues/1060)). From upstream v1.1.2, the shared tensor-parallel group
+refuses a loaded NCCL older than 2.30.0 before rank setup, GLM included. This fork carries that check in the v1.1.2
+update.
+
+Vision. `--vision` loads CUDA 13's `libcublasLt.so.13`. The driver does not provide it, and NCCL is not a substitute.
+`capabilities --json` lists optional libraries and whether each was found. Video inputs also need `libtfvideo.so` in
+`lib` beside the server. Upstream v1.1.2 opens `../lib/libtfvideo.so`, then the file beside the executable, then the
+loader path ([#1107](https://github.com/ashhart/TensorFold/issues/1107)). A build that still searches only the loader
+path needs `LD_LIBRARY_PATH` set to that `lib` directory on both ranks.
+
+First launch. The first start can stay silent for several minutes while it reads the checkpoint digest. Wait for
+`checkpoint digest:` before treating it as stuck. A later start reports the cached files immediately.
+
 ### GB10 CPU pinning for long CUDA runs
 
 In [#1033](https://github.com/ashhart/TensorFold/issues/1033), @Bizuayeu reports two CPU threads spinning per CUDA rank,
