@@ -221,6 +221,16 @@ slower and a cold prompt of 9,600 to 38,400 tokens 2 to 5% slower, with the same
 60 W instead of 89 to 92 W, and the hottest thermal zone at 88.6 to 90.7 C instead of 96.8 to 98.1 C. These are the
 contributor's measurements.
 
+`nvidia-smi -q` still shows the old Applications Clocks and Max Clocks after `-lgc`. While a reply decodes, read the
+live clock with `nvidia-smi --query-gpu=clocks.gr,power.draw,temperature.gpu --format=csv -l 2` (about 2,190 MHz in
+the serves above). The oneshot unit does not apply the cap again after a driver reload or a GPU reset; check that
+live clock after either, or reboot so the unit runs.
+
+A lower cap is also reported. On five GB10s serving a model of 125B parameters or larger, an uncapped 2,455 MHz clock
+read 56.0 W, 84 C and 73.4 tok/s; `sudo nvidia-smi -lgc 0,2200` read 40.1 W, 78 C and 72.5 tok/s; and
+`sudo nvidia-smi -lgc 0,1800` read 23.5 W, 68 C and 70.5 tok/s. These are that report's measurements. The unit above
+keeps 2,200 MHz.
+
 ## Flash Next and paired Metal serving
 
 Flash Next reads its MLX 6-bit/group-32 checkpoint directly and creates its native layouts locally.
