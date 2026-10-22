@@ -75,6 +75,8 @@ const Script = struct {
     reply: []const u32,
     asked: ?u8 = null,
     prompt_rows: bool = true,
+    /// Ends of successive token chunks; empty: one split at half the reply.
+    cuts: []const usize = &.{},
 
     fn engine(e: *@This()) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
@@ -82,13 +84,13 @@ const Script = struct {
 
     fn info(ctx: *anyopaque) api.Info {
         const e: *Script = @ptrCast(@alignCast(ctx));
-        return .{ .context_window = 64, .logprobs = true, .prompt_logprobs = e.prompt_rows };
+        return .{ .context_window = 4096, .logprobs = true, .prompt_logprobs = e.prompt_rows };
     }
 
     fn submit(ctx: *anyopaque, id: api.Id, r: *const api.Request, sink: api.Sink) api.SubmitError!void {
         const e: *Script = @ptrCast(@alignCast(ctx));
         e.asked = r.logprobs;
-        var rows: [32]api.LogprobRow = undefined;
+        var rows: [128]api.LogprobRow = undefined;
         for (e.reply, rows[0..e.reply.len], 0..) |t, *row, i| {
             const lp = -@as(f32, @floatFromInt(i + 1)) / 4;
             row.* = .{ .token = t, .logprob = lp, .count = r.logprobs orelse 0 };
@@ -110,10 +112,16 @@ const Script = struct {
             }
             sink.event(sink.ctx, id, &.{ .prompt_logprobs = prompt_rows[0 .. r.prompt.len - 1] });
         }
-        const half = e.reply.len / 2;
-        for ([_][2]usize{ .{ 0, half }, .{ half, e.reply.len } }) |part| {
-            if (r.logprobs != null) sink.event(sink.ctx, id, &.{ .logprobs = rows[part[0]..part[1]] });
-            sink.event(sink.ctx, id, &.{ .tokens = e.reply[part[0]..part[1]] });
+        var from: usize = 0;
+        const stops = if (e.cuts.len > 0) e.cuts else &[_]usize{e.reply.len / 2};
+        for (stops) |end| {
+            if (r.logprobs != null) sink.event(sink.ctx, id, &.{ .logprobs = rows[from..end] });
+            sink.event(sink.ctx, id, &.{ .tokens = e.reply[from..end] });
+            from = end;
+        }
+        if (from < e.reply.len) {
+            if (r.logprobs != null) sink.event(sink.ctx, id, &.{ .logprobs = rows[from..] });
+            sink.event(sink.ctx, id, &.{ .tokens = e.reply[from..] });
         }
         const ended = e.reply.len > 0 and e.reply[e.reply.len - 1] == eos;
         sink.event(sink.ctx, id, &.{ .finished = .{ .reason = if (ended) .stop else .length } });
@@ -169,12 +177,12 @@ const Got = struct {
 const Route = enum { chat, responses, completions };
 
 fn send(reply: []const u32, thinking: bool, route: Route, body: []const u8) !Got {
-    return sendWith(reply, thinking, route, body, true);
+    return sendWith(reply, thinking, route, body, true, &.{});
 }
 
-fn sendWith(reply: []const u32, thinking: bool, route: Route, body: []const u8, prompt_rows: bool) !Got {
+fn sendWith(reply: []const u32, thinking: bool, route: Route, body: []const u8, prompt_rows: bool, cuts: []const usize) !Got {
     var text: Text = .{};
-    var backend: Script = .{ .reply = reply, .prompt_rows = prompt_rows };
+    var backend: Script = .{ .reply = reply, .prompt_rows = prompt_rows, .cuts = cuts };
     var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
         .served_name = "test-model",
         .model_ids = &.{"test-model"},
@@ -431,8 +439,65 @@ test "prompt_logprobs: null first, then each prompt token with its rank before t
         .{ .route = .completions, .body = "{\"model\":\"test-model\",\"prompt\":\"abc\",\"prompt_logprobs\":1}", .rows = false },
     };
     for (refused) |c| {
-        var got = try sendWith(&reply, false, c.route, c.body, c.rows);
+        var got = try sendWith(&reply, false, c.route, c.body, c.rows, &.{});
         defer got.deinit();
         try std.testing.expectEqual(@as(u16, 400), got.status);
     }
+}
+
+fn pushBytes(ids: *std.ArrayList(u32), s: []const u8) !void {
+    for (s) |b| try ids.append(std.testing.allocator, b);
+}
+
+fn field(v: std.json.Value, choice: []const u8, name: []const u8) ?[]const u8 {
+    const choices = v.object.get("choices") orelse return null;
+    if (choices != .array or choices.array.items.len == 0) return null;
+    const c = choices.array.items[0];
+    if (c != .object) return null;
+    const msg = c.object.get(choice) orelse return null;
+    if (msg != .object) return null;
+    const text = msg.object.get(name) orelse return null;
+    return if (text == .string) text.string else null;
+}
+
+test "a quoted </think> and an echoed <think>hello</think> world split at the close token, streamed and whole" {
+    var ids: std.ArrayList(u32) = .empty;
+    defer ids.deinit(std.testing.allocator);
+    try pushBytes(&ids, "<think>\nquote </think> here\n");
+    const quoted = ids.items.len;
+    try ids.append(std.testing.allocator, think_end);
+    try pushBytes(&ids, "\n\n<think>hello</think> world");
+    try ids.append(std.testing.allocator, eos);
+    const body = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":64";
+    var whole = try sendWith(ids.items, true, .chat, body ++ "}", true, &.{ quoted, quoted + 1 });
+    defer whole.deinit();
+    const parsed = try content(whole);
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("quote </think> here", field(parsed.value, "message", "reasoning_content").?);
+    try std.testing.expectEqualStrings("<think>hello</think> world", field(parsed.value, "message", "content").?);
+    const reasoning_tokens = parsed.value.object.get("usage").?.object.get("completion_tokens_details").?.object.get("reasoning_tokens").?;
+    try std.testing.expectEqual(@as(i64, @intCast(quoted + 1)), reasoning_tokens.integer);
+    var streamed = try sendWith(ids.items, true, .chat, body ++ ",\"stream\":true}", true, &.{ quoted, quoted + 1 });
+    defer streamed.deinit();
+    var reason: std.ArrayList(u8) = .empty;
+    defer reason.deinit(std.testing.allocator);
+    var answer: std.ArrayList(u8) = .empty;
+    defer answer.deinit(std.testing.allocator);
+    var quote_seen = false;
+    var content_before_quote = false;
+    for (streamed.events.items) |e| {
+        const chunk = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, e, .{});
+        defer chunk.deinit();
+        if (field(chunk.value, "delta", "reasoning_content")) |t| {
+            try reason.appendSlice(std.testing.allocator, t);
+            if (std.mem.indexOf(u8, reason.items, "</think>") != null) quote_seen = true;
+        }
+        if (field(chunk.value, "delta", "content")) |t| if (t.len > 0) {
+            if (!quote_seen) content_before_quote = true;
+            try answer.appendSlice(std.testing.allocator, t);
+        };
+    }
+    try std.testing.expect(!content_before_quote);
+    try std.testing.expectEqualStrings("quote </think> here", std.mem.trim(u8, reason.items, "\n"));
+    try std.testing.expectEqualStrings("<think>hello</think> world", answer.items);
 }
