@@ -49,14 +49,44 @@ fn trimNewlines(s: []const u8) []const u8 {
 
 pub const Split = struct { reasoning: []const u8, answer: []const u8 };
 
+const Cut = struct { at: usize, len: usize };
+
 /// (reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back.
 pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers) Allocator.Error!Split {
+    return splitCore(a, full, finished, m, true, null);
+}
+
+/// Split at the first close-marker token when that marker is one id; otherwise the decoded text.
+pub fn splitThinkingTokens(a: Allocator, full: []const u8, finished: bool, m: Markers, tokens: []const u32, close_id: ?u32, ctx: anytype, decode: anytype) Allocator.Error!Split {
+    const id = close_id orelse return splitThinking(a, full, finished, m);
+    return splitCore(a, full, finished, m, false, try tokenCut(a, full, tokens, id, ctx, decode));
+}
+
+fn tokenCut(a: Allocator, full: []const u8, tokens: []const u32, id: u32, ctx: anytype, decode: anytype) Allocator.Error!?Cut {
+    const i = std.mem.indexOfScalar(u32, tokens, id) orelse return null;
+    const before = try decode(ctx, a, tokens[0..i]);
+    const through = try decode(ctx, a, tokens[0 .. i + 1]);
+    if (!std.mem.startsWith(u8, through, before) or !std.mem.startsWith(u8, full, before)) return null;
+    const len = through.len - before.len;
+    if (before.len + len > full.len) return null;
+    return .{ .at = before.len, .len = len };
+}
+
+fn moved(full: []const u8, text: []const u8, cut: ?Cut) ?Cut {
+    const c = cut orelse return null;
+    const off = @intFromPtr(text.ptr) - @intFromPtr(full.ptr);
+    if (c.at < off or c.at + c.len > off + text.len) return null;
+    return .{ .at = c.at - off, .len = c.len };
+}
+
+fn splitCore(a: Allocator, full: []const u8, finished: bool, m: Markers, search: bool, cut: ?Cut) Allocator.Error!Split {
     var text = full;
+    var mark = cut;
     if (m.open.len > 0 and !std.mem.startsWith(u8, text, m.open)) {
         if (find(text, m.open)) |start| if (start > 0) {
             var prefix = text[0..start];
             prefix = prefix[0 .. prefix.len - partialTag(prefix, m.open)]; // a stray partial opener
-            const inner = try splitThinking(a, text[start..], finished, m);
+            const inner = try splitCore(a, text[start..], finished, m, search, moved(full, text[start..], mark));
             return .{ .reasoning = inner.reasoning, .answer = try std.mem.concat(a, u8, &.{ prefix, inner.answer }) };
         };
         if (!finished) {
@@ -68,12 +98,19 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
     }
     if (m.open.len > 0) {
         text = trimNewlines(text[m.open.len..]);
+        mark = moved(full, text, mark);
     } else if (std.mem.startsWith(u8, text, think_open)) {
         text = trimNewlines(text[think_open.len..]);
+        mark = moved(full, text, mark);
     } else if (!finished and std.mem.startsWith(u8, think_open, text)) {
         return .{ .reasoning = "", .answer = "" }; // held while the reply may still be writing that opener
     }
-    if (find(text, m.close)) |end| return .{ .reasoning = text[0..end], .answer = trimNewlines(text[end + m.close.len ..]) };
+    if (search) {
+        if (find(text, m.close)) |end| return .{ .reasoning = text[0..end], .answer = trimNewlines(text[end + m.close.len ..]) };
+    } else if (mark) |c| {
+        // one close id: its first token, not an earlier spelling of the same text
+        return .{ .reasoning = text[0..c.at], .answer = trimNewlines(text[c.at + c.len ..]) };
+    }
     var call: ?usize = null;
     for (calls) |c| if (find(text, c[0])) |at| {
         if (call == null or at < call.?) call = at;
@@ -382,4 +419,75 @@ test "a reply that writes its own think opener keeps the tag out of its reasonin
         try std.testing.expectEqualStrings("Plan.\n", s.reasoning);
         try std.testing.expectEqualStrings("Done.", s.answer);
     }
+}
+
+const marker_id: u32 = 0x110000;
+
+fn decodePieces(_: *const anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    for (ids) |id| if (id == marker_id) try out.appendSlice(a, "</think>") else try out.append(a, @intCast(id));
+    return out.items;
+}
+
+fn pushBytes(a: Allocator, ids: *std.ArrayList(u32), s: []const u8) Allocator.Error!void {
+    for (s) |b| try ids.append(a, b);
+}
+
+fn thinkAt(a: Allocator, ids: []const u32, finished: bool, id: ?u32) Allocator.Error!Split {
+    const text = try decodePieces(@ptrFromInt(1), a, ids);
+    return splitThinkingTokens(a, text, finished, think_markers, ids, id, @as(*const anyopaque, @ptrFromInt(1)), decodePieces);
+}
+
+test "a quoted </think> stays in reasoning; the answer starts at the close token" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ids: std.ArrayList(u32) = .empty;
+    try pushBytes(a, &ids, "<think>\nleft </think> stays quoted\n");
+    try ids.append(a, marker_id);
+    try pushBytes(a, &ids, "\n\nright");
+    const s = try thinkAt(a, ids.items, true, marker_id);
+    try std.testing.expectEqualStrings("left </think> stays quoted\n", s.reasoning);
+    try std.testing.expectEqualStrings("right", s.answer);
+    const spelled = try thinkAt(a, ids.items[0 .. ids.items.len - "\n\nright".len - 1], true, null);
+    try std.testing.expectEqualStrings("left ", spelled.reasoning);
+    try std.testing.expectEqualStrings(" stays quoted\n", spelled.answer);
+}
+
+test "echo <think>hello</think> world: the spelled tag is the answer, not the end of reasoning" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ids: std.ArrayList(u32) = .empty;
+    try pushBytes(a, &ids, "<think>\nquote </think> here\n");
+    try ids.append(a, marker_id);
+    try pushBytes(a, &ids, "\n\n<think>hello</think> world");
+    const s = try thinkAt(a, ids.items, true, marker_id);
+    try std.testing.expectEqualStrings("quote </think> here\n", s.reasoning);
+    try std.testing.expectEqualStrings("<think>hello</think> world", s.answer);
+}
+
+test "streaming chunks keep a quoted </think> in reasoning until the close token" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ids: std.ArrayList(u32) = .empty;
+    try pushBytes(a, &ids, "<think>\nquote </think> here\n");
+    const quoted = ids.items.len;
+    try ids.append(a, marker_id);
+    const closed = ids.items.len;
+    try pushBytes(a, &ids, "\n\n<think>hello</think> world");
+    var prev_r: []const u8 = "";
+    var prev_a: []const u8 = "";
+    for (1..ids.items.len + 1) |n| {
+        const s = try thinkAt(a, ids.items[0..n], false, marker_id);
+        try std.testing.expect(std.mem.startsWith(u8, s.reasoning, prev_r));
+        try std.testing.expect(std.mem.startsWith(u8, s.answer, prev_a));
+        if (n < closed) try std.testing.expectEqualStrings("", s.answer);
+        if (n == quoted) try std.testing.expect(std.mem.indexOf(u8, s.reasoning, "</think>") != null);
+        if (n == closed) try std.testing.expectEqualStrings("quote </think> here\n", s.reasoning);
+        prev_r = s.reasoning;
+        prev_a = s.answer;
+    }
+    try std.testing.expectEqualStrings("<think>hello</think> world", prev_a);
 }
