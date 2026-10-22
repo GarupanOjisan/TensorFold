@@ -80,6 +80,8 @@ test "digest cache detects same-size rewrites even when mtime is restored" {
     const old = try get(c, file, &calls);
     const f = try tmp.dir.openFile(t.io, "file", .{ .mode = .read_write });
     defer f.close(t.io);
+    // The rewrite has to land on a later tick, or ctime matches the create and a restored mtime is a hit.
+    try std.Io.sleep(t.io, .fromMilliseconds(50), .awake);
     try f.writePositionalAll(t.io, "other", 0);
     try f.setTimestamps(t.io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(@intCast(old.key.mtime)) } });
     const now = try get(c, file, &calls);

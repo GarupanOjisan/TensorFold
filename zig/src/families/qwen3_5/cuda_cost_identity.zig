@@ -59,6 +59,8 @@ test "cost identity: stable reads reuse a drafter, while a changed payload at th
     const first = try checkpoint(a, io, root);
     try std.testing.expectEqualSlices(u8, &first, &try checkpoint(a, io, root));
     bytes[bytes.len - 1] = 1;
+    // A same-size rewrite inside one timestamp tick keeps the stamp (NTFS ~16 ms, some Linux hosts ~4 ms).
+    try std.Io.sleep(io, .fromMilliseconds(50), .awake);
     try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = &bytes });
     const changed = try checkpoint(a, io, root);
     try std.testing.expect(!std.mem.eql(u8, &first, &changed));
