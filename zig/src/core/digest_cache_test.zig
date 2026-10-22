@@ -5,6 +5,10 @@ const t = std.testing;
 const Io = std.Io;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
+test {
+    _ = @import("digest_parallel_test.zig");
+}
+
 const Reader = struct {
     io: Io = t.io,
     calls: ?*usize = null,
@@ -76,6 +80,8 @@ test "digest cache detects same-size rewrites even when mtime is restored" {
     const old = try get(c, file, &calls);
     const f = try tmp.dir.openFile(t.io, "file", .{ .mode = .read_write });
     defer f.close(t.io);
+    // The rewrite has to land on a later tick, or ctime matches the create and a restored mtime is a hit.
+    try std.Io.sleep(t.io, .fromMilliseconds(50), .awake);
     try f.writePositionalAll(t.io, "other", 0);
     try f.setTimestamps(t.io, .{ .modify_timestamp = .{ .new = .fromNanoseconds(@intCast(old.key.mtime)) } });
     const now = try get(c, file, &calls);
@@ -174,8 +180,12 @@ test "digest cache stays bounded and evicts old identities" {
     try t.expectEqual(@as(usize, 3), records.items.len);
     var it = dir.iterate();
     var count: usize = 0;
-    while (try it.next(t.io)) |_| count += 1;
-    try t.expectEqual(@as(usize, 2), count);
+    while (try it.next(t.io)) |entry| {
+        try t.expect(std.mem.eql(u8, entry.name, "index.bin") or std.mem.eql(u8, entry.name, "index.lock") or
+            (std.mem.startsWith(u8, entry.name, "hash-") and std.mem.endsWith(u8, entry.name, ".lock")));
+        count += 1;
+    }
+    try t.expect(count <= 2 + @import("digest_lock.zig").stripes);
     const first = try path(t.allocator, &tmp, "file-0");
     defer t.allocator.free(first);
     try t.expect(!(try get(c, first, &calls)).hit);

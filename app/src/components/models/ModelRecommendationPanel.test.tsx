@@ -15,6 +15,10 @@ function MockButton(props: { children?: React.ReactNode; disabled?: boolean }) {
   return React.createElement('button', { disabled: props.disabled }, props.children)
 }
 const imports: Record<string, unknown> = {
+  '../../lib/preferences/useAuthoredText': {
+    useAuthoredText: () => (text: string, values: Record<string, string | number> = {}) =>
+      text.replace(/\{([^}]+)\}/g, (match, key) => key in values ? String(values[key]) : match),
+  },
   'react/jsx-runtime': jsx, '../../lib/engine': { formatBytes: () => '1 GiB' },
   '../ui': { Button: MockButton },
   '../../../shared/hub-failure': failures,

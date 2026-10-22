@@ -13,12 +13,17 @@ export function engineChildEnv(base: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   return env
 }
 
+// A child's view of `base`: the Hub origin that authorized its checks, and no Hub token.
+export function pinnedEngineEnv(base: NodeJS.ProcessEnv, endpoint: string): NodeJS.ProcessEnv {
+  const child = { ...base }
+  delete child.HF_TOKEN
+  child.HF_ENDPOINT = endpoint
+  return Object.freeze(child)
+}
+
 // Snapshot before filtering so Hub checks and native pulls cannot select different origins.
 export function engineLaunchEnv(options: { childEnv?: NodeJS.ProcessEnv; env?: NodeJS.ProcessEnv }) {
   const source = { ...(options.childEnv ?? options.env ?? process.env) }
   const endpoint = resolveHubEndpoint(source.HF_ENDPOINT)
-  const child = options.childEnv ? source : engineChildEnv(source)
-  delete child.HF_TOKEN
-  child.HF_ENDPOINT = endpoint
-  return { env: Object.freeze(child), endpoint }
+  return { env: pinnedEngineEnv(options.childEnv ? source : engineChildEnv(source), endpoint), endpoint }
 }
