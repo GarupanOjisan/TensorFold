@@ -49,6 +49,25 @@ async function main() {
     slow.cancel()
     assert.equal((await slow.done).state, 'cancelled')
     await waitFor(() => !processAlive(pid), 5000, 'pull process to exit')
+
+    // Actual polling excludes the resumed cache from the rate and eventually measures new writes.
+    const cache = path.join(h.hub, 'models--Org--Measured', 'blobs')
+    await fs.mkdir(cache, { recursive: true })
+    await fs.writeFile(path.join(cache, 'existing'), Buffer.alloc(65536, 1))
+    const measurements: PullProgress[] = []
+    // After a flush APFS can count the whole presized blob, so hold in the first of two files to keep received bytes below the total.
+    const measured = startPull({ binary: h.binary, env: { ...h.env, FAKE_PULL_FILES: '2', FAKE_PULL_CHUNK: '4096', FAKE_PULL_DELAY_MS: '55', FAKE_PULL_HOLD_AFTER_BYTES: '65536' }, hub: h.hub, steps: [{ repo: 'Org/Measured', revision: null }], totalBytes: 65536 + 2 * 256 * 1024, pollMs: 50, onUpdate: (progress) => measurements.push(progress) })
+    // Hold the fake download partial until cancelled, so a delayed poll cannot miss the ETA window.
+    try {
+      await waitFor(() => measurements.length > 0, 5000, 'resumed cache baseline')
+      assert.equal(measurements[0].receivedBytes, 65536)
+      assert.equal(measurements[0].bytesPerSecond, null)
+      assert.equal(measurements[0].etaSeconds, null)
+      await waitFor(() => measurements.some((progress) => (progress.bytesPerSecond ?? 0) > 0 && (progress.etaSeconds ?? 0) > 0), 10_000, 'measured write rate and remaining time')
+    } finally {
+      measured.cancel()
+      assert.equal((await measured.done).state, 'cancelled')
+    }
   } finally {
     await h.cleanup()
   }

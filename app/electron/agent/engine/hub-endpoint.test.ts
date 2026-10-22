@@ -81,7 +81,8 @@ async function main() {
     assert.equal((await service.preflight(REPO)).verdict, 'ok')
     h.env.HF_ENDPOINT = NEXT_ENDPOINT
     await service.search('model')
-    assert.equal((await service.pull(REPO)).state, 'running')
+    // beta 8's pull queue reports a new pull as queued before its worker starts it
+    assert.ok(['queued', 'running'].includes((await service.pull(REPO)).state))
     await waitFor(() => events.some((e) => e.kind === 'pull' && e.pull.state === 'done'))
     const records = (await h.records()).filter((row) => row.kind === 'pull')
     assert.equal(records.length, 1)

@@ -2,19 +2,18 @@ import { execFile } from 'node:child_process'
 import { promises as fs, existsSync } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import type { EngineCapabilities, EngineConnection, EngineEvent, EngineInstalledModel, EngineLearningSnapshot, EngineLibraryScanOptions, EngineModelLibrarySnapshot, EnginePerformance, EngineSnapshot, EngineStatus, HubModelSummary, ModelPreflight, PullProgress, Readiness } from '../types'
+import { createHash } from 'node:crypto'
+import type { EngineCapabilities, EngineConnection, EngineEvent, EngineInstalledModel, EngineLearningSnapshot, EngineLibraryScanOptions, EngineModelLibrarySnapshot, EnginePerformance, EngineSnapshot, EngineStatus, HubModelSummary, ModelPreflight, PullProgress, Readiness, EngineModelGenerationSettings, EngineModelPreviewResult, EngineModelComparisonInput, EngineModelComparisonSnapshot } from '../types'
 import { FAMILY_TITLES, SUGGESTED_MODELS, drafterFor } from './catalog'
 import { parseCapabilities, parseInfoOutput, parseModelsOutput, parseVersion, runEngineCli, type ModelInfo } from './cli'
 import { ModelHub } from './model-hub'
+import { engineLaunchEnv, pinnedEngineEnv } from './engine-env'
+export { engineChildEnv } from './engine-env'
 import { assertRepoId, hasCachedSnapshot, hubCacheDir, repoCacheDir, repoCachedBytes, type EngineBinary } from './paths'
 import { setEnginePerformanceRecorder, setEngineServeHook } from './provider'
 import { createTurnStats, finalizeTurnStats, readEngineTimings, recordModelCall, type ModelCallSample } from '../turn-stats'
 import { recordEngineContext } from './context'
-import { EngineDownloads, type RunningPull } from './downloads'
-import { engineLaunchEnv } from './engine-env'
-import type { EngineServiceOptions } from './service-options'
-export { engineChildEnv } from './engine-env'
-export type { EngineServiceOptions } from './service-options'
+import { PullQueue, type PullHandle } from './pull'
 import { EngineSupervisor } from './supervisor'
 import { ModelRevisions } from './model-revisions'
 import { EnginePreferenceStore } from './preferences'
@@ -22,23 +21,62 @@ import { LearningCopies, LEARNING_MODEL } from './learning-copy'
 import { EngineLearning } from './learning'
 import { isLocalModelId, ModelLibrary } from './library'
 import { assertCortheonReleaseAllowed, CORTHEON_RELEASE_POLICY, cortheonEnabledForRelease } from '../../../shared/release-feature-policy'
+import { measureModelPreview } from './model-preview'
+import { ModelComparisons } from './model-comparison'
+import { modelLaunchOptions } from './launch-options'
+import type { ModelBenchmarkInput, ModelBenchmarkReceipt, ModelBenchmarkSnapshot } from '../../../shared/model-benchmark'
+import { ModelBenchmarks } from './benchmark/controller'
+import { createModelBenchmarkStore, benchmarkWorkspace, readBenchmarkReceiptFile, type ModelBenchmarkStore } from './benchmark/storage'
+import { startBenchmarkProcess } from './benchmark/process'
+import { assertBundledBenchmarkVersion } from './benchmark/version'
 
-// Main-process ownership of the supervisor, pull jobs, cached CLI answers and renderer events.
+// Glue for the main process: one supervisor, the pull jobs, cached CLI answers, and the events the
+// renderer mirrors. Electron-free; main-app passes the binary path, app home and an emitter.
+
+export interface EngineServiceOptions {
+  binaryPath: string
+  appHome: string
+  env?: NodeJS.ProcessEnv
+  // Exact environment for engine processes; tests use it to reach the fake engine's knobs.
+  childEnv?: NodeJS.ProcessEnv
+  binary?: EngineBinary
+  fetch?: typeof fetch
+  totalMemoryBytes?: number
+  memoryBudgetBytes?: number
+  readyTimeoutMs?: number
+  pollMs?: number
+  emit: (event: EngineEvent) => void
+  onInstalled?: (repos: string[]) => void
+  assertComparisonAllowed?: () => void
+  modelSettings?: (repo: string) => EngineModelGenerationSettings | null
+  benchmarkStore?: ModelBenchmarkStore
+}
+
 function processAlive(pid: number): boolean {
   try { process.kill(pid, 0); return true } catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM' }
 }
 
 export class EngineService {
   readonly supervisor: EngineSupervisor
-  private readonly env: NodeJS.ProcessEnv
+  private readonly launch: { env: NodeJS.ProcessEnv; endpoint: string }
   private readonly totalMemoryBytes: number
   private version: string | null = null
   private versionChecked = false
   private capabilities: EngineCapabilities | null = null
   private performance: EnginePerformance | null = null
   private installedCache: EngineInstalledModel[] | null = null
-  private readonly pulls = new Map<string, RunningPull>()
-  private readonly downloads: EngineDownloads
+  private readonly pulls = new Map<string, { handle: PullHandle; last: PullProgress }>()
+  private readonly finished = new Map<string, PullProgress>()
+  private readonly pullQueue = new PullQueue()
+  private deletingModel = false
+  private preview: { model: string; controller: AbortController; profile: EngineModelGenerationSettings | null; promise: Promise<EngineModelPreviewResult> } | null = null
+  private readonly comparisons: ModelComparisons
+  private readonly benchmarks: ModelBenchmarks
+  private benchmarkAdmission: (() => void) | null = null
+  private sharedEndpointKey: string | null = null
+  private comparisonAdmission: (() => void) | null = null
+  private comparisonRequest: { owner: symbol; model: string; profile: EngineModelGenerationSettings | null } | null = null
+  private readonly lastPullEmit = new Map<string, number>()
   private readonly models: ModelHub
   private readonly revisions: ModelRevisions
   private readonly preferences: EnginePreferenceStore
@@ -55,23 +93,20 @@ export class EngineService {
   private learningPurge: Promise<void> | null = null
   private purgingLearning = false
 
+  // A supplied childEnv stays live for the fake engine's knobs; the authorized Hub origin stays pinned either way.
+  private get env(): NodeJS.ProcessEnv {
+    return this.options.childEnv ? pinnedEngineEnv(this.options.childEnv, this.launch.endpoint) : this.launch.env
+  }
+
   constructor(private readonly options: EngineServiceOptions) {
-    const launch = engineLaunchEnv(options)
-    this.env = launch.env
+    this.launch = engineLaunchEnv(options)
     this.totalMemoryBytes = options.totalMemoryBytes ?? os.totalmem()
     this.models = new ModelHub({
-      endpoint: launch.endpoint, fetch: options.fetch, env: this.env, totalMemoryBytes: this.totalMemoryBytes,
+      endpoint: this.launch.endpoint, fetch: options.fetch, env: this.env, totalMemoryBytes: this.totalMemoryBytes,
       capabilities: () => this.capabilitiesDoc(), installed: () => this.installed(), cacheDir: () => this.hub,
       memory: () => ({ limit: this.supervisor.memoryLimitBytes, budget: this.supervisor.memoryBudgetBytes }),
     })
     this.revisions = new ModelRevisions(options.appHome, () => this.hub)
-    this.downloads = new EngineDownloads({
-      running: this.pulls, revisions: this.revisions, env: this.env, hub: () => this.hub,
-      binary: () => this.requireBinary(), assertIdle: (repo) => this.assertPullIdle(repo),
-      cached: (key) => this.models.cached(key), preflight: (repo, revision) => this.preflight(repo, revision),
-      invalidate: (repo) => this.invalidatePreflight(repo), invalidateInstalled: () => { this.installedCache = null },
-      refreshInstalled: () => this.installed(true), emit: options.emit, pollMs: options.pollMs,
-    })
     this.preferences = new EnginePreferenceStore(options.appHome)
     this.library = new ModelLibrary({ appHome: options.appHome, env: this.env, capabilities: () => this.capabilitiesDoc(), memoryLimitBytes: () => this.supervisor.memoryLimitBytes })
     this.learningCopies = new LearningCopies(options.appHome)
@@ -80,8 +115,9 @@ export class EngineService {
       env: () => this.env,
       info: (repo) => this.info(repo),
       resolveModelArgument: (repo) => this.modelArgument(repo),
-      drafterFor: (repo) => drafterFor(this.localRepos.get(repo) ?? repo),
+      drafterFor: (repo) => this.requiredDrafter(repo),
       drafterBytes: (repo) => this.cachedModelBytes(repo),
+      modelSettings: (repo) => this.options.modelSettings?.(repo) ?? null,
       totalMemoryBytes: this.totalMemoryBytes,
       memoryBudgetBytes: options.memoryBudgetBytes,
       readyTimeoutMs: options.readyTimeoutMs,
@@ -94,12 +130,53 @@ export class EngineService {
         return this.learningSupported && repo === prefs.learningModel ? { enabled: prefs.learningEnabled, graphFile: this.learningCopies.graphFile(repo) } : null
       },
     })
+    this.comparisons = new ModelComparisons({
+      assertAllowed: () => this.assertComparisonAllowed(),
+      reserve: () => this.supervisor.reserveSequence(),
+      validateModels: async (models) => {
+        const installed = await this.installed(true)
+        for (const model of models) {
+          const entry = installed.find((item) => item.repo === model)
+          if (!entry) throw new Error('Choose models that are installed in your local library.')
+          if (entry.fitsMemory !== true) throw new Error(`${model} has not been confirmed to fit this Mac's model memory budget.`)
+          // info() checks the actual admitted checkpoint and registered engine family.
+          await this.info(model)
+        }
+      },
+      measure: async (model, prompt, signal, owner) => {
+        const request = { owner, model, profile: null as EngineModelGenerationSettings | null }
+        this.comparisonRequest = request
+        try { return await measureModelPreview(model, signal, () => request.profile, undefined, { prompt, owner, assertAllowed: () => this.assertComparisonAllowed() }) }
+        finally { if (this.comparisonRequest === request) this.comparisonRequest = null }
+      },
+    })
     this.learning = new EngineLearning({ appHome: options.appHome, supervisor: this.supervisor, copies: this.learningCopies,
       settings: () => ({ supported: this.learningSupported, enabled: this.preferences.get().learningEnabled, model: this.preferences.get().learningModel }),
       emit: (snapshot) => {
         if (snapshot.job && ['done', 'cancelled', 'interrupted'].includes(snapshot.job.state)) this.installedCache = null
         options.emit({ kind: 'learning', snapshot })
       }, pollMs: options.pollMs,
+    })
+    this.benchmarks = new ModelBenchmarks({
+      assertAllowed: () => this.assertBenchmarkAllowed(),
+      validateModel: async (model) => {
+        const installed = await this.installed(true)
+        const entry = installed.find(item => item.repo === model)
+        if (!entry || entry.fitsMemory !== true || entry.source === 'library' || isLocalModelId(model) || !(await hasCachedSnapshot(this.hub, model))) throw new Error('Choose a cached installed checkpoint confirmed to fit this Mac.')
+        const revision = (await fs.readFile(path.join(repoCacheDir(this.hub, model), 'refs', 'main'), 'utf8')).trim()
+        const snapshot = await this.revisions.snapshot(model, revision)
+        const argument = await this.modelArgument(model)
+        if (argument !== model && await fs.realpath(argument) !== snapshot) throw new Error('The selected checkpoint differs from the cached public model.')
+        const status = await this.status()
+        const engineVersion = assertBundledBenchmarkVersion(status.version)
+        await this.info(model)
+        return { revision, configSha256: createHash('sha256').update(await fs.readFile(path.join(snapshot, 'config.json'))).digest('hex'), engineVersion }
+      },
+      reserve: () => this.supervisor.reserveSequence('local benchmark'),
+      workspace: () => benchmarkWorkspace(options.appHome),
+      process: (input, workspace, progress, signal) => startBenchmarkProcess({ binary: this.requireBinary(), input, ...workspace, workingDirectory: workspace.directory, env: this.env, progress, signal }),
+      readReceipt: (file, input) => readBenchmarkReceiptFile(file, input),
+      store: options.benchmarkStore ?? createModelBenchmarkStore(options.appHome),
     })
   }
 
@@ -121,7 +198,23 @@ export class EngineService {
   // Wires streamChat's engine hook to this service and clears an engine a crashed run left behind.
   install(): void {
     setEnginePerformanceRecorder((model, sample) => this.recordPerformance(model, sample))
-    setEngineServeHook(async (model, options) => { this.assertNotQuitting(); await this.status(); return this.supervisor.acquire(model, options) })
+    setEngineServeHook(async (model, options) => {
+      this.assertModelAdmission()
+      const comparison = this.comparisonRequest
+      if (this.comparisons.busy && (!comparison || comparison.owner !== options.owner || comparison.model !== model)) throw new Error('Finish or cancel the model comparison before using the local engine.')
+      if (options.owner && (!this.comparisons.busy || comparison?.owner !== options.owner || comparison.model !== model)) throw new Error('This comparison no longer owns the local engine.')
+      if (options.owner) this.assertComparisonAllowed()
+      await this.status(); this.assertModelAdmission()
+      if (options.owner) this.assertComparisonAllowed()
+      const lease = await this.supervisor.acquire(model, options)
+      try {
+        const saved = this.options.modelSettings?.(model) ?? null
+        const generation = options.owner && comparison ? { ...(saved ?? { contextTokens: this.supervisor.status().contextTokens ?? 4096, topP: 1, topK: 0, minP: 0, speculativeDecoding: 'off' as const }), temperature: 0, maxOutputTokens: 256 } : saved
+        if (options.owner && comparison) comparison.profile = generation
+        if (options.exclusive && this.preview?.model === model) this.preview.profile = generation
+        return { ...lease, generation: generation ?? undefined }
+      } catch (error) { lease.release(); throw error }
+    })
     void this.reapStaleEngine()
   }
 
@@ -148,6 +241,8 @@ export class EngineService {
   }
 
   private changeFeature<T>(run: () => Promise<T>): Promise<T> {
+    if (this.benchmarks?.busy) return Promise.reject(new Error('Finish or cancel the local benchmark before changing engine settings.'))
+    if (this.comparisons.busy) return Promise.reject(new Error('Finish or cancel the model comparison before changing local engine settings.'))
     this.featurePending++
     const next = this.featureChanges.then(() => { this.assertNotQuitting(); return run() }).finally(() => { this.featurePending-- })
     this.featureChanges = next.catch(() => {})
@@ -220,18 +315,98 @@ export class EngineService {
     return snapshot
   }
 
-  async teach(text: string): Promise<EngineLearningSnapshot> { this.assertNotQuitting(); await this.status(); this.assertNotQuitting(); return this.learning.teach(text) }
+  async teach(text: string): Promise<EngineLearningSnapshot> { if (this.benchmarks.busy) throw new Error('Finish or cancel the local benchmark before teaching.'); if (this.comparisons.busy) throw new Error('Finish or cancel the model comparison before teaching.'); this.assertNotQuitting(); await this.status(); this.assertNotQuitting(); return this.learning.teach(text) }
   async cancelTeach(): Promise<EngineLearningSnapshot> { return this.learning.cancel() }
 
-  isLearningBusy(): boolean { return this.learning.busy || this.featurePending > 0 }
+  isLearningBusy(): boolean { return this.learning.busy || this.featurePending > 0 || this.preview != null || this.comparisons.busy || this.benchmarks.busy }
+
+  applyModelSettings(model: string, apply: () => Promise<void>, rollback: () => Promise<void>): Promise<void> {
+    this.assertModelAdmission()
+    assertRepoId(model)
+    if (this.learning.busy || this.preview) return Promise.reject(new Error('Finish the current lesson or model preview before applying model settings.'))
+    return this.changeFeature(async () => {
+      try {
+        await this.supervisor.configureModel(model, async () => {
+          await apply()
+          const settings = this.options.modelSettings?.(model)
+          if (settings) modelLaunchOptions(settings, (await this.info(model)).contextTokens)
+        }, rollback)
+      } finally { this.installedCache = null; this.emitStatus() }
+    })
+  }
+
+  tryModel(model: string): Promise<EngineModelPreviewResult> {
+    this.assertModelAdmission()
+    assertRepoId(model)
+    if (this.isLearningBusy()) return Promise.reject(new Error('Finish the current lesson, settings change or preview before measuring another model.'))
+    if (this.hasExternalResearchEnabled()) return Promise.reject(new Error('Turn external research off before running a local model preview.'))
+    const controller = new AbortController()
+    const job = { model, controller, profile: null as EngineModelGenerationSettings | null, promise: Promise.resolve(null as unknown as EngineModelPreviewResult) }
+    this.preview = job
+    const timeout = setTimeout(() => controller.abort(new Error('The model preview timed out. Try a smaller model or context window.')), 180_000)
+    job.promise = measureModelPreview(model, controller.signal, () => job.profile).finally(() => { clearTimeout(timeout); if (this.preview === job) this.preview = null })
+    return job.promise
+  }
+
+  assertLocalWorkAdmission(): void {
+    this.assertModelAdmission()
+    if (this.comparisons.busy) throw new Error('Finish or cancel the model comparison before starting local model work.')
+  }
+  setComparisonAdmission(assertAllowed: (() => void) | null): void { this.comparisonAdmission = assertAllowed }
+  compareModels(input: EngineModelComparisonInput): Promise<EngineModelComparisonSnapshot> { return this.comparisons.start(input) }
+  comparisonStatus(id: string): EngineModelComparisonSnapshot | null { return this.comparisons.snapshot(id) }
+  cancelComparison(id: string): boolean { return this.comparisons.cancel(id) }
+  setBenchmarkAdmission(assertAllowed: (() => void) | null): void { this.benchmarkAdmission = assertAllowed }
+  startBenchmark(input: ModelBenchmarkInput): Promise<ModelBenchmarkSnapshot> { return this.benchmarks.start(input) }
+  benchmarkStatus(id?: string): Promise<ModelBenchmarkSnapshot | null> { return this.benchmarks.snapshot(id) }
+  benchmarkHistory(): Promise<ModelBenchmarkSnapshot[]> { return this.benchmarks.history() }
+  cancelBenchmark(id: string): boolean { return this.benchmarks.cancel(id) }
+  benchmarkReceiptForExport(id: string): Promise<ModelBenchmarkReceipt> { return this.benchmarks.receiptForExport(id) }
+  settleBenchmarks(id?: string): Promise<void> { return this.benchmarks.settle(id) }
+  private assertBenchmarkAllowed(): void {
+    this.assertNotQuitting()
+    this.benchmarkAdmission?.()
+    if (this.deletingModel || this.pullQueue.busy || this.learning.busy || this.featurePending || this.preview || this.comparisons.busy || this.supervisor.status().learningActive || this.preferences.get().learningEnabled) throw new Error('Finish local work, downloads and model settings changes, and turn Living Weights off before benchmarking.')
+    if (this.hasExternalResearchEnabled()) throw new Error('Turn external research off before benchmarking local models.')
+    if (this.sharedEndpointKey && this.supervisor.live()?.apiKey === this.sharedEndpointKey) throw new Error('Unload the shared API session before benchmarking; external clients may still be using it.')
+  }
+  private assertComparisonAllowed(): void {
+    this.assertModelAdmission()
+    this.options.assertComparisonAllowed?.()
+    this.comparisonAdmission?.()
+    if (this.learning.busy || this.featurePending || this.preview || this.supervisor.status().learningActive || this.preferences.get().learningEnabled) throw new Error('Finish local work and turn Living Weights off before comparing models.')
+    if (this.hasExternalResearchEnabled()) throw new Error('Turn external research off before comparing local models.')
+    if (this.sharedEndpointKey && this.supervisor.live()?.apiKey === this.sharedEndpointKey) throw new Error('Unload the model to close its shared API session before comparing models; external clients may still be using it.')
+  }
+
+  cancelTryModel(): boolean {
+    if (!this.preview) return false
+    this.preview.controller.abort(new Error('Model preview cancelled.'))
+    return true
+  }
 
   private assertNotQuitting(): void {
     if (this.quitting) throw new Error('TensorFold is waiting for Living Weights to save before quitting.')
     if (this.purgingLearning) throw new Error('TensorFold is pausing local models while learned data is erased.')
   }
 
+  private assertModelAdmission(): void {
+    this.assertNotQuitting()
+    if (this.benchmarks?.busy) throw new Error('Finish or cancel the local benchmark before changing or using the local engine.')
+    if (this.deletingModel) throw new Error('Wait for model cache cleanup before loading or using a model.')
+  }
+
   async prepareToQuit(): Promise<void> {
     this.quitting = true
+    this.benchmarks.dispose(false)
+    await this.benchmarks.settle()
+    const comparisonId = this.comparisons.currentId
+    if (comparisonId) this.cancelComparison(comparisonId)
+    await this.comparisons.settle()
+    this.comparisons.clear()
+    const preview = this.preview
+    this.cancelTryModel()
+    await preview?.promise.catch(() => {})
     await this.featureChanges
     await this.learning.settle()
   }
@@ -239,8 +414,19 @@ export class EngineService {
   beginLearningPurge(): Promise<void> {
     // Close admission synchronously, before the caller acquires/awaits its global purge lease.
     this.purgingLearning = true
+    const benchmark = this.benchmarks.currentId
+    if (benchmark) this.benchmarks.cancel(benchmark)
+    const preview = this.preview
+    this.cancelTryModel() // Close the owned preview request before waiting on global purge leases.
+    this.options.emit({ kind: 'comparison-cleared' })
     this.learning.setPaused(true)
+    const comparisonId = this.comparisons.currentId
+    if (comparisonId) this.cancelComparison(comparisonId)
     return this.learningPurge ??= (async () => {
+      await preview?.promise.catch(() => {})
+      await this.comparisons.settle()
+      await this.benchmarks.settle()
+      this.comparisons.clear()
       await this.featureChanges
       await this.learning.settle()
     })()
@@ -289,10 +475,13 @@ export class EngineService {
 
   // For an explicit client-connection request, without starting a model or emitting credentials.
   async connection(): Promise<EngineConnection | null> {
+    if (this.comparisons.busy || this.benchmarks.busy) throw new Error('API sharing is paused during local model comparisons and benchmarks.')
     // Enabling learning restarts the server and rotates the previously shared key. Keep the new
     // learner key inside the main process so external requests cannot bypass its save/quit guards.
     if (this.preferences.get().learningEnabled || this.supervisor.status().learningActive) throw new Error('Local API sharing is paused while Living Weights is enabled. Turn teaching off before copying a connection for another app.')
-    return this.supervisor.live()
+    const live = this.supervisor.live()
+    if (live) this.sharedEndpointKey = live.apiKey
+    return live
   }
 
   hasExternalResearchEnabled(): boolean { return this.preferences.get().cortheon || this.supervisor.status().cortheonActive }
@@ -333,10 +522,11 @@ export class EngineService {
     assertRepoId(repo)
     if (isLocalModelId(repo)) {
       const local = await this.library.resolve(repo)
+      if (local.repo && (this.pullQueue.hasRepo(local.repo) || this.pullQueue.hasRepo(this.requiredDrafter(repo, local.repo) ?? ''))) throw new Error('Wait for the model download to finish before loading it.')
       if (local.repo) this.localRepos.set(repo, local.repo)
       return local.path
     }
-    if (this.pulls.has(repo) || [...this.pulls.keys()].some((model) => drafterFor(model) === repo)) throw new Error('Wait for the model download to finish before loading it.')
+    if (this.pullQueue.hasRepo(repo)) throw new Error('Wait for the model download to finish before loading it.')
     if (repo === this.preferences.get().learningModel) {
       const owned = await this.learningCopies.existing(repo)
       if (!owned) throw new Error('The private Living Weights model is missing; preserve its profile before repairing it.')
@@ -358,6 +548,10 @@ export class EngineService {
       if (await hasCachedSnapshot(this.hub, repo)) return repoCachedBytes(this.hub, repo)
       return (await this.localDrafter(repo))?.weightsBytes ?? null
     } catch { return null }
+  }
+
+  private requiredDrafter(model: string, canonical = this.localRepos.get(model) ?? model): string | null {
+    return this.options.modelSettings?.(model)?.speculativeDecoding === 'off' ? null : drafterFor(canonical)
   }
 
   private async localDrafter(repo: string) {
@@ -385,7 +579,7 @@ export class EngineService {
     for (const repo of Object.keys(selected)) if (!models.has(repo)) models.set(repo, { repo, family: '', modelType: '' })
     const out: EngineInstalledModel[] = []
     for (const model of models.values()) {
-      const drafter = drafterFor(model.repo)
+      const drafter = this.requiredDrafter(model.repo)
       const drafterBytes = drafter ? await this.cachedModelBytes(drafter) : null
       const entry: EngineInstalledModel = { ...model, source: selected[model.repo] ? 'download' : 'cache', format: null, contextTokens: null, weightsBytes: null, memoryFloorBytes: null, fitsMemory: null, drafter, drafterInstalled: drafter ? drafterBytes != null : null }
       try {
@@ -406,7 +600,7 @@ export class EngineService {
     for (const local of (await this.library.snapshot()).models.filter((model) => model.loadable)) {
       try {
         const checked = await this.library.resolve(local.id)
-        const drafter = checked.repo ? drafterFor(checked.repo) : null
+        const drafter = checked.repo ? this.requiredDrafter(local.id, checked.repo) : null
         const drafterBytes = drafter ? await this.cachedModelBytes(drafter) : null
         const memoryFloorBytes = checked.memoryFloorBytes == null ? null : checked.memoryFloorBytes + (drafterBytes ?? 0)
         if (checked.repo) this.localRepos.set(local.id, checked.repo)
@@ -423,9 +617,59 @@ export class EngineService {
 
   preflight(repo: string, revision: string | null = null): Promise<ModelPreflight> { return this.models.preflight(repo, revision) }
 
-  pullList(): PullProgress[] { return this.downloads.list() }
+  pullList(): PullProgress[] {
+    const running = [...this.pulls.values()].map((p) => p.last)
+    return [...running, ...[...this.finished.values()].filter((p) => !this.pulls.has(p.repo))]
+  }
 
-  pull(repo: string, revision: string | null = null): Promise<PullProgress> { return this.downloads.pull(repo, revision) }
+  async pull(repo: string, revision: string | null = null): Promise<PullProgress> {
+    this.assertModelAdmission()
+    if (this.deletingModel) throw new Error('Wait for model cache cleanup before starting a download.')
+    if (isLocalModelId(repo)) throw new Error('Local library checkpoints load in place and cannot be downloaded by their library ID.')
+    if (this.pulls.has(assertRepoId(repo))) return this.pulls.get(repo)!.last
+    await this.revisions.read() // Preserve invalid registry bytes and refuse before starting a child.
+    this.assertPullIdle(repo)
+    const pre = this.models.cached(JSON.stringify([repo, revision])) ?? await this.preflight(repo, revision)
+    this.assertModelAdmission()
+    if (this.deletingModel) throw new Error('Wait for model cache cleanup before starting a download.')
+    this.assertPullIdle(repo)
+    if (this.pulls.has(repo)) return this.pulls.get(repo)!.last
+    if (!['ok', 'installed'].includes(pre.verdict)) throw new Error(pre.reasons[0] ?? `${repo} cannot be downloaded for the built-in engine.`)
+    if (!pre.resolvedRevision || (pre.drafter && !pre.drafter.resolvedRevision)) throw new Error('Retry the model checks to resolve an immutable checkpoint before downloading.')
+    const steps = [{ repo, revision: pre.resolvedRevision }, ...(pre.drafter ? [{ repo: pre.drafter.repo, revision: pre.drafter.resolvedRevision! }] : [])]
+    for (const step of steps) this.assertPullIdle(step.repo)
+    this.finished.delete(repo)
+    const handle = this.pullQueue.enqueue({
+      binary: this.requireBinary(),
+      env: this.env,
+      hub: this.hub,
+      steps,
+      totalBytes: pre.totalBytes,
+      pollMs: this.options.pollMs ? Math.max(50, this.options.pollMs) : 1000,
+      onUpdate: (progress) => this.onPullUpdate(progress),
+    }, async (final) => { await this.revisions.commit(steps); return final })
+    this.pulls.set(repo, { handle, last: handle.progress() })
+    this.options.emit({ kind: 'pull', pull: handle.progress() })
+    void handle.done.then(async (final) => {
+      this.pulls.delete(repo)
+      this.finished.set(repo, final)
+      this.invalidatePreflight(repo)
+      this.installedCache = null
+      this.options.emit({ kind: 'pull', pull: final })
+      if (final.state === 'done') await this.installed(true).catch(() => {})
+    })
+    return handle.progress()
+  }
+
+  private onPullUpdate(progress: PullProgress): void {
+    if (!['queued', 'running', 'verifying'].includes(progress.state)) return // Completion follows durable selection.
+    const job = this.pulls.get(progress.repo)
+    if (job) job.last = progress
+    const now = Date.now()
+    if (progress.state === 'running' && now - (this.lastPullEmit.get(progress.repo) ?? 0) < 250) return
+    this.lastPullEmit.set(progress.repo, now)
+    this.options.emit({ kind: 'pull', pull: progress })
+  }
 
   private assertPullIdle(repo: string): void {
     const status = this.supervisor.status()
@@ -444,9 +688,10 @@ export class EngineService {
   }
 
   async load(repo: string): Promise<EngineStatus> {
-    this.assertNotQuitting()
+    this.assertModelAdmission()
     await this.status() // Restore managed flags before starting a model after an app restart.
     if (isLocalModelId(repo)) await this.library.resolve(repo)
+    this.assertModelAdmission()
     await this.supervisor.serve(assertRepoId(repo))
     return this.statusNow()
   }
@@ -460,20 +705,27 @@ export class EngineService {
   // Removes the repo's folder from the shared cache, and its drafter when no other installed model uses it.
   async remove(repo: string): Promise<EngineInstalledModel[]> {
     assertRepoId(repo)
+    this.assertModelAdmission()
+    if (this.deletingModel || this.pullQueue.busy) throw new Error('Finish or cancel model downloads before cleaning the shared cache.')
+    this.deletingModel = true
+    try { return await this.supervisor.mutateCache(() => this.removeModelNow(repo)) } finally { this.deletingModel = false }
+  }
+
+  private async removeModelNow(repo: string): Promise<EngineInstalledModel[]> {
     if (isLocalModelId(repo)) throw new Error('Local library checkpoints are read-only. Remove their search folder to unlink them; their files stay untouched.')
     const selected = await this.revisions.read()
     if (!selected[repo]) throw new Error('This checkpoint belongs to the shared cache, rather than an app-managed download. TensorFold will not delete it.')
     const status = this.supervisor.status()
-    if (status.model === repo && status.state !== 'stopped' && status.state !== 'failed') throw new Error(`Unload ${repo} before deleting it.`)
+    if ((status.model === repo || this.localRepos.get(status.model ?? '') === repo || status.drafter === repo) && status.state !== 'stopped' && status.state !== 'failed') throw new Error(`Unload ${repo} before deleting it.`)
     if (this.pulls.has(repo)) throw new Error(`Cancel the download of ${repo} before deleting it.`)
     const installed = await this.installed()
     const drafter = drafterFor(repo)
     const targets = [repo]
-    if (drafter && selected[drafter] && !installed.some((m) => m.repo !== repo && m.drafter === drafter)) targets.push(drafter)
+    if (drafter && selected[drafter] && !installed.some((m) => m.repo !== repo && drafterFor(this.localRepos.get(m.repo) ?? m.repo) === drafter)) targets.push(drafter)
     for (const target of targets) await this.removeRepoFolder(target, selected[target])
     await this.revisions.remove(targets)
     this.invalidatePreflight(repo)
-    this.downloads.forget(repo)
+    this.finished.delete(repo)
     return this.installed(true)
   }
 
@@ -518,7 +770,7 @@ export class EngineService {
   async librarySnapshot(): Promise<EngineModelLibrarySnapshot> {
     const snapshot = await this.library.snapshot()
     for (const model of snapshot.models) {
-      const drafter = model.repo ? drafterFor(model.repo) : null
+      const drafter = model.repo ? this.requiredDrafter(model.id, model.repo) : null
       if (!drafter || !model.loadable) continue
       const bytes = await this.cachedModelBytes(drafter)
       if (bytes == null) { model.loadable = false; model.reason = `This checkpoint needs its drafter ${drafter}. Download the full model in Models or scan the companion checkpoint too.` }
@@ -538,17 +790,17 @@ export class EngineService {
   }
 
   async scanLibrary(options: EngineLibraryScanOptions = {}): Promise<EngineModelLibrarySnapshot> {
-    this.assertNotQuitting()
+    this.assertModelAdmission()
     return this.libraryChanged(await this.library.scan(options))
   }
 
   async addLibraryFolder(directory: string): Promise<EngineModelLibrarySnapshot> {
-    this.assertNotQuitting()
+    this.assertModelAdmission()
     return this.libraryChanged(await this.library.addFolder(directory))
   }
 
   async removeLibraryFolder(id: string): Promise<EngineModelLibrarySnapshot> {
-    this.assertNotQuitting()
+    this.assertModelAdmission()
     // Unlinking a search folder never stops a loaded API or modifies its checkpoint files.
     return this.libraryChanged(await this.library.removeFolder(id))
   }
@@ -557,11 +809,14 @@ export class EngineService {
 
   // Quit path, without waiting: SIGTERM at before-quit, SIGKILL (force) when the process exits.
   shutdown(force = true): void {
-    if (!force && this.learning.busy) {
+    if (!force && (this.learning.busy || this.benchmarks.busy)) {
       void this.prepareToQuit().then(() => this.shutdown(false)).catch(() => {})
       return
     }
     this.learning.shutdown()
+    this.benchmarks.dispose()
+    this.cancelTryModel()
+    this.pullQueue.cancelAll()
     void this.library.cancel().catch(() => {})
     for (const { handle } of this.pulls.values()) handle.cancel()
     this.supervisor.killNow(force ? 'SIGKILL' : 'SIGTERM')
