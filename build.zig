@@ -118,10 +118,26 @@ pub fn build(b: *std.Build) void {
     const cost_run = b.addRunArtifact(cost_cases);
     b.step("test-cost-rule", "CPU scripted window and interleaved head timing").dependOn(&cost_run.step);
     test_step.dependOn(&cost_run.step);
+    const identity_cases = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/core/lanes/cost_identity.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+        .link_libc = true,
+    }) });
+    const identity_run = b.addRunArtifact(identity_cases);
+    b.step("test-cost-identity", "Streamed window-cost identity matches legacy bytes with bounded memory").dependOn(&identity_run.step);
+    test_step.dependOn(&identity_run.step);
     merge_build.targets(b, target, optimize); // tensorfold merge's tests and tf-merge-check, host only on every OS
+    const voice_tool = b.createModule(.{ .root_source_file = b.path("zig/src/server/drama_voice_tool.zig"), .target = target, .optimize = optimize });
+    _ = server_build.addTo(b, voice_tool, target, optimize);
+    const voice_exe = b.addExecutable(.{ .name = "drama3-voice", .root_module = voice_tool });
+    b.step("drama3-voice", "Attested Drama voice files from reference WAVs, coded by drama3-generate --encode").dependOn(&b.addInstallArtifact(voice_exe, .{}).step);
+    // the backend options are declared for every target, so one build script may pass the same flags on every OS
+    const cuda_options = @import("zig/build/options.zig").cuda(b);
+    const tp_options = @import("zig/build/options.zig").tp(b);
     switch (target.result.os.tag) {
         .macos => metalTargets(b, target, optimize, draft_ids, build_options, test_step),
-        .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options),
+        .linux, .windows => cuda_build.targets(b, target, optimize, draft_ids, build_options, cuda_options),
         else => {},
     }
     const gemma4_host_sources = b.createModule(.{ .root_source_file = b.path("zig/kernels/metal/sources.zig"), .target = b.graph.host });
@@ -137,7 +153,7 @@ pub fn build(b: *std.Build) void {
     const xgrammar = grammar_build.option(b);
     dist_build.targets(b, draft_ids, build_options, release_version, xgrammar);
     @import("zig/build/sessions.zig").add(b, test_step);
-    @import("zig/build/tp.zig").add(b, target, optimize, test_step);
+    @import("zig/build/tp.zig").add(b, target, optimize, test_step, tp_options);
     @import("zig/build/gradient_host.zig").add(b);
     @import("zig/build/living_tools_host.zig").steps(b);
     cuda_build.hostTests(b, draft_ids, build_options, test_step, target.result.os.tag != .macos);
@@ -149,7 +165,10 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = api_mod })).step);
     }
     poolChecks(b, b.graph.host, test_step);
-    hip_build.steps(b, target, optimize, build_options, test_step);
+    const with_hip = b.option(bool, "hip", "Enable the opt-in HIP backend and its host/device targets") orelse false;
+    const hip_options = hip_build.options(b); // declared on every target (#1165), used only with -Dhip=true
+    hip_build.loaderTests(b, test_step);
+    if (with_hip) hip_build.steps(b, target, optimize, build_options, test_step, hip_options);
     exlr8_build.hostTests(b, target, test_step);
     xpu_build.steps(b, target, optimize, build_options);
     video_build.steps(b, target, test_step);
@@ -177,6 +196,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&warning_run.step);
     b.step("test-learn-warning", "CPU production-log refusal, backoff and recovery test").dependOn(&warning_run.step);
     grammar_build.steps(b, target, xgrammar);
+    grammar_build.hostTests(b, test_step);
     contract_build.hostTests(b, gemma4_contract_host);
     sys_build.wire(b);
     @import("zig/build/checkpoint_config.zig").wire(b);

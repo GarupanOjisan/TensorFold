@@ -10,6 +10,7 @@ pub const hf_text = @import("hf_text.zig");
 pub const listener = @import("listener.zig");
 pub const server = @import("server.zig");
 pub const serve = @import("serve.zig");
+pub const idle_unload = @import("idle_unload.zig");
 pub const hub = @import("hub.zig");
 pub const tool_specs = @import("tool_specs.zig");
 pub const Server = server.Server;
@@ -23,6 +24,8 @@ test {
     _ = @import("done_times_test.zig");
     _ = @import("drain_test.zig");
     _ = @import("keepalive_test.zig");
+    _ = @import("idle_unload.zig");
+    _ = @import("idle_unload_test.zig");
     @import("std").testing.refAllDecls(@This());
     _ = @import("json");
     _ = @import("std_options.zig");
@@ -47,6 +50,10 @@ test {
     _ = @import("status_routes.zig");
     _ = @import("speech.zig");
     if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_stream_test.zig"); // over a Unix socket pair
+    _ = @import("drama_voice_tool.zig");
+    _ = @import("speech_redraw.zig");
+    if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_redraw_test.zig"); // over a Unix socket pair
+    if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_register_test.zig"); // over a Unix socket pair
     _ = @import("drama_prompt.zig");
     _ = @import("health_test.zig");
     _ = @import("memory_routes.zig");
@@ -63,6 +70,7 @@ test {
     _ = @import("stream_preflight_test.zig");
     _ = @import("stream_dsml_test.zig");
     _ = @import("logprobs_test.zig");
+    _ = @import("think_split_test.zig");
     _ = @import("thinking_reserve_test.zig");
     _ = @import("late_system_test.zig");
     _ = @import("compact_test.zig");
@@ -70,6 +78,7 @@ test {
     _ = @import("completion_prompt_test.zig");
     _ = @import("hf_eos_http_test.zig");
     _ = @import("server_init_test.zig");
+    _ = @import("connection_arena_test.zig");
     _ = @import("decisions.zig");
     _ = @import("decisions_test.zig");
     _ = @import("systemone.zig");
@@ -100,6 +109,8 @@ test {
     _ = @import("slide_forget_test.zig");
     _ = @import("slide_supplied.zig");
     _ = @import("slide_questions_test.zig");
+    _ = @import("slide_teacher_test.zig");
+    _ = @import("slide_learn_path_test.zig");
     _ = @import("slide_whom.zig");
     _ = @import("slide_subject.zig");
     _ = @import("slide_span.zig");

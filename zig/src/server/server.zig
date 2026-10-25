@@ -23,6 +23,7 @@ const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
 const cortheon = @import("cortheon/cortheon.zig");
+const idle_unload = @import("idle_unload.zig");
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
@@ -32,11 +33,18 @@ pub const CompactAt = union(enum) { auto, fraction: f64 };
 
 pub const Identity = @import("identity.zig").Identity;
 
+/// The most a kept-alive connection's arena keeps between requests; a longer request's memory goes back.
+pub const connection_arena_limit: usize = 1 << 20;
+
 pub const Config = struct {
     browser: request_guard.Policy = .{},
+    allowed_controls: ?@import("drama_allow.zig").Policy = null,
+    redraw: @import("speech_redraw.zig").Policy = .{},
     sse_keepalive_s: f64 = 15,
     served_name: []const u8,
     model_dir: []const u8 = "",
+    voices_dir: ?[]const u8 = null,
+    default_voice: []const u8 = "default",
     /// The served name first, then aliases, without repeats.
     model_ids: []const []const u8,
     default_max_tokens: i64 = 4096,
@@ -48,6 +56,8 @@ pub const Config = struct {
     loop_guard: bool = false,
     /// Seconds the idle keepalive runs after the last request ends (0: off).
     keep_warm_s: i64 = 900,
+    /// Seconds of idle past the last request before the engine closes; the next request reloads it (0: never).
+    idle_unload_s: i64 = 0,
     dashboard: bool = false,
     /// Sampling when a request names none (generation_config.json and the serve flags), or null for greedy.
     default_sampling: ?Value = null,
@@ -55,6 +65,8 @@ pub const Config = struct {
     /// --vision-urls: image parts may name public HTTPS URLs, fetched before admission (media_fetch.zig).
     vision_urls: bool = false,
     seed_salt: i64 = 0,
+    silence_mid: bool = false,
+    silence_guard: bool = false,
     /// --prompt-seed keeps historical prompt-keyed sampling when a request omits its seed.
     prompt_seed: bool = false,
     /// TENSORFOLD_REQUEST_LOG: where chat and completion bodies are appended; null: nowhere.
@@ -90,10 +102,12 @@ pub const Server = struct {
     info: api.Info,
     text: model_text.Text,
     config: Config,
+    voices: []const @import("drama_voice.zig").Voice = &.{},
     keys: ?*auth.Store,
     late_system: []const u8 = "system",
     needs_user_after_tool: bool = false,
     markers: reply_text.Markers = reply_text.think_markers,
+    close_id: ?u32 = null, // the close marker's own token, when the marker is one token
     chunks: chunk_plan.Plan = .{},
     effort_levels: []const []const u8 = &.{},
     thinking_switch: bool = false,
@@ -109,6 +123,8 @@ pub const Server = struct {
     generating: std.atomic.Value(u32) = .init(0),
     /// The idle keepalive on the engine's queue, armed by --keep-warm; null when off or not Metal.
     keepalive: ?*api.keepalive.Keepalive = null,
+    /// The idle-unload manager (--idle-unload); null when off. Its thread parks the engine; a wake reloads it.
+    idle_manager: ?*idle_unload.Manager = null,
     preparing: std.atomic.Value(i64) = .init(0),
     speech_inflight: std.atomic.Value(u32) = .init(0),
     arena: std.heap.ArenaAllocator,
@@ -136,6 +152,11 @@ pub const Server = struct {
             log.line("--vision: marker token {d} is not an added token in this tokenizer; image and video input cannot be served safely", .{id});
             return error.InvalidVisionMarkers;
         };
+        if (config.voices_dir) |dir| {
+            if (srv.info.speech == null) return error.VoicesRequireSpeech;
+            srv.voices = try @import("drama_voice.zig").load(srv.arena.allocator(), io, dir);
+        }
+        _ = try @import("drama_voice.zig").select(srv.voices, config.default_voice, "default");
         if (!srv.info.text_generation) {
             if (config.cortheon) return error.CortheonRequiresTextGeneration;
             return srv;
@@ -150,6 +171,7 @@ pub const Server = struct {
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
+        srv.close_id = text.tokenId(srv.markers.close);
         const source = text.templateSource();
         srv.effort_levels = try fields.effortLevels(a, source);
         srv.thinking_switch = std.mem.indexOf(u8, source, "enable_thinking") != null or
@@ -332,7 +354,7 @@ pub const Server = struct {
         defer arena.deinit();
         var first = true;
         while (true) {
-            _ = arena.reset(.retain_capacity);
+            _ = arena.reset(.{ .retain_with_limit = connection_arena_limit });
             const a = arena.allocator();
             const outcome = conn.readRequest(a, !first) catch break;
             first = false;

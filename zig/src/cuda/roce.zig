@@ -11,6 +11,7 @@ const launch = @import("launch.zig");
 const tp_group = @import("tp_group.zig");
 const Stream = @import("stream.zig").Stream;
 const kernels = @import("kernels.zig");
+const nap = @import("roce_nap.zig");
 
 const max_hcas = 2;
 const slots = 2;
@@ -453,7 +454,6 @@ pub const Gather = struct {
     fn proxy(g: *Gather) void {
         const c = g.ctrl();
         var idle: u64 = 0;
-        const nap: std.c.timespec = .{ .sec = 0, .nsec = 20_000 };
         while (g.running.load(.monotonic)) {
             const seq = @atomicLoad(u32, &c[c_seq], .acquire);
             if (seq == g.last_seq) {
@@ -462,7 +462,7 @@ pub const Gather = struct {
                     g.failed.store(true, .release);
                     return;
                 };
-                if (idle >= idle_spins) _ = std.c.nanosleep(&nap, null);
+                if (idle >= idle_spins) nap.pause();
                 continue;
             }
             idle = 0;

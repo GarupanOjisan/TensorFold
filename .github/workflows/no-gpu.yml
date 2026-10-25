@@ -37,6 +37,25 @@ jobs:
         run: zig build fuzz-cortheon
       - name: Served Flash Next gate regressions
         run: python3 -m unittest discover -s tools/zig -p flashnext_batch_serve_test.py
+      # The generated Engram tables: committing a table that its generator no longer reproduces is a silent drift.
+      # The generator refuses any unicodedata but the pinned 16.0.0, which 3.14 carries and 3.12/3.13 do not.
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        id: nfkd-python
+        with:
+          python-version: "3.14"
+      - name: NFKD tables are current
+        env:
+          PYTHON: ${{ steps.nfkd-python.outputs.python-path }}
+        run: |
+          "$PYTHON" tools/zig/nfkd_tables.py --check --zig "$(command -v zig)" ||
+            { echo "regen: python3 tools/zig/nfkd_tables.py --zig zig"; exit 1; }
+      - name: NFKD generator tests
+        env:
+          PYTHON: ${{ steps.nfkd-python.outputs.python-path }}
+        run: cd tools/zig && "$PYTHON" -m unittest test_nfkd_tables
+      # Every build option is declared for every target, so one build script fits every OS.
+      - name: build options
+        run: python3 -m unittest discover -s tools/zig -p build_options_test.py
       # The lean rule (600-line files, one-line comments within 120 columns): no problem the base branch lacks.
       - name: lean check
         env:

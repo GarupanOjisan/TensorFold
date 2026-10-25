@@ -46,6 +46,7 @@ pub fn family(comptime F: type, o: api.Open) ?[]const u8 {
     }
     if (o.learn_conversations and F != nemotron.native) return "--learn-conversations keeps conversation states on disk for Nemotron only on CUDA: serve this model without it";
     if (o.kv8 and !(@hasDecl(F, "Options") and @hasField(F.Options, "kv8"))) return "--kv-cache fp8: this CUDA family keeps bf16 caches; serve without it";
+    if (o.prompt_int8 and !(@hasDecl(F, "Options") and @hasField(F.Options, "prompt_int8"))) return "--prompt-precision int8: this CUDA family's prompt matmuls take bf16 inputs; serve without it";
     return null;
 }
 
@@ -147,4 +148,17 @@ test "CUDA MTP controls refuse unsupported families before device work" {
 test "policy options are refused by families that do not implement them" {
     try std.testing.expect(backend(.{ .dir = "d", .model_type = "nemotron_h", .policy = "kv=fp8" }) != null);
     try std.testing.expect(backend(.{ .dir = "d", .model_type = "lfm2_vl", .policy = "kv=fp8" }) != null);
+}
+
+test "prompt precision: int8 is refused unless a CUDA family consumes the option" {
+    const Bf16 = struct {
+        pub const Options = struct {};
+    };
+    const Int8 = struct {
+        pub const Options = struct { prompt_int8: bool = false };
+    };
+    const request: api.Open = .{ .dir = "d", .model_type = "m", .prompt_int8 = true };
+    try std.testing.expectStringStartsWith(family(Bf16, request) orelse "", "--prompt-precision int8:");
+    try std.testing.expect(family(Int8, request) == null);
+    try std.testing.expect(family(Bf16, .{ .dir = "d", .model_type = "m" }) == null);
 }

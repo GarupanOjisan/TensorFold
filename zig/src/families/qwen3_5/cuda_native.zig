@@ -39,7 +39,7 @@ pub const snap_grid: u32 = E.max_rows;
 /// explain() words open refusals too (--vision on a checkpoint without a tower it reads).
 pub const explains_open = true;
 
-pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, kv8: bool = false };
+pub const Options = struct { context: usize, drafts: bool, segments: usize = 1, slide: bool = false, vision: ?vision.Limits = null, kv8: bool = false, prompt_int8: bool = false };
 
 /// What the native server drives: the lane backend, the facts its round loop reads, and how to free it.
 pub const Loaded = struct {
@@ -66,6 +66,7 @@ pub fn open(gpa: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: [
     if (o.slide and o.kv8) return error.UnsupportedLearningFormat;
     const e = try E.Engine.init(gpa, io, ctx, dir, o.kv8);
     errdefer e.deinit();
+    if (o.prompt_int8) try e.int8.enable(e); // --prompt-precision int8: prompt projections quantize their inputs
     if (e.g.vocab != c.vocab) return error.UnsupportedQwenVocab; // draw.zig's masks are sized by the 2B's vocabulary
     if (o.slide) _ = try @import("cuda_learn_shape.zig").from(e.g);
     // --vision: the checkpoint's tower, its weights and one call's scratch loaded beside the model's
@@ -207,12 +208,15 @@ fn coldCut(len: usize, chunks: []const u32, pos: usize) bool {
 }
 
 test "a pass resumes only where a cold pass cuts: every max_rows rows from 0 or from the request's chunk starts" {
-    try std.testing.expect(coldCut(1000, &.{}, E.max_rows * 3));
-    try std.testing.expect(!coldCut(1000, &.{}, E.max_rows * 3 + 1));
-    try std.testing.expect(coldCut(1000, &.{200}, 200));
-    try std.testing.expect(coldCut(1000, &.{200}, 200 + E.max_rows));
-    try std.testing.expect(!coldCut(1000, &.{200}, 2 * E.max_rows)); // cut at 200 instead, then 328
-    try std.testing.expectEqual(@as(usize, 200), nextCut(1000, &.{200}, E.max_rows));
+    const m = E.max_rows;
+    const len = 10 * m;
+    const start = m + m / 2; // a request chunk start between the first two cuts
+    try std.testing.expect(coldCut(len, &.{}, m * 3));
+    try std.testing.expect(!coldCut(len, &.{}, m * 3 + 1));
+    try std.testing.expect(coldCut(len, &.{start}, start));
+    try std.testing.expect(coldCut(len, &.{start}, start + m));
+    try std.testing.expect(!coldCut(len, &.{start}, 2 * m)); // cut at the start instead, then max_rows on
+    try std.testing.expectEqual(@as(usize, start), nextCut(len, &.{start}, m));
 }
 
 fn release(p: *anyopaque) void {
@@ -350,6 +354,8 @@ const Lanes = struct {
         }
         cache.untaught = stream.untaught;
         while (at < ids.len) {
+            // a cancel or the host's halt lands between chunks, not after a pass of minutes (its cache goes back reset)
+            if (stream.isCancelled()) return error.Cancelled;
             const end = nextCut(ids.len, stream.chunks, at);
             try self.e.forward(&.{.{ .cache = cache, .rows = end - at, .images = if (images) |*im| im else null }}, ids[at..end], .last);
             at = end;

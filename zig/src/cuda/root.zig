@@ -38,6 +38,7 @@ pub const nvfp4 = @import("nvfp4.zig");
 pub const segments = @import("segments.zig");
 pub const grouped = @import("grouped.zig");
 pub const qlinear = @import("qlinear.zig");
+pub const w4a8 = @import("w4a8.zig");
 pub const norms = @import("norms.zig");
 pub const embed_rows = @import("embed_rows.zig");
 pub const route_rows = @import("route_rows.zig");
@@ -92,6 +93,7 @@ test {
     _ = @import("experts.zig");
     _ = @import("sample.zig");
     _ = @import("roce.zig");
+    _ = @import("roce_nap.zig");
     _ = @import("rank_scatter.zig");
     _ = @import("relay_plan.zig");
     _ = launch;
@@ -145,4 +147,12 @@ test {
     _ = exl3.block.experts;
     _ = exl3.block.lin2;
     _ = exl3.block.x3gm;
+}
+
+test {
+    _ = @import("context_health.zig");
+}
+
+test {
+    _ = @import("graph_instantiate_failure_test.zig");
 }

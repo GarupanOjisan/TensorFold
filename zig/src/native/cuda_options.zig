@@ -36,6 +36,7 @@ pub fn set(comptime F: type, o: api.Open, opts: *F.Options, problem: *[]const u8
     if (comptime @hasField(F.Options, "drafter")) opts.drafter = o.drafter;
     if (comptime @hasField(F.Options, "drafter_bits")) opts.drafter_bits = o.drafter_bits;
     if (@hasField(F.Options, "kv8")) opts.kv8 = o.kv8;
+    if (@hasField(F.Options, "prompt_int8")) opts.prompt_int8 = o.prompt_int8;
     return true;
 }
 
@@ -70,4 +71,16 @@ test "native family options forward lane counts and fixedness only when declared
     try std.testing.expectEqual(@as(u32, 7), counted.lanes);
     try std.testing.expectEqual(@as(u32, 7), fixed.lanes);
     try std.testing.expect(fixed.lanes_fixed);
+}
+
+test "prompt precision: family options receive both explicit int8 and default bf16" {
+    const F = struct {
+        pub const Options = struct { prompt_int8: bool = false };
+    };
+    var why: []const u8 = "";
+    var opts: F.Options = .{ .prompt_int8 = true };
+    for ([_]bool{ false, true, false }) |on| {
+        try std.testing.expect(set(F, .{ .dir = "d", .model_type = "qwen3_5", .prompt_int8 = on }, &opts, &why));
+        try std.testing.expectEqual(on, opts.prompt_int8);
+    }
 }

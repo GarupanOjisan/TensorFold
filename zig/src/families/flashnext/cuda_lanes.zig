@@ -6,6 +6,8 @@ const lanes = @import("lanes");
 const prompt = @import("cuda_prompt.zig");
 const weights = @import("cuda_prompt_wt.zig");
 const mtp = @import("cuda_mtp.zig");
+const mtp_ops = @import("cuda_mtp_ops.zig");
+const lanes_draft = @import("cuda_lanes_draft.zig");
 const snap = @import("cuda_snap.zig");
 const ranks = @import("cuda_rank_engine.zig");
 const config = @import("cuda_config.zig");
@@ -13,11 +15,14 @@ const Glue = @import("cuda_glue.zig").Glue;
 const living = @import("living");
 const slide_mod = @import("cuda_slide.zig");
 const train = @import("cuda_train.zig");
+const bytes = @import("cuda_lanes_bytes.zig");
 
 const be = lanes.backend;
 const ring = 1024;
 /// Streams a round takes at most (a round with more live streams takes them in turns).
 const round_streams = 32;
+/// Drafted windows' rows a shared verify takes at most: a drafting round's (TF_FLASHNEXT_WINDOW_ROWS; 0: each alone).
+const window_rows_default = 4 * mtp.max_rows;
 
 /// The Triton entry points the pass launches and the head's two more: a captured set replaces our glue with all.
 pub const captured_entries = [_][]const u8{ "_embed", "_hc_writeback", "_qmm_hcdown", "_hc_reduce_act", "_qmm_upmix", "_ple_gate", "_ple_conv", "_attn_prep", "_attn_gate", "_pool", "_scores", "_chunks", "_merge", "_router", "_topk_rows" };
@@ -89,28 +94,16 @@ pub fn Namespace(comptime Tri: type) type {
 
         /// Device bytes of the checkpoint: the n-gram tables stay mapped, the MTP head counts; 0 if unread.
         pub fn deviceWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) u64 {
-            const main = weights.deviceBytes(gpa, io, dir) catch return 0;
-            return main + mtp.headBytes();
+            return bytes.deviceWeightBytes(gpa, io, dir);
         }
 
         pub fn placementWeightBytes(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, world: usize, rank: usize, drafts: bool) !u64 {
-            if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
-            const mode = try config.mode(gpa, io, dir);
-            if (mode == .modelopt) {
-                const main = try @import("cuda_rank_memory.zig").estimate(gpa, io, dir, world, rank);
-                // Dense draft projections and vocabulary rows exceed the affine head's estimate.
-                return main + if (drafts and rank == 0) mtp.headBytes() + (1 << 30) else @as(u64, 0);
-            }
-            if (world != 1) return error.UnsupportedQuantization;
-            const main = try weights.deviceBytes(gpa, io, dir);
-            return main + if (drafts) mtp.headBytes() else @as(u64, 0);
+            return bytes.placementWeightBytes(gpa, io, dir, world, rank, drafts);
         }
 
         /// The tower's weights and one call's scratch, which rank zero holds beside the text weights with --vision.
         pub fn visionBytes(a: std.mem.Allocator, io: std.Io, dir: []const u8) !u64 {
-            const v = @import("qwen_vision");
-            const c = ((try v.Settings.read(a, io, dir)) orelse return error.NoVisionTower).tower;
-            return v.Tower.weightBytes(c) + v.Tower.scratchBytes(c, v.max_patches);
+            return bytes.visionBytes(a, io, dir);
         }
 
         pub fn healthy(ptr: *anyopaque) bool {
@@ -125,17 +118,7 @@ pub fn Namespace(comptime Tri: type) type {
 
         /// A request or load this engine refuses, in words; null: none of its own.
         pub fn explain(_: ?*anyopaque, err: anyerror) ?[]const u8 {
-            return switch (err) {
-                error.PromptTooLong => "the prompt and its reply exceed this server's context window: shorten it or lower max_tokens",
-                error.OutOfDeviceMemory => "the GPU had no memory left for this request's caches: retry once another request ends",
-                error.UnsupportedCheckpoint => "the checkpoint differs from the supported Flash Next CUDA layout; the log names its config field",
-                error.TensorRankDraftSnapshotUnavailable => "tensor-rank MTP snapshots are unavailable: disable the prompt cache for this configuration",
-                error.RankDisconnected, error.RankTimeout, error.RemoteRank, error.BadRankFrame => "a tensor-parallel rank failed; restart both ranks from the same checkpoint before retrying",
-                else => @import("cuda_images.zig").Vision.explain(err),
-                error.PocketOfAnotherSize => "a lesson's pocket is wider than the layer's loaded one: restart the server on the folder",
-                error.UnsupportedLearningFormat => "--slide requires the affine 4-bit group-32 single-rank Flash Next checkpoint",
-                error.TrainingOnCapturedGlue => "--slide trains on Flash Next's own glue: serve it without TENSORFOLD_CUDA_KERNELS",
-            };
+            return @import("cuda_lanes_explain.zig").explain(err);
         }
 
         /// A stream's caches; with the head, its cache, a window's buffers and the drafts it holds for the next round.
@@ -170,11 +153,11 @@ pub fn Namespace(comptime Tri: type) type {
             /// --slide: the pocket's layout, from config.json at load.
             lay: living.Layout = undefined,
 
-            fn tri(self: *Cuda) Tri {
+            pub fn tri(self: *Cuda) Tri {
                 return .{ .set = if (self.set) |*x| x else null, .own = &self.glue, .s = self.stream };
             }
 
-            fn ops(self: *Cuda) Ops {
+            pub fn ops(self: *Cuda) Ops {
                 return .{ .e = self.engine, .tri = self.tri(), .h = self.head.?, .main = if (self.ranks != null) .{
                     .ptr = self,
                     .forward = mainForward,
@@ -199,7 +182,7 @@ pub fn Namespace(comptime Tri: type) type {
             }
 
             pub fn backend(self: *Cuda) be.Backend {
-                return .{ .ptr = self, .proposal_head = if (self.head) |h| &h.service else null, .vtable = &.{
+                const scoring_table: be.Backend.VTable = .{
                     .prefill = prefillFn,
                     .prefill_step = prefillStepFn,
                     .first = firstFn,
@@ -211,8 +194,11 @@ pub fn Namespace(comptime Tri: type) type {
                     .release = releaseFn,
                     .tree = treeFn,
                     .probabilities = probabilitiesFn,
+                    .score = @import("cuda_score.zig").Hook(Cuda, Tri).call,
                     .first_masked = firstMaskedFn,
-                } };
+                };
+                const ranked_table = @import("cuda_score.zig").withoutScore(scoring_table);
+                return .{ .ptr = self, .proposal_head = if (self.head) |h| &h.service else null, .vtable = if (self.ranks == null) &scoring_table else &ranked_table };
             }
 
             /// With the head: windows of up to 16 rows cut by its confidence; else shared one-row rounds.
@@ -230,6 +216,8 @@ pub fn Namespace(comptime Tri: type) type {
                     .hidden_rows = true,
                     .batch_rows = if (drafting) 4 * mtp.max_rows else round_streams,
                     .max_streams = round_streams,
+                    // a shared round's greedy streams draft in one head pass a step (lanes_draft.batched)
+                    .draft_streams = drafting and lanes_draft.batchHeads(),
                 };
             }
 
@@ -240,7 +228,7 @@ pub fn Namespace(comptime Tri: type) type {
                 return h;
             }
 
-            fn value(self: *const Cuda, feed: be.Feed) u32 {
+            pub fn value(self: *const Cuda, feed: be.Feed) u32 {
                 return switch (feed) {
                     .handle => |h| self.drawn[h % ring],
                     .value => |v| v,
@@ -257,7 +245,7 @@ pub fn Namespace(comptime Tri: type) type {
                 return mtp.drawRow(self.gpa, row, null, position, s.sampling);
             }
 
-            fn lane(self: *Cuda, s: *lanes.Stream) !*Lane {
+            pub fn lane(self: *Cuda, s: *lanes.Stream) !*Lane {
                 return self.lanes.getPtr(s) orelse return error.UnknownStream;
             }
 
@@ -439,19 +427,23 @@ pub fn Namespace(comptime Tri: type) type {
             defer self.gpa.free(ids);
             const at_window = try self.gpa.alloc(usize, windows.len);
             defer self.gpa.free(at_window);
+            const row_ids = try self.gpa.alloc([mtp.max_rows]u32, windows.len);
+            defer self.gpa.free(row_ids);
+            const drafted = try self.gpa.alloc(usize, windows.len);
+            defer self.gpa.free(drafted);
             var plain: usize = 0;
+            var held: usize = 0;
             for (windows, out, 0..) |w, *o, wi| {
                 if (w.held != 0 or w.parents != null) return error.HeldDraftsNotBuilt;
                 const l = try self.lane(w.stream);
                 const rows = w.rows();
-                if (l.draft) |*d| {
+                if (l.draft != null) {
                     if (rows > mtp.max_rows) return error.WindowTooWide;
                     for (w.positions, 0..) |p, r| if (p != l.seq.fed + 1 + r) return error.PositionMismatch;
-                    var row_ids: [mtp.max_rows]u32 = undefined;
-                    row_ids[0] = w.pending;
-                    @memcpy(row_ids[1..rows], w.tokens);
-                    try self.ops().verify(&l.seq, d, row_ids[0..rows]);
-                    try self.ops().draws(d, w.stream.sampling, w.masks, o.sampled[0..rows]);
+                    row_ids[wi][0] = w.pending;
+                    @memcpy(row_ids[wi][1..rows], w.tokens);
+                    drafted[held] = wi;
+                    held += 1;
                 } else {
                     if (rows != 1) return error.CannotRewind;
                     if (w.positions[0] != l.seq.fed + 1) return error.PositionMismatch;
@@ -462,6 +454,8 @@ pub fn Namespace(comptime Tri: type) type {
                 }
                 if (w.tokens.len > 0) @memcpy(o.drafts[0..w.tokens.len], w.tokens);
             }
+            const cap = @min(@min(envUsize("TF_FLASHNEXT_WINDOW_ROWS", window_rows_default), window_rows_default), self.engine.chunk);
+            try @import("cuda_lanes_verify.zig").windows(self, windows, out, drafted[0..held], row_ids, cap);
             var at: usize = 0;
             while (at < plain) : (at += round_streams) {
                 const n = @min(round_streams, plain - at);
@@ -485,7 +479,12 @@ pub fn Namespace(comptime Tri: type) type {
         fn draftFn(ptr: *anyopaque, requests: []const be.DraftRequest) anyerror!void {
             const self = of(ptr);
             if (self.head == null) return error.NoDraftHead;
-            for (requests) |r| {
+            defer lanes_draft.depthLog(self, requests);
+            // greedy chains of a shared round: their heads in one pass a step (the drafts each would get alone)
+            var batched: [mtp_ops.max_lanes]bool = @splat(false);
+            if (lanes_draft.batchHeads() and requests.len > 1 and requests.len <= mtp_ops.max_lanes) try lanes_draft.batched(self, requests, &batched);
+            for (requests, 0..) |r, ri| {
+                if (ri < batched.len and batched[ri]) continue;
                 if (r.lanes != null) return error.TreesNotBuilt;
                 const l = try self.lane(r.stream);
                 const d = if (l.draft) |*x| x else return error.NoDraftHead;
@@ -539,13 +538,11 @@ pub fn Namespace(comptime Tri: type) type {
             _ = @import("cuda_images_test.zig").Cases(Cuda, Cuda.open, dropLane);
             _ = @import("cuda_lanes_restore_test.zig").Cases(Cuda, Cuda.open, snapRestore, dropLane);
             _ = @import("cuda_lanes_admission_test.zig").Cases(Cuda, Cuda.open, dropLane);
+            _ = @import("cuda_score.zig").CapabilityCases(Cuda);
         }
 
         test "a bad TF_FLASHNEXT_CHUNK is refused at load before the loader takes a stream, a module or a buffer" {
-            const env = if (@import("builtin").os.tag == .windows) @import("sys").c else struct {
-                extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: i32) i32;
-                extern "c" fn unsetenv(name: [*:0]const u8) i32;
-            };
+            const env = @import("sys").env;
             defer _ = env.unsetenv("TF_FLASHNEXT_CHUNK");
             // every driver entry point undefined: the refusal must come before the first call
             var driver: cuda.Driver = undefined;

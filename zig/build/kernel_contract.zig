@@ -12,9 +12,17 @@ pub fn module(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 pub fn hostTests(b: *std.Build, family: *std.Build.Step) void {
     const run = b.addRunArtifact(b.addTest(.{ .root_module = module(b, b.graph.host, .debug) }));
     run.has_side_effects = true;
+    b.step("test-kernel-seed-host", "Named contract fixtures keep their seed when entries are inserted").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = module(b, b.graph.host, .debug), .filters = &.{"contract seed:"} })).step);
     const step = b.step("test-kernel-contract", "The kernel contract's host tests: gate logic, controls, every launch against every chip");
     step.dependOn(&run.step);
     step.dependOn(family);
+    const rotary = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/tests/contract/rotary_cache_positions.zig"),
+        .target = b.graph.host,
+        .optimize = .debug,
+    }) }));
+    b.step("test-rotary-cache-positions-host", "Cache-check positions match the consumed pooled axes without shaders").dependOn(&rotary.step);
+    step.dependOn(&rotary.step);
     const zstd = b.addRunArtifact(b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/core/contract/fatbin_zstd.zig"),
         .target = b.graph.host,

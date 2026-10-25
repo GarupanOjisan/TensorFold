@@ -24,6 +24,15 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.B
     const prompt_moe = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"prompt MoE precision:"} }));
     b.step("test-qwen35-prompt-moe-host", "Prompt expert arithmetic stays separate from verify capacity without devices").dependOn(&prompt_moe.step);
     step.dependOn(&prompt_moe.step);
+    const int8_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_w4a8_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+    int8_contract.addCSourceFile(.{ .file = b.path("zig/tests/cuda/w4a8_normalize_host.c"), .flags = &.{ "-std=c11", "-ffp-contract=off" } });
+    const int8_contract_run = b.addRunArtifact(b.addTest(.{ .root_module = int8_contract, .filters = &.{"w4a8 host:"} }));
+    b.step("test-w4a8-contract-host", "Finite normalization, independent W4A8 references and numerical controls without CUDA").dependOn(&int8_contract_run.step);
+    step.dependOn(&int8_contract_run.step);
+    const int8_prompt = b.createModule(.{ .root_source_file = b.path("zig/qwen35_prompt_int8_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "qwen35", .module = mods.qwen35 } } });
+    const int8_run = b.addRunArtifact(b.addTest(.{ .root_module = int8_prompt, .filters = &.{"prompt int8:"} }));
+    b.step("test-qwen35-prompt-int8-host", "Prompt int8 allocation and actual projection recording without devices").dependOn(&int8_run.step);
+    step.dependOn(&int8_run.step);
     const precision = b.createModule(.{ .root_source_file = b.path("zig/qwen35_draft_precision_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "qwen35", .module = mods.qwen35 }, .{ .name = "lanes", .module = mods.lanes } } });
     const precision_run = b.addRunArtifact(b.addTest(.{ .root_module = precision, .filters = &.{"Draft precision:"} }));
     b.step("test-qwen35-draft-precision-host", "Draft arithmetic roles and canonical native launches without devices").dependOn(&precision_run.step);
@@ -32,6 +41,15 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.B
     const frames_run = b.addRunArtifact(b.addTest(.{ .root_module = frames, .filters = &.{"Draft frames:"} }));
     b.step("test-qwen35-draft-frames-host", "Fixed frame schedules, returned byte records and controls without devices").dependOn(&frames_run.step);
     step.dependOn(&frames_run.step);
+    const stack_symbols = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_stack_symbols_host.zig"), .target = host, .link_libc = true, .imports = &.{.{ .name = "core", .module = mods.core }} });
+    b.step("test-qwen35-stack-symbols-host", "The stack's new symbols' own numerical specs without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = stack_symbols })).step);
+    const images = b.createModule(.{ .root_source_file = b.path("zig/qwen35_images_host.zig"), .target = host, .link_libc = true, .imports = &.{.{ .name = "qwen35", .module = mods.qwen35 }} });
+    b.step("test-qwen35-images-host", "The image planes' staging ABI at the device's row offsets without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = images })).step);
+    const launch_args = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_q35_launch_args_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "qwen35", .module = mods.qwen35 }} });
+    const launch_args_run = b.addRunArtifact(b.addTest(.{ .root_module = launch_args }));
+    launch_args_run.setCwd(b.path("."));
+    b.step("test-qwen35-launch-args-host", "The q35 attention launches' argument lists against the .cu kernels' signatures without devices").dependOn(&launch_args_run.step);
+    step.dependOn(&launch_args_run.step);
     const startup = b.createModule(.{ .root_source_file = b.path("zig/cuda_startup_costs_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = mods.lanes }} });
     b.step("test-cuda-startup-costs-host", "Eager measured CUDA costs and transactional failure controls without devices").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = startup })).step);
 

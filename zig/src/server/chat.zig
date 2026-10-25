@@ -17,7 +17,6 @@ const Mailbox = @import("mailbox.zig").Mailbox;
 const Value = json.Value;
 const Cx = errors.Cx;
 const Allocator = std.mem.Allocator;
-
 pub const Prompt = union(enum) { text: []const u8, ids: []const u32 };
 
 /// What a route hands the reply: Python's chat() arguments.
@@ -347,12 +346,13 @@ const Generation = struct {
             }
             try fresh.append(g.a, t);
         }
-        const all = try g.visible.extend(g.a, g.srv.text, decodeText, fresh.items);
+        const all = try g.visible.extend(g.a, g.srv.text, reply_text.decodeText, fresh.items);
         const text = g.stops.visible(all, true);
         if (g.visible.pending()) return; // a character still split across tokens
         var answer = text;
         if (g.thinking) {
-            const split = try reply_text.splitThinkingTokens(g.a, text, false, g.srv.markers, g.visible.tokens.items, g.srv.text.tokenId(g.srv.markers.close), g.srv.text, decodeText);
+            const close = try g.visible.closeOf(g.a, reply_text.decodeText, g.srv.text, g.srv.close_id);
+            const split = try reply_text.splitThinkingAt(g.a, text, false, g.srv.markers, close);
             const piece = g.streamed_reasoning.after(split.reasoning, true);
             if (piece.len > 0) {
                 try g.streamed_reasoning.set(g.a, split.reasoning, piece);
@@ -459,6 +459,7 @@ const Generation = struct {
         const reason: []const u8 = g.reason orelse switch (m.reason) {
             .stop => "stop",
             .length => "length",
+            .silence => return cx.other("the text engine returned a speech-only finish reason"),
             .cancelled => "cancelled",
             .failed => return cx.other(if (m.message.len > 0) try a.dupe(u8, m.message) else "the reply failed"),
         };
@@ -472,7 +473,7 @@ const Generation = struct {
         var content: []const u8 = text;
         var reasoning: ?[]const u8 = null;
         if (g.thinking) {
-            const split = try reply_text.splitThinkingTokens(a, text, true, g.srv.markers, content_tokens, g.srv.text.tokenId(g.srv.markers.close), g.srv.text, decodeText);
+            const split = try reply_text.splitThinkingTokens(a, reply_text.decodeText, g.srv.text, text, true, g.srv.markers, content_tokens, g.srv.close_id);
             const r = reply_text.pyStrip(split.reasoning);
             reasoning = if (r.len > 0) r else null;
             content = split.answer;
@@ -586,10 +587,6 @@ const StopHook = struct {
         return false;
     }
 };
-
-fn decodeText(t: anytype, a: Allocator, tokens: []const u32) ![]u8 {
-    return t.decode(a, tokens);
-}
 
 /// ``{key: text}``: a streamed delta (role, content or reasoning_content).
 pub fn deltaOf(a: Allocator, key: []const u8, text: []const u8) Allocator.Error!Value {

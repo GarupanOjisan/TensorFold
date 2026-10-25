@@ -24,17 +24,23 @@ const ck_k = @import("contract_ck.zig");
 const scan_k = @import("contract_scan.zig");
 const lane8_k = @import("contract_ck_lane.zig");
 const latent_k = @import("contract_latent.zig");
+const vit_k = @import("contract_vit_glue.zig");
 const act_round_k = @import("contract_act_round.zig");
+
+const w4a8_k = @import("contract_w4a8.zig");
 
 const round_k = @import("contract_tree_round.zig");
 
 const act_k = @import("contract_act.zig");
+const vit_g4_group = @import("contract_gemma_group.zig");
 const gdn_k = @import("contract_gdn.zig");
 const qk_k = @import("contract_qk.zig");
+const wrows_k = @import("contract_window_rows.zig");
 const embed_k = @import("contract_embed.zig");
 
 const tree_k = @import("contract_tree_attn.zig");
 const block_k = @import("contract_block_attn.zig");
+const q35_k = @import("contract_q35_attn.zig");
 
 const window_k = @import("contract_window.zig");
 const moe_k = @import("contract_moe.zig");
@@ -46,8 +52,6 @@ const glue_k = @import("contract_flashnext_glue.zig");
 
 const contract = core.contract;
 const g = contract.gates;
-const limits = contract.limits;
-const registry = contract.registry;
 const kk = cuda.kernels;
 
 const controls = struct {
@@ -57,16 +61,6 @@ const controls = struct {
 const h3_image = struct {
     pub const bytes align(16) = @embedFile("fatbin_h3").*;
 };
-
-/// The named embedded image; only contract_controls may select the planted controls.
-pub fn image(name: []const u8) error{UnknownContractImage}![]const u8 {
-    if (@import("contract_deepseek_images.zig").image(name)) |bytes| return bytes;
-    if (std.mem.eql(u8, name, "h3")) return &h3_image.bytes;
-    inline for (.{ "tree_round", "act_rows", "gdn_prep", "qk_rows", "norms", "moe", "experts", "qwen36_mtp", "nemotron_attention", "nemotron_route", "nemotron_latent", "qmm_group", "lane_gemv", "prompt16", "qmmf", "ck_experts", "rank_sum", "prefill_attention", "vit", "embed_rows", "route_rows", "flashnext_gdn", "flashnext_batch", "flashnext_hc", "flashnext_attn", "flashnext_mtp", "qwen_vision", "exl3_linear", "exl3_experts", "exl3_candidate", "experts3", "experts3_prefill", "drama3", "drama3_fp8", "drama3_codec", "glm_mm", "glm_dflash", "glm_glue", "nemotron_mamba", "sample", "qwen35", "qwen35_keep", "qwen35_kv8", "qwen35_draft", "ck_lane", "gdn_train", "train_q4", "train_attn", "flashnext_train", "train", "attn_train", "qwen27_train", "tree_attention", "block_attention", "window_attention", "moe_glue", "dense_rows", "qmm", "flashnext_fact", "flashnext_hcf", "flashnext_fexp", "experts_rows" }) |n| if (std.mem.eql(u8, name, n)) return @field(kk, n);
-    if (std.mem.eql(u8, name, "contract_controls")) return if (options.controls) &controls.bytes else &.{};
-    std.debug.print("FAIL kernel-contract: unknown image name: {s}\n", .{name});
-    return error.UnknownContractImage;
-}
 
 /// Gates 1-4 on every registered CUDA kernel and each control at its own gate, then gate 5 on this GPU.
 pub fn run(gpu: check.Gpu) !void {
@@ -91,7 +85,7 @@ pub fn run(gpu: check.Gpu) !void {
     const sms: usize = @intCast(try gpu.ctx.attribute(.multiprocessor_count));
     var affine4 = try cuda.qlinear.Affine4Kernels.resolve(gpu.d, mods[1], mods[2], mods[3], mods[4], sms, cap == 121);
     defer affine4.deinit();
-    var split = try cuda.qlinear.Split.init(gpu.d); // GB10 serves without it; other GPUs take it for K slices
+    var split = try cuda.qlinear.Split.initFor(gpu.d, 2); // GB10 serves without it; other GPUs take it for K slices
     defer split.deinit();
     var prompt = try cuda.nvfp4.Prompt.load(gpu.d);
     defer prompt.unload();
@@ -103,6 +97,35 @@ pub fn run(gpu: check.Gpu) !void {
     defer rank_sum.unload();
     var kernels: std.ArrayList(g.Kernel) = .empty;
     defer kernels.deinit(a);
+    var vit = try cuda.vit.Kernels.load(gpu.d);
+    defer vit.unload();
+    var glue: [12]vit_k.Glue = undefined;
+    for (&glue, 0..) |*item, i| item.* = .{
+        .rig = .{ .gpu = gpu, .s = s },
+        .k = &vit,
+        .act = @fromBackingInt(@intCast(i % 4)),
+        .residual = i >= 4,
+        .in_place = i >= 8,
+    };
+    defer for (&glue) |*item| item.deinit();
+    for (&glue) |*item| try kernels.append(a, item.kernel());
+    var wrong_vit: vit_k.Glue = .{ .rig = .{ .gpu = gpu, .s = s }, .k = &vit, .act = .none, .residual = true, .in_place = false, .wrong_bias_round = true, .ctl = try mods[5].function("tf_ctl_vit_unrounded_bias") };
+    defer wrong_vit.deinit();
+    try kernels.append(a, wrong_vit.kernel());
+    var w4a8_mod = try cuda.Module.load(gpu.d, kk.w4a8_prefill);
+    defer w4a8_mod.unload();
+    const w4a8_fns = try cuda.w4a8.Kernels.resolve(w4a8_mod);
+    const w4a8_configs = [_]struct { kind: w4a8_k.Kind, fault: w4a8_k.Fault }{
+        .{ .kind = .quantize, .fault = .none },       .{ .kind = .prefill, .fault = .none },
+        .{ .kind = .quantize, .fault = .guard },      .{ .kind = .prefill, .fault = .guard },
+        .{ .kind = .quantize, .fault = .wrong_code }, .{ .kind = .quantize, .fault = .wrong_scale },
+        .{ .kind = .quantize, .fault = .wrong_sum },  .{ .kind = .quantize, .fault = .narrow_sum },
+        .{ .kind = .prefill, .fault = .wrong_code },  .{ .kind = .prefill, .fault = .narrow_epilogue },
+    };
+    var w4a8_cases: [w4a8_configs.len]w4a8_k.Case = undefined;
+    for (&w4a8_cases, w4a8_configs) |*case, cfg| case.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = cfg.kind, .fault = cfg.fault, .kernels = w4a8_fns, .arena = .init(a) };
+    defer for (&w4a8_cases) |*case| case.deinit();
+    for (&w4a8_cases) |*case| try kernels.append(a, case.kernel());
     var row_list: [7]rows_k.Row = undefined;
     var nrows: usize = 0;
     defer for (row_list[0..nrows]) |*r| r.deinit();
@@ -279,6 +302,13 @@ pub fn run(gpu: check.Gpu) !void {
     for (act_round_k.entries, &act_rounds) |e, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .entry = e, .act = &act_rows, .ctl = if (e.keep != null) try mods[5].function("tf_ctl_act_round") else null };
     defer for (&act_rounds) |*x| x.deinit();
     for (&act_rounds) |*x| try kernels.append(a, x.kernel());
+    var gemma_ops: @import("contract_gemma_ops.zig").Group = .{};
+    defer gemma_ops.deinit();
+    try gemma_ops.init(gpu, s, &act_rows, &vit, &round_fns, mods[5]);
+    try gemma_ops.append(a, &kernels);
+    var vit_g4 = try vit_g4_group.Group.init(gpu, s, &vit, mods[5]);
+    defer vit_g4.deinit();
+    try vit_g4.append(a, &kernels);
     var gdn_prep = try cuda.gdn_prep.GdnPrep.load(gpu.d);
     defer gdn_prep.unload();
     var gdns: [9]gdn_k.Gdn = undefined;
@@ -312,6 +342,14 @@ pub fn run(gpu: check.Gpu) !void {
     var blocks: [2]block_k.Block = .{ .{ .rig = .{ .gpu = gpu, .s = s }, .ba = &block_attn, .causal = false }, .{ .rig = .{ .gpu = gpu, .s = s }, .ba = &block_attn, .causal = true } };
     defer for (&blocks) |*x| x.deinit();
     for (&blocks) |*x| try kernels.append(a, x.kernel());
+    var q35_mod = try cuda.Module.load(gpu.d, kk.qwen35);
+    defer q35_mod.unload();
+    var q35_kv8 = try cuda.Module.load(gpu.d, kk.qwen35_kv8);
+    defer q35_kv8.unload();
+    var q35s: [q35_k.forms.len]q35_k.Q35 = undefined;
+    for (q35_k.forms, &q35s) |f, *x| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .form = f, .partial = try if (f.cache == .fp8) q35_kv8.function("tf_q35_attn_partial8") else q35_mod.function("tf_q35_attn_partial"), .merge = try q35_mod.function("tf_q35_attn_merge") };
+    defer for (&q35s) |*x| x.deinit();
+    for (&q35s) |*x| try kernels.append(a, x.kernel());
     var window_fns = try cuda.window_attention.WindowAttention.load(gpu.d);
     defer window_fns.unload();
     var windows: [window_k.cfgs.len]window_k.Window = undefined;
@@ -398,14 +436,22 @@ pub fn run(gpu: check.Gpu) !void {
         .scores = try attn.function("fn_qsa_scores"),
         .hcf_down = try hcf_mod.function(ftk.cubin_hcf_down),
         .hcf_up = try hcf_mod.function(ftk.cubin_hcf_up),
+        .front = try batch.function("fn_gdn_front"),
+        .norm = try batch.function("fn_gdn_norm"),
+        .fused = try batch.function("fn_gdn_fused"),
     };
+    try glue_fns.fused.allowDynamicShared(fparts.gdn_fused_smem);
     try glue_fns.tpr.allowDynamicShared(fparts.chain_tpr_smem);
     try glue_fns.hcf_down.allowDynamicShared(ftk.hcf_down_smem);
     try glue_fns.hcf_up.allowDynamicShared(ftk.hcf_up_smem);
-    var glues: [3]glue_k.Glue = undefined;
+    var glues: [4]glue_k.Glue = undefined;
     for (std.enums.values(glue_k.Kind), &glues) |kind, *m| m.* = .{ .rig = .{ .gpu = gpu, .s = s }, .kind = kind, .f = &glue_fns, .glue = &fglue };
     defer for (&glues) |*m| m.deinit();
     for (&glues) |*m| try kernels.append(a, m.kernel());
+    var wrows: [wrows_k.cfgs.len]wrows_k.Rows = undefined;
+    for (&wrows, wrows_k.cfgs) |*x, f| x.* = .{ .rig = .{ .gpu = gpu, .s = s }, .f = f, .g = &window_fns, .ctl = mods[5], .arena = .init(a) };
+    defer for (&wrows) |*x| x.deinit();
+    for (&wrows) |*x| try kernels.append(a, x.kernel());
     var t: g.Tally = .{};
     try @import("contract_dump.zig").run(a, kernels.items);
     const t0 = check.now(gpu.io);
@@ -427,131 +473,7 @@ pub fn run(gpu: check.Gpu) !void {
     try check.expect(t.problems() + lim == 0, "kernel-contract: {d} gate failures, {d} controls missed, {d} limit problems", .{ t.failed, t.missed, lim });
 }
 
-/// Gate 5 on this GPU: the table's row for it against the driver, each record against the loaded function.
-pub fn live(gpu: check.Gpu) !usize {
-    var n = try registry.checkCuda(gpu.gpa, &registry.all_cuda, false);
-    std.debug.print("{s} limits: {d} registered CUDA launches against sm_80/86/89/120/121, {d} problems\n", .{ if (n == 0) "PASS" else "FAIL", registry.all_cuda.len, n });
-    const sm: u32 = @intCast(try gpu.ctx.capability());
-    const at = for (limits.sms, 0..) |t, i| {
-        if (t.sm == sm) break i;
-    } else {
-        std.debug.print("N/A  limits live: sm_{d} is not a target the records cover\n", .{sm});
-        return n;
-    };
-    const t = limits.sms[at];
-    const dev = [_]struct { []const u8, cuda.abi.DeviceAttribute, u32 }{
-        .{ "most shared bytes a block (opt-in)", .max_shared_memory_per_block_optin, t.smem_optin },
-        .{ "threads a block", .max_threads_per_block, t.threads },
-    };
-    for (dev) |d| {
-        const got: u32 = @intCast(try gpu.ctx.attribute(d[1]));
-        if (got != d[2]) n += 1;
-        std.debug.print("{s} limits live sm_{d} {s}: the driver says {d}, the table {d}\n", .{ if (got == d[2]) "PASS" else "FAIL", sm, d[0], got, d[2] });
-    }
-    var said: ?limits.Nvcc = null;
-    for (registry.all_cuda ++ registry.cuda_controls) |r| {
-        const control = std.mem.startsWith(u8, r.launch.name, "control");
-        if (!control and registry.targetDecision(r, t, r.usage[at]) != .applicable) continue;
-        const bytes = try image(r.launch.image);
-        const rel = try built(gpu.gpa, bytes, sm);
-        const set = registry.setFor(rel);
-        if (said == null or !std.meta.eql(said.?, set)) records("live", rel, set);
-        said = set;
-        const want = registry.usageFor(r, rel)[at];
-        var mod = try cuda.Module.load(gpu.d, bytes);
-        defer mod.unload();
-        const sym = try gpu.gpa.dupeSentinel(u8, r.launch.symbol, 0);
-        defer gpu.gpa.free(sym);
-        const f = try mod.function(sym);
-        const regs: u32 = @intCast(try f.attribute(.num_regs));
-        const static: u32 = @intCast(try f.attribute(.shared_size_bytes));
-        const most: u32 = @intCast(try f.attribute(.max_threads_per_block));
-        const fits = r.launch.threads <= most and static + r.launch.dynamic <= t.smem_optin;
-        const current = want.regs == regs and want.static == static;
-        if (!control and !(fits and current)) n += 1;
-        if (control and fits) n += 1;
-        const word = if (control) (if (fits) "MISSED" else "RED ") else if (fits and current) "PASS" else "FAIL";
-        std.debug.print("{s} limits live {s}: {d} threads launched, the driver allows {d}; {d} registers, {d} + {d} shared bytes (recorded {d}, {d})\n", .{ word, r.launch.name, r.launch.threads, most, regs, static, r.launch.dynamic, want.regs, want.static });
-    }
-    return n;
-}
-
-/// The nvcc release that built a fatbin's image for `sm`, else the one its images agree on (null: none names one).
-fn built(a: std.mem.Allocator, bytes: []const u8, sm: u32) !?limits.Nvcc {
-    return contract.cubin.releaseFor(a, bytes, sm);
-}
-
-/// Says which compiler's records an audit compares against, and why.
-fn records(what: []const u8, rel: ?limits.Nvcc, set: limits.Nvcc) void {
-    if (rel) |v| {
-        const own = std.meta.eql(v, set);
-        std.debug.print("INFO limits {s}: images built by nvcc {d}.{d}, checked against nvcc {d}.{d}'s records{s}\n", .{ what, v.major, v.minor, set.major, set.minor, if (own) "" else " (the newest set at or below it)" });
-    } else std.debug.print("INFO limits {s}: the images name no nvcc release; checked against nvcc {d}.{d}'s records\n", .{ what, set.major, set.minor });
-}
-
-/// tf-cuda-test kernel-contract-limits DIR: each record against the fatbins in DIR, every SM image they hold.
-pub fn fatbins(gpu: check.Gpu, dir: []const u8) !void {
-    const a = gpu.gpa;
-    var n: usize = 0;
-    var said: ?limits.Nvcc = null;
-    for (registry.all_cuda ++ registry.cuda_controls) |r| {
-        const control = std.mem.startsWith(u8, r.launch.name, "control");
-        const any_target = for (limits.sms, 0..) |target, index| {
-            if (registry.targetDecision(r, target, r.usage[index]) == .applicable) break true;
-        } else false;
-        if (!control and !any_target) {
-            std.debug.print("N/A limits {s}: no applicable target\n", .{r.launch.name});
-            continue;
-        }
-        const path = try std.fmt.allocPrint(a, "{s}/{s}.fatbin", .{ dir, r.launch.image });
-        defer a.free(path);
-        const bytes = try std.Io.Dir.cwd().readFileAlloc(gpu.io, path, a, .limited(1 << 28));
-        defer a.free(bytes);
-        const imgs = try contract.cubin.images(a, bytes);
-        defer contract.cubin.freeImages(a, imgs);
-        var red: usize = 0;
-        var line: std.ArrayList(u8) = .empty;
-        defer line.deinit(a);
-        for (limits.sms, 0..) |t, i| {
-            const decision = registry.targetDecision(r, t, r.usage[i]);
-            if (!control and decision != .applicable) {
-                std.debug.print("N/A limits {s} sm_{d}: {t}\n", .{ r.launch.name, t.sm, decision });
-                continue;
-            }
-            const img = for (imgs) |im| {
-                if (im.sm == t.sm) break im;
-            } else {
-                std.debug.print("FAIL limits {s}: {s} holds no sm_{d} image (build with -Dsm=80,86,89,120,121)\n", .{ r.launch.name, path, t.sm });
-                n += 1;
-                continue;
-            };
-            const ks = try contract.cubin.kernels(a, img.elf, t.sm);
-            defer a.free(ks);
-            const k = for (ks) |kv| {
-                if (std.mem.eql(u8, kv.name, r.launch.symbol)) break kv;
-            } else return error.SymbolNotInImage;
-            const rel = try contract.cubin.release(a, img.elf);
-            const set = registry.setFor(rel);
-            if (said == null or !std.meta.eql(said.?, set)) records("fatbins", rel, set);
-            said = set;
-            var out: std.ArrayList(u8) = .empty;
-            defer out.deinit(a);
-            const measured = registry.targetDecision(r, t, k.usage);
-            if (!control and measured != .applicable) {
-                std.debug.print("N/A limits {s} sm_{d}: {t}\n", .{ r.launch.name, t.sm, measured });
-                continue;
-            }
-            red += try limits.cuda(r.launch, k.usage, t, &out, a);
-            const current = std.meta.eql(k.usage, registry.usageFor(r, rel)[i]);
-            if (!control and !current) n += 1;
-            std.debug.print("{s} limits sm_{d} {s}: {d} registers, {d} static shared bytes, bound {d} (record {s}){s}", .{ if (out.items.len > 0) (if (control) "RED " else "FAIL") else "PASS", t.sm, r.launch.name, k.usage.regs, k.usage.static, k.usage.bound, if (current) "current" else "stale", if (out.items.len > 0) ": " else "\n" });
-            if (out.items.len > 0) std.debug.print("{s}", .{out.items});
-            try line.print(a, ".{{ .regs = {d}, .static = {d}, .bound = {d} }}, ", .{ k.usage.regs, k.usage.static, k.usage.bound });
-        }
-        std.debug.print("RECORD {s}: .usage = .{{ {s}}}\n", .{ r.launch.name, line.items });
-        if (control and red == 0) n += 1;
-        if (!control) n += red;
-    }
-    try check.expect(n == 0, "kernel-contract-limits: {d} problems", .{n});
-    check.pass("kernel-contract-limits: every registered launch fits sm_80, sm_86, sm_89, sm_120 and sm_121, every control red", .{});
-}
+/// The named embedded image and gate 5: in the contract's own file, so the gates' registrations stay short.
+pub const image = @import("contract_limits.zig").image;
+pub const live = @import("contract_limits.zig").live;
+pub const fatbins = @import("contract_limits.zig").fatbins;

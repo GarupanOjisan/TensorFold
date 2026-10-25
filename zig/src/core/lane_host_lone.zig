@@ -15,7 +15,7 @@ fn takes(h: *LaneHost, job: *Job) bool {
     const r = job.request;
     const lone = h.lone orelse return false;
     const think = lone.min_budget > 0 and (r.think_budget == 0 or r.think_budget > lone.min_budget);
-    return !((r.sampling != null and !lone.sampled) or !r.drafts or ((r.think_budget > 0 or r.loop_guard) and !think) or r.call != null or (r.structure != null and !lone.structures) or (r.logprobs != null and !lone.logprobs) or r.prompt_logprobs != null);
+    return !((r.sampling != null and !lone.sampled) or !r.drafts or ((r.think_budget > 0 or r.loop_guard) and !think) or r.call != null or (r.structure != null and !lone.structures) or (r.images.len > 0 and !lone.images) or (r.logprobs != null and !lone.logprobs) or r.prompt_logprobs != null);
 }
 
 /// After a round: the lane core's last live stream goes back to the driver when nothing else waits or is due.
@@ -72,8 +72,9 @@ pub fn run(h: *LaneHost, job: *Job, began: i96, resumed: bool) bool {
     h.lone_job = null;
     const handed = paused catch |e| {
         if (!job.prefill_sent) LaneHost.emit(job, .{ .prefilled = 0 });
+        if (e == error.Cancelled) return h.cancel(job);
         h.remove(job);
-        h.finish(job, if (e == error.Cancelled) .cancelled else .failed, if (e == error.Cancelled) "" else h.words(e));
+        h.finish(job, .failed, h.words(e));
         return true;
     };
     if (context.partial) {
