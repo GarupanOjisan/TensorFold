@@ -12,6 +12,7 @@ const shape = @import("shape.zig");
 const ev = @import("events.zig");
 const trail = @import("trail.zig");
 const Engine = @import("engine.zig").Engine;
+const limit = @import("copy_limit.zig");
 const Stream = @import("stream.zig").Stream;
 const Value = ev.Value;
 const f = ev.f;
@@ -195,17 +196,16 @@ fn headTrunk(e: *Engine, s: *Stream, p: Plan, levels: usize) !?fill.Trunk {
     return .{ .tokens = chain, .others = others };
 }
 
-/// A copy from the context backed by `enter_match` ids (Python `_copy_proposal`), else Recall's when it should pay.
+/// A context copy backed by enter_match (Python `_copy_proposal`), else Recall; shared rounds use this ramp too.
 pub fn copyProposal(e: *Engine, s: *Stream) !Copy {
     if (e.cfg.max_copy == 0 or s.force.items.len > 0 or (e.cfg.root_copies and s.root_copy_miss)) return .{};
-    const width: u32 = if (e.alone) (s.copy_width orelse e.cfg.first_copy) else e.cfg.first_copy;
-    const most = @min(@as(i64, width), s.draftRoom() - 1);
+    const most = @min(@as(i64, limit.ask(e, s)), s.draftRoom() - 1);
     if (s.proposer) |p| if (!e.alone or e.cfg.lone_copies) {
         // a priced proposer's drafts are as it gives them, its none too: no width, length or match gate, no Recall
         if (p.vtable.priced) return .{ .tokens = p.propose(s.context.items, @min(@as(i64, e.cfg.max_copy), s.draftRoom() - 1)) catch &.{} };
         const copied = p.proposeAfter(s.context.items, &.{}, most) catch &.{};
-        const least: usize = if (e.alone and e.cfg.context_copies) 1 else 2;
-        if (copied.len >= least and p.lastMatch() >= e.cfg.enter_match) return .{ .tokens = copied };
+        const kept = limit.take(e, s, p.lastMatch(), p.lastEnd(), copied);
+        if (kept.len > 0) return .{ .tokens = kept };
     };
     const r = s.recall orelse return .{};
     if (most < 2) return .{};

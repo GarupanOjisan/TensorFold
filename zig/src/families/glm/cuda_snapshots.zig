@@ -25,7 +25,7 @@ pub fn agree(e: anytype, budget: u64) !void {
 }
 
 pub fn bytes(e: anytype, at: usize) u64 {
-    const head: ?usize = if (e.mtp) @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").window_rows) catch return std.math.maxInt(u64)) else null;
+    const head: ?usize = if (e.mtp) @min(e.capacity, std.math.add(usize, at, @import("cuda_state.zig").copy_rows) catch return std.math.maxInt(u64)) else null;
     const p = layout.Plan.init(&e.cur.st, &e.c, at, head) catch return std.math.maxInt(u64);
     return pages.rounded(p.len) catch std.math.maxInt(u64);
 }
@@ -41,7 +41,7 @@ pub fn keep(e: anytype) !u64 {
 
 pub fn keepAs(e: anytype, id: u64) !void {
     if (e.snaps.contains(id)) return error.StateKept;
-    if (e.cur.st.pending != 0 or e.cur.st.mtp_len > e.cur.st.pos + @import("cuda_state.zig").window_rows)
+    if (e.cur.st.pending != 0 or e.cur.st.mtp_len > e.cur.st.pos + @import("cuda_state.zig").copy_rows)
         return error.NotAtMark;
     const pool = if (e.snap_pages) |*p| p else return error.NoSnapshotCache;
     const plan = try layout.Plan.init(&e.cur.st, &e.c, e.cur.st.pos, if (e.mtp) e.cur.st.mtp_len else null);

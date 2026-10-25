@@ -90,7 +90,7 @@ pub fn weightShare(a: std.mem.Allocator, io: std.Io, dir: []const u8, total: u64
 
 /// Slots for `context` plus a verify window, a multiple of 64 so the sparse pool keeps the AOT set.
 pub fn capacity(context: usize) usize {
-    return std.mem.alignForward(usize, context + fw.window_rows, 64);
+    return std.mem.alignForward(usize, context + fw.copy_rows, 64);
 }
 
 const snapshots = @import("cuda_snapshots.zig");

@@ -67,6 +67,7 @@ test {
     _ = engine;
     _ = follow;
     _ = lanes;
+    _ = @import("cuda_copy.zig");
     _ = native;
     _ = @import("cuda_qpack.zig");
     _ = @import("cuda_tile.zig");

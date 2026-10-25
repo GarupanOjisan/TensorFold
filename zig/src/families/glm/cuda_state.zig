@@ -17,8 +17,10 @@ const kda_block = @import("cuda_kda_block.zig");
 
 /// A prompt chunk's rows (decode.PREFILL_ROWS).
 pub const prefill_rows = 2048;
-/// A decode window's rows (Engine's max_rows).
+/// A DFlash block and the MTP head's window. Copy verifies use `copy_rows` and do not widen this.
 pub const window_rows = 8;
+/// Rows a copy verify may run (15 drafted tokens). Buffers, the sampler and the KDA save hold this many.
+pub const copy_rows = 16;
 /// Prompts one prompt pass takes together (cuda_prompts): a prompt buffer's logits rows, one a prompt.
 pub const prompt_heads = 16;
 /// The context the buffers' dense attention partials reach (Buffers' min(capacity, 2560)).
@@ -115,9 +117,9 @@ pub const Buffers = struct {
         return make(d, w, rows, prefill, capacity, rows);
     }
 
-    /// A shared window's scratch: `rows` rows of several streams, each one's attention and KDA chain on `window_rows`.
+    /// A shared window's scratch: `rows` rows of several streams, each one's attention and KDA chain on `copy_rows`.
     pub fn initShared(d: *const cuda.Driver, w: *const weights.Weights, rows: usize, capacity: usize) !Buffers {
-        return make(d, w, rows, false, capacity, window_rows);
+        return make(d, w, rows, false, capacity, copy_rows);
     }
 
     /// `seg`: the most rows one stream's attention takes (a decode window's rows, or a shared window's segment).
@@ -299,8 +301,8 @@ pub const State = struct {
         const pk_rows = capacity / sparse.pool + 2;
         var sizes: std.ArrayList(usize) = .empty;
         defer sizes.deinit(gpa);
-        try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * window_rows * kw * 2 });
-        try sizes.appendSlice(gpa, &.{ nk * window_rows * n * 4, nk * window_rows * n * 2, nk * window_rows * n * 4, nk * window_rows * s.kda.len() * 4 });
+        try sizes.appendSlice(gpa, &.{ 4, nk * 3 * 3 * n * 2, 2 * nk * s.kda.len() * kda.dk * kda.dv * 4, nk * copy_rows * kw * 2 });
+        try sizes.appendSlice(gpa, &.{ nk * copy_rows * n * 4, nk * copy_rows * n * 2, nk * copy_rows * n * 4, nk * copy_rows * s.kda.len() * 4 });
         const ring_rows = @min(capacity, index_ring);
         for (0..nd + 1) |_| try sizes.appendSlice(gpa, &.{ lc_bytes, ring_rows * c.i_dim * 2, ring_rows * c.i_dim * 2, pk_rows * c.i_dim * 2 });
         try sizes.appendSlice(gpa, &.{ 4, c.hidden * 2 }); // MTP position and sequence-owned first-draft row
@@ -316,7 +318,7 @@ pub const State = struct {
         for (caches, 0..) |*x, j| x.* = .{ .lc = p[8 + 4 * j], .ls = if (kv8) p[8 + 4 * j] + capacity * c.kv_lora else 0, .ik = p[9 + 4 * j], .ig = p[10 + 4 * j], .pk = p[11 + 4 * j], .pk_rows = pk_rows };
         const rings = try gpa.alloc(u64, 2 * (nd + 1));
         for (0..nd + 1) |j| rings[2 * j ..][0..2].* = .{ p[9 + 4 * j], p[10 + 4 * j] };
-        return .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + capacity * c.kv_lora else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = window_rows * kw, .proj_row = kw };
+        return .{ .ring_rows = ring_rows, .ring_row = c.i_dim * 2, .rings = rings, .arena = a, .gpa = gpa, .capacity = capacity, .pos_dev = p[0], .conv = p[1], .rec = p[2], .proj = p[3], .save_k = p[4], .save_v = p[5], .save_g = p[6], .save_b = p[7], .cur = cur, .heads = s.kda.len(), .mtp_caches = .{ .lc = p[8 + 4 * nd], .ls = if (kv8) p[8 + 4 * nd] + capacity * c.kv_lora else 0, .ik = p[9 + 4 * nd], .ig = p[10 + 4 * nd], .pk = p[11 + 4 * nd], .pk_rows = pk_rows }, .mtp_pos_dev = p[12 + 4 * nd], .prompt_hidden = p[13 + 4 * nd], .kda_layers = nk, .caches = caches, .conv_c = 3 * n, .rec_layer = s.kda.len() * kda.dk * kda.dv * 4, .proj_layer = copy_rows * kw, .proj_row = kw };
     }
 
     pub fn deinit(st: *State) void {

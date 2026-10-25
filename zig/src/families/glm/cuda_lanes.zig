@@ -10,16 +10,17 @@ const prompt_lp = @import("cuda_prompt_logprobs.zig");
 const cuda = @import("cuda");
 
 const be = lanes.backend;
+const copy = @import("cuda_copy.zig");
 
 /// First tokens a handle names.
 const ring = 1024;
 
-/// The widest verify window: the pending token and a copy (the lane core proposes them), as the decode buffers hold.
-pub const max_rows = fw.window_rows;
+/// The widest verify window the buffers hold. DFlash stays at fw.window_rows; copies use this.
+pub const max_rows = fw.copy_rows;
 const mtp_rows = 1 + engine.max_drafts;
 const max_held = dflash.BLOCK - 1; // a DFlash2 block's drafts (the MTP head's chains stop at max_drafts)
 
-/// With DFlash2: a window's ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8), shared as glm_cuda's.
+/// Window ms by rows on two GB10s (EXL3, TF_GLM_PROF: 86 to 107 ms at 5 to 8); past 8 rows the same line.
 const gb10_window_costs = costTable(max_rows, 52.0, 6.8);
 const gb10_shared_costs = costTable(engine.shared_rows, 76.0, 4.1);
 
@@ -99,12 +100,12 @@ pub const Lanes = struct {
         break :vt v;
     };
 
-    /// Round loop facts: copies up to max_rows, head chains to mtp_rows, shared windows unless TF_GLM_SHARED=0.
+    /// Round loop facts: copies up to TF_GLM_COPY_MAX, head chains to mtp_rows, shared unless TF_GLM_SHARED=0.
     pub fn facts(self: *const Lanes) lanes.Model {
         const drafting = self.x.e.mtp;
         const block = self.x.e.drafter != null;
         const sharing = drafting and !self.alone;
-        return .{
+        return copy.apply(.{
             .exact_width = if (drafting) max_rows else 1,
             .first_copy_rows = mtp_rows, // a first copy as wide as a head round; it grows as its tokens land
             .gpu_tokens = false,
@@ -120,7 +121,7 @@ pub const Lanes = struct {
             .hidden_rows = sharing,
             .batch_rows = if (sharing) engine.shared_rows else 0,
             .max_streams = if (sharing) engine.max_shared else 1,
-        };
+        }, copy.read());
     }
 
     fn of(ptr: *anyopaque) *Lanes {
@@ -517,7 +518,8 @@ pub const Lanes = struct {
 };
 
 comptime {
-    std.debug.assert(max_rows <= fw.window_rows);
+    std.debug.assert(max_rows == fw.copy_rows);
+    std.debug.assert(dflash.BLOCK <= fw.window_rows); // DFlash's block stays on the head window
 }
 
 test "a lane's slot is chosen before its map entry exists" {
