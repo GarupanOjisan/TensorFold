@@ -58,7 +58,7 @@ pub const Engine = struct {
     images: ?*images_mod.Images = null, // --vision: a prompt pass's image rows (rank 0 encodes, the others receive)
     packs: mm_mod.Packed = .{}, // the linears packed at load and their bits (TF_GLM_DENSE_BITS, _HEAD_BITS)
     drafter: ?*dflash.Drafter = null, // --drafter: DFlash2 (every rank runs its passes; rank 0 selects the drafts)
-    profs: [fw.window_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
+    profs: [fw.copy_rows]?*prof_mod.Prof = @splat(null), // TF_GLM_PROF=1: verify sections' GPU time, by rows
     profiling_prompt: ?*prof_mod.Prof = null,
     prompt_profs: [4]?*prof_mod.Prof = @splat(null), // and prompt chunks': to 64, 256, 1024, 2048 rows
     checkpoint_digest: [32]u8,
@@ -172,16 +172,16 @@ pub const Engine = struct {
         }
         e.bp = try fw.Buffers.init(d, &e.w, fw.prefill_rows, true, o.capacity);
         errdefer e.bp.deinit();
-        e.bd = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        e.bd = try fw.Buffers.init(d, &e.w, fw.copy_rows, false, o.capacity);
         errdefer e.bd.deinit();
-        e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity);
+        e.bm = try fw.Buffers.init(d, &e.w, fw.window_rows, false, o.capacity); // MTP absorbs in head-sized chunks
         errdefer e.bm.deinit();
         if (o.mtp) e.bs = try fw.Buffers.initShared(d, &e.w, shared_rows, o.capacity);
         errdefer if (e.bs) |*b| b.deinit();
         e.pairs = try cuda.DeviceBuffer.alloc(d, pair_bytes * world);
         errdefer e.pairs.free();
         try d.check(d.api.cuMemsetD8_v2(e.pairs.ptr, 0, pair_bytes * world), "cuMemsetD8"); // each pair's padding stays zero
-        e.smp = try sampler.Sampler.init(d, c.vocab, fw.window_rows);
+        e.smp = try sampler.Sampler.init(d, c.vocab, fw.copy_rows);
         errdefer e.smp.deinit();
         errdefer e.freeProfs();
         if (prof_mod.Prof.wanted()) for (&e.profs) |*p| {
@@ -307,7 +307,7 @@ pub const Engine = struct {
 
     /// Where a prompt pass of `len` ids starts: 0, or `from`'s position with its kept state restored.
     fn prefillStart(e: *Engine, len: usize, from: ?Resume) !usize {
-        if (len == 0 or len + fw.window_rows >= e.cur.st.capacity) return error.PromptTooLong;
+        if (len == 0 or len + fw.copy_rows >= e.cur.st.capacity) return error.PromptTooLong;
         const r = from orelse return 0;
         if (r.at == 0 or r.at >= len or r.at % fw.prefill_rows != 0) return error.BadResume;
         try e.restoreState(r.id);
@@ -449,7 +449,7 @@ pub const Engine = struct {
 
     /// A verify window: `ids` (pending token, then drafts) at the committed position; `out[r]` drawn at pos + 1 + r.
     pub fn verify(e: *Engine, ids: []const u32, out: []u32, bits: u64) !void {
-        if (ids.len == 0 or ids.len > fw.window_rows) return error.WindowTooWide;
+        if (ids.len == 0 or ids.len > fw.copy_rows) return error.WindowTooWide;
         var one: [1]fw.Rank = undefined;
         var f = e.view(&e.bd, &one);
         const at = e.cur.st.pos;
@@ -472,7 +472,7 @@ pub const Engine = struct {
         var ids: [shared_rows]u32 = undefined;
         var rows: usize = 0;
         for (parts, 0..) |p, i| {
-            if (p.ids.len == 0 or p.ids.len > fw.window_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
+            if (p.ids.len == 0 or p.ids.len > fw.copy_rows or rows + p.ids.len > shared_rows) return error.WindowTooWide;
             for (parts[0..i]) |q| if (q.slot == p.slot) return error.SlotTwice;
             try e.bind(p.slot);
             segs[i] = .{ .st = &e.cur.st, .row0 = rows, .rows = p.ids.len };

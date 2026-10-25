@@ -8,6 +8,7 @@ const be = @import("backend.zig");
 const sm = @import("stream.zig");
 const ev = @import("events.zig");
 const win = @import("windows.zig");
+const copy_limit = @import("copy_limit.zig");
 const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const fill = @import("fill.zig");
@@ -46,7 +47,7 @@ pub const Engine = struct {
     drafted: u64 = 0,
     accepted: u64 = 0,
     shared_rounds: u64 = 0,
-    alone: bool = true, // this step has one live stream: its copies may take their ramp
+    alone: bool = true, // this step has one live stream
     lone_kept: [2][lone_costs.bands]?lone_costs.Kept = @splat(@splat(null)), // the newest lone calibrations, greedy then sampled, a band each
     steps: u64 = 0,
     arena: std.heap.ArenaAllocator, // a round's temporaries
@@ -347,10 +348,9 @@ pub const Engine = struct {
                     if (p.recalled) {
                         if (s.recall) |r| r.observe(@intCast(own), @intCast(own_kept), s.rounds);
                     } else if (s.proposer) |pr| pr.observe(@intCast(own), @intCast(own_kept));
-                    if (e.alone) {
-                        const width = s.copy_width orelse e.cfg.first_copy;
-                        s.copy_width = if (own_kept == own) @min(e.cfg.max_copy, 2 * width + 1) else e.cfg.first_copy;
-                    }
+                    // a shared round grows the same ramp: each stream's save holds the copy window
+                    const width = s.copy_width orelse e.cfg.first_copy;
+                    s.copy_width = copy_limit.nextWidth(width, e.cfg.first_copy, e.cfg.max_copy, own_kept == own);
                 } else if (p.kind == .head) {
                     if (p.lanes) |l| if (s.odds != null) s.observeLanes(l, path);
                     const ds = try accept.depths(a, parents);

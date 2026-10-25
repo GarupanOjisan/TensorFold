@@ -13,7 +13,7 @@ const b16 = @import("cuda_b16.zig");
 
 /// Checks a shared window's segments (a prompt buffer's: whole prompts) against its `rows` rows; each holds its own.
 pub fn begin(r: fw.Rank, rows: usize, stream: cuda.Stream) !void {
-    const most: usize = if (r.b.prefill) fw.prefill_rows else fw.window_rows;
+    const most: usize = if (r.b.prefill) fw.prefill_rows else fw.copy_rows;
     if (r.b.prefill and r.segs.len > @import("cuda_state.zig").prompt_heads) return error.BadWindow;
     var at: usize = 0;
     for (r.segs) |g| {
@@ -65,11 +65,11 @@ pub fn mixer(f: *const fw.Forward, r: fw.Rank, l: weights.Layer, li: usize, di: 
                 }
                 v.p = st.proj + li * st.proj_layer * 2; // the window's rows stay with the layer until its commit
                 try f.d.check(f.d.api.cuMemcpyDtoDAsync_v2(v.p, b.kproj + g.row0 * w * 2, g.rows * w * 2, f.stream.handle), "cuMemcpyDtoDAsync");
-                const kv = li * fw.window_rows * st.heads * kda.dk;
+                const kv = li * fw.copy_rows * st.heads * kda.dk;
                 v.saves.k = st.save_k + kv * 4;
                 v.saves.v = st.save_v + kv * 2;
                 v.saves.g = st.save_g + kv * 4;
-                v.saves.b = st.save_b + li * fw.window_rows * st.heads * 4;
+                v.saves.b = st.save_b + li * fw.copy_rows * st.heads * 4;
                 try kda_block.chainRows(&f.m.kda, f.stream, k, v, g.rows, conv, st.recAt(cur, li), f.kda_wide);
             }
             if (out) |o| try kda_block.fill(f.set(), f.stream, k, s, 0, rows, o);

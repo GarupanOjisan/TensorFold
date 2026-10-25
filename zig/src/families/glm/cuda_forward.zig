@@ -26,6 +26,7 @@ const shared = @import("cuda_shared.zig");
 
 pub const prefill_rows = state.prefill_rows;
 pub const window_rows = state.window_rows;
+pub const copy_rows = state.copy_rows;
 pub const State = state.State;
 pub const Buffers = state.Buffers;
 
@@ -239,11 +240,11 @@ pub const Forward = struct {
                 s.p = if (b.prefill) b.kproj else st.proj + li * st.proj_layer * 2;
                 s.saves.state_out = st.recAt(1 - cur, li);
                 if (!b.prefill) { // a window's saved rows stay with the layer until its commit
-                    const kv = li * window_rows * st.heads * kda.dk;
+                    const kv = li * copy_rows * st.heads * kda.dk;
                     s.saves.k = st.save_k + kv * 4;
                     s.saves.v = st.save_v + kv * 2;
                     s.saves.g = st.save_g + kv * 4;
-                    s.saves.b = st.save_b + li * window_rows * st.heads * 4;
+                    s.saves.b = st.save_b + li * copy_rows * st.heads * 4;
                 }
                 const conv = st.conv + li * 3 * st.conv_c * 2;
                 try kda_block.bodyProfile(f.set(), &f.m.kda, f.stream, k, s, b.normed, c.hidden, rows, conv, st.recAt(cur, li), !b.prefill and f.kda_wide, b.prefill, f.prof);
@@ -517,8 +518,8 @@ pub const Forward = struct {
                     a.add(st.recAt(cur, 0));
                     a.add(@as(usize, st.rec_layer / 4));
                     for ([_]u64{ st.save_k, st.save_v, st.save_g, st.save_b }) |x| a.add(x);
-                    a.add(@as(usize, window_rows * h * kda.dk));
-                    a.add(@as(usize, window_rows * h));
+                    a.add(@as(usize, copy_rows * h * kda.dk));
+                    a.add(@as(usize, copy_rows * h));
                     a.add(@as(c_int, @intCast(keep)));
                     a.add(st.recAt(1 - cur, 0));
                     try cuda.launch.launch(f.m.kda.replay_layers, .{ .grid = .{ .x = @intCast(st.kda_layers * h) }, .block = .{ .x = 1024 } }, f.stream, &a);

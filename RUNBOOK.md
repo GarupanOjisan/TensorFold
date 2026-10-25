@@ -212,6 +212,33 @@ path needs `LD_LIBRARY_PATH` set to that `lib` directory on both ranks.
 First launch. The first start can stay silent for several minutes while it reads the checkpoint digest. Wait for
 `checkpoint digest:` before treating it as stuck. A later start reports the cached files immediately.
 
+### GLM CUDA copy windows
+
+Rank 0 reads these. Give both ranks the same values. The decode buffers, sampler and KDA save always hold 16 rows.
+DFlash stays on its 8-row block (7 drafts). The MTP head still absorbs in 8-row chunks. Native verify launches
+kernels directly: there is no captured CUDA graph to widen, and `WIDE_GRAPHS` is not read. The KDA wide step already
+walks rows in tiles of 16.
+
+`TF_GLM_COPY_MAX` is the most tokens a copy may draft. The default is 15 (a 16-row window). `7` is the previous cap
+(an 8-row window). Values outside 1..15 clamp into that range; text that is not an integer keeps 15. The first copy
+is still 3 tokens and doubles plus one after a fully accepted copy, including in a shared or multi-stream round.
+That growth fits: each stream's KDA save holds 16 rows, a shared segment may be 16 rows, and one shared forward
+still holds at most 32 rows, so the allocator trims a round that would overflow.
+
+`TF_GLM_COPY_REPLY_MATCH` is the match a copy needs when its continuation starts in the reply. The default is 16.
+A copy taken from the prompt still needs 8. The recipe's 16-token reply bar moved code from 55.4 to 56.2 tok/s and
+edit from 120 to 125, with no prose regression called out for that bar. `TF_GLM_COPY_MAX=15` is what moved edit
+from 84 to 119 tok/s with prose and code unchanged. Those figures are the recipe's, not a measurement on this tree.
+
+`TF_GLM_COPY_EXTEND=1` is off by default. It turns on context copies and root copies, and a match of at least 16
+tokens may take the whole `TF_GLM_COPY_MAX` in that round instead of waiting for the ramp. Root copies then skip
+the head for an admitted copy. Use it for an A/B against the default. Unset or any value other than `1` leaves it off.
+
+A 16-row save is twice the KDA window of an 8-row save, and the shared scratch sizes its per-stream chain for 16
+rows. Watch free memory on both GPUs, especially at 4 streams. Drafted token ids must match `"draft": false`
+(`token_sha256`). Prose and prefill should not regress. The on-hardware plan is in the pull request that added
+these knobs.
+
 ### GB10 CPU pinning for long CUDA runs
 
 In [#1033](https://github.com/ashhart/TensorFold/issues/1033), @Bizuayeu reports two CPU threads spinning per CUDA rank,

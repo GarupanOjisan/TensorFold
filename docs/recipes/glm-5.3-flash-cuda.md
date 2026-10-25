@@ -51,6 +51,22 @@ left after a 12.2 GiB reserve` and a 5.8 GiB prompt cache
 (`TF_GLM_PREFILL_REDUCE`) and the two-rank RoCE gathers (`TF_ROCE`) are in
 [placement](../multi-rank-receipts.md#the-settings-the-ranks-agreed-on).
 
+## Copy windows
+
+Rank 0 plans copies. The buffers below are allocated on every rank.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `TF_GLM_COPY_MAX` | 15 | Drafted tokens a copy may hold. `7` is the previous 8-row window. Clamped to 1..15. |
+| `TF_GLM_COPY_REPLY_MATCH` | 16 | Matching tokens required when the copied continuation starts in the reply. Prompt copies stay at 8. |
+| `TF_GLM_COPY_EXTEND` | off | `1` enables context copies, root copies, and a 16-token match that may use the whole copy cap at once. |
+
+DFlash remains a 7-draft block. The MTP head still chunks its absorb at 8 rows. A copy may grow past its first 3
+tokens after a fully accepted copy, in a lone round and in a shared round. The shared forward still admits at most
+32 rows. Native GLM verify does not capture CUDA graphs, so there is no 16-row graph set; the KDA wide kernel
+already accepts a 16-row window. Set the same values on every rank. Compare `token_sha256` with `"draft": false`,
+and watch memory: the KDA save and the shared per-stream chain are sized for 16 rows.
+
 ## Long runs on GB10
 
 Long prompts and long runs of replies heat a GB10. The runbook's [heat bands](../../RUNBOOK.md#linux-and-cuda) (with a
