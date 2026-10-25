@@ -5,7 +5,14 @@ const M = limits.MetalLaunch;
 const C = limits.CudaLaunch;
 const U = limits.Usage;
 /// A CUDA launch and what nvcc made of it for sm_80, sm_86, sm_89, sm_120 and sm_121 (limits.sms' order; regs 0: none).
-pub const CudaRecord = struct { launch: C, usage: [limits.sms.len]U, geometry_pending: bool = false, optional_shared: bool = false };
+pub const CudaRecord = struct {
+    launch: C,
+    usage: [limits.sms.len]U,
+    geometry_pending: bool = false,
+    optional_shared: bool = false,
+    /// Keep the independent later compiler selection when adding a late 13.0 receipt.
+    later_pending: bool = false,
+};
 const target = @import("registry_target.zig");
 pub const TargetDecision = target.TargetDecision;
 pub const targetDecision = target.targetDecision;
@@ -190,11 +197,12 @@ pub const cuda = @import("flashnext_cuda_records.zig").cuda ++ [_]CudaRecord{
     // Affine-3 experts: the decode pair and down, the prompt pair and down at their shared bytes, the repacks
     .{ .launch = .{ .name = "experts3 decode pair", .symbol = "_ZN11tf_experts313expert_kernelILi2ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i", .image = "experts3", .threads = 128 }, .usage = .{ .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 }, .{ .regs = 255, .static = 0, .bound = 128 } } },
     .{ .launch = .{ .name = "experts3 decode down", .symbol = "_ZN11tf_experts313expert_kernelILi1ELi0ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i", .image = "experts3", .threads = 128 }, .usage = .{ .{ .regs = 196, .static = 0, .bound = 128 }, .{ .regs = 197, .static = 0, .bound = 128 }, .{ .regs = 197, .static = 0, .bound = 128 }, .{ .regs = 190, .static = 0, .bound = 128 }, .{ .regs = 190, .static = 0, .bound = 128 } } },
+    .{ .launch = .{ .name = "experts3 decode split", .symbol = "_ZN11tf_experts312split_kernelILi2ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i", .image = "experts3", .threads = 128 }, .usage = .{ .{ .regs = 254, .static = 25600, .bound = 128 }, .{ .regs = 255, .static = 25600, .bound = 128 }, .{ .regs = 255, .static = 25600, .bound = 128 }, .{ .regs = 255, .static = 25600, .bound = 128 }, .{ .regs = 255, .static = 25600, .bound = 128 } } },
     .{ .launch = .{ .name = "experts3_prefill pair", .symbol = "_ZN19tf_experts3_prefill14prefill_kernelILi2ELi2ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i", .image = "experts3_prefill", .threads = 256, .dynamic = 46080, .opt_in = true }, .usage = .{ .{ .regs = 179, .static = 0, .bound = 256 }, .{ .regs = 179, .static = 0, .bound = 256 }, .{ .regs = 179, .static = 0, .bound = 256 }, .{ .regs = 146, .static = 0, .bound = 256 }, .{ .regs = 146, .static = 0, .bound = 256 } } },
     .{ .launch = .{ .name = "experts3_prefill down", .symbol = "_ZN19tf_experts3_prefill14prefill_kernelILi1ELi3ELi2ELi2ELi4EEEvPK13__nv_bfloat16iiPK5uint4iiPKiS8_S8_PvifS6_i", .image = "experts3_prefill", .threads = 256, .dynamic = 47104, .opt_in = true }, .usage = .{ .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 128, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 }, .{ .regs = 98, .static = 0, .bound = 256 } } },
     .{ .launch = .{ .name = "experts3 tf_experts3_widen", .symbol = "tf_experts3_widen", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 }, .{ .regs = 32, .static = 0, .bound = 0 } } },
     .{ .launch = .{ .name = "experts3 tf_experts3_planes", .symbol = "tf_experts3_planes", .image = "experts3", .threads = 256 }, .usage = .{ .{ .regs = 26, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 28, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 }, .{ .regs = 36, .static = 0, .bound = 0 } } },
-} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda ++ @import("window_rows_records.zig").cuda;
+} ++ @import("registry_media.zig").cuda ++ @import("nemotron_prompt_records.zig").cuda ++ @import("glm_cuda_records.zig").cuda ++ @import("registry_shared_attention.zig").records(CudaRecord) ++ @import("gemma_cuda_records.zig").cuda ++ @import("row_cuda_records.zig").cuda ++ @import("flashnext_tile_records.zig").cuda ++ @import("window_rows_records.zig").cuda ++ @import("modelopt_lane_records.zig").cuda ++ @import("nvfp4_fact_records.zig").cuda ++ @import("lane_half_records.zig").cuda;
 
 /// The nvcc release `cuda`'s usage records come from: the compiler that builds the release fatbins.
 pub const cuda_release: limits.Nvcc = .{ .major = 13, .minor = 0 };
@@ -310,7 +318,7 @@ pub const cuda_sets = [_]CudaSet{
     .{ .release = .{ .major = 13, .minor = 3 }, .usage = &([_]Override{
         .{ .name = "router tf_nemo_topk", .usage = .{ .{ .regs = 94, .static = 0, .bound = 32 }, .{ .regs = 95, .static = 0, .bound = 32 }, .{ .regs = 95, .static = 0, .bound = 32 }, .{ .regs = 96, .static = 0, .bound = 32 }, .{ .regs = 96, .static = 0, .bound = 32 } } },
         .{ .name = "flashnext_batch fn_qsa_select", .usage = .{ .{ .regs = 32, .static = 1168, .bound = 1024 }, .{ .regs = 50, .static = 1168, .bound = 1024 }, .{ .regs = 50, .static = 1168, .bound = 1024 }, .{ .regs = 44, .static = 1168, .bound = 1024 }, .{ .regs = 44, .static = 1168, .bound = 1024 } } },
-    } ++ @import("flashnext_tile_records.zig").cuda_133) },
+    } ++ @import("flashnext_tile_records.zig").cuda_133 ++ @import("glm_cuda_records.zig").cuda_133) },
 };
 pub fn newer(x: limits.Nvcc, y: limits.Nvcc) bool {
     return x.major > y.major or (x.major == y.major and x.minor > y.minor);
@@ -329,6 +337,7 @@ pub fn setFor(release: ?limits.Nvcc) limits.Nvcc {
 pub fn usageFor(r: CudaRecord, release: ?limits.Nvcc) [limits.sms.len]U {
     var u = r.usage;
     const rel = release orelse return u;
+    if (r.later_pending and !newer(.{ .major = 13, .minor = 2 }, rel)) u = none;
     if (for (u) |v| {
         if (v.regs > 0) break false;
     } else true) u = @import("pending_132.zig").lookup(r.launch.name, rel) orelse return u;
@@ -340,7 +349,7 @@ pub fn usageFor(r: CudaRecord, release: ?limits.Nvcc) [limits.sms.len]U {
     }
     return u;
 }
-/// Pending Qwen launch records must be measured before passing the physical resource gate.
+/// Restored Qwen launches retain a pending entry wherever a compiler receipt is absent.
 pub const cuda_pending = @import("cuda_lane_pending.zig").records;
 /// Gate 5's planted CUDA controls: a launch past its __launch_bounds__, one needing more registers than a block has.
 pub const cuda_controls = [_]CudaRecord{
@@ -427,8 +436,8 @@ pub const metal = [_]M{
     .{ .name = "tile_qmm twin picks by expert tf_tile_qmv_group", .threads = 128, .tg_memory = 1024, .m1 = 1024, .m2 = 1024 },
     .{ .name = "tile_qmm group sums tf_tile_xsum", .threads = 256, .tg_memory = 0, .m1 = 1024, .m2 = 1024 },
     .{ .name = "glm hc_expand_10 custom_kernel_tf_glm5_fused_hc_expand_cc77af98f2__4096_1_0_0_0_bfloat16_t_bfloat16_t_float_float_floatc_bfloat16_t_float_float", .threads = 1024, .tg_memory = 0, .m1 = 1024, .m2 = 1024 },
-    .{ .name = "glm gather glm_gather_glu", .threads = 64, .tg_memory = 0, .m1 = 512, .m2 = 512 },
-    .{ .name = "glm gather glm_gather_down", .threads = 64, .tg_memory = 0, .m1 = 576, .m2 = 576 },
+    .{ .name = "glm gather glm_gather_glu", .threads = 64, .tg_memory = 0, .reserved = 64 },
+    .{ .name = "glm gather glm_gather_down", .threads = 64, .tg_memory = 0, .reserved = 64 },
     .{ .name = "glm gather glm_rows_bf16_nax", .threads = 256, .tg_memory = 5120, .offline = false },
     .{ .name = "h3 rows in h3_rows_in", .threads = 1024, .tg_memory = 0, .m1 = 1024, .m2 = 1024 },
     .{ .name = "h3 modulated norm h3_norm", .threads = 32, .tg_memory = 0, .m1 = 1024, .m2 = 1024 },
@@ -500,6 +509,11 @@ pub const metal = [_]M{
     .{ .name = "drama3 moe d3_plan", .threads = 1024, .tg_memory = 1024, .reserved = 1024 },
     .{ .name = "drama3 moe d3_expert_up", .threads = 128, .tg_memory = 0, .reserved = 128 },
     .{ .name = "drama3 moe d3_expert_down", .threads = 128, .tg_memory = 0, .reserved = 128 },
+    .{ .name = "drama3 nvfp4 d3_nvfp4_up", .threads = 128, .tg_memory = 0, .reserved = 128 },
+    .{ .name = "drama3 nvfp4 d3_nvfp4_down", .threads = 128, .tg_memory = 0, .reserved = 128 },
+    .{ .name = "drama3 nvfp4 d3_router_compact", .threads = 256, .tg_memory = 256, .reserved = 256 },
+    .{ .name = "drama3 nvfp4 d3_nvfp4_combine", .threads = 256, .tg_memory = 128, .reserved = 256 },
+    .{ .name = "drama3 guidance d3_cfg_mix", .threads = 256, .tg_memory = 0, .reserved = 256 },
     .{ .name = "drama3 sample d3_argmax", .threads = 1024, .tg_memory = 256, .reserved = 1024 },
     .{ .name = "drama3 sample d3_sample_main", .threads = 256, .tg_memory = 3632, .reserved = 256 },
     .{ .name = "drama3 sample d3_sample_code", .threads = 256, .tg_memory = 3632, .reserved = 256 },
@@ -552,12 +566,12 @@ test {
     _ = paging;
 }
 /// The Metal collector keeps measured slots and the restored vision declarations.
-pub const all_metal = metal ++ @import("delta_slots_records.zig").records ++ @import("flashnext_pending.zig").records ++ @import("simd_pairs_records.zig").records;
+pub const all_metal = metal ++ @import("delta_slots_records.zig").records ++ @import("flashnext_pending.zig").records ++ @import("simd_pairs_records.zig").records ++ @import("glm_rows_records.zig").records;
 const learning = @import("registry_learning.zig");
 pub const gradient_pending = learning.gradient_pending;
 pub const qwen_learning_pending = learning.qwen_learning_pending;
 pub const glm_pending = @import("glm_sampling_pending.zig");
-pub const landed_cuda = cuda ++ gradient_pending ++ qwen_learning_pending ++ paging.extra ++ @import("qwen_served_records.zig").records ++ cuda_pending ++ @import("qwen_decode_pending.zig").records ++ glm_pending.sampling ++ @import("glm_kv_pending.zig").records ++ @import("proposal_sampling_records.zig").records;
+pub const landed_cuda = cuda ++ @import("dory_cuda_records.zig").cuda ++ gradient_pending ++ qwen_learning_pending ++ paging.extra ++ @import("qwen_served_records.zig").records ++ cuda_pending ++ @import("qwen_decode_pending.zig").records ++ glm_pending.sampling ++ @import("glm_kv_pending.zig").records ++ @import("proposal_sampling_records.zig").records ++ @import("flashnext_pages_pending.zig").records ++ @import("glm_f32w_pending.zig").records;
 test {
     _ = learning;
 }
@@ -565,11 +579,13 @@ pub const all_cuda = landed_cuda ++ dsv41_pending ++ @import("inc4_pending.zig")
 pub const dsv41_pending = @import("registry_union.zig").extra(landed_cuda, @import("dsv41_pending_1.zig").records ++ @import("dsv41_pending_2.zig").records);
 test {
     _ = @import("glm_kv_pending.zig");
+    _ = @import("glm_f32w_pending.zig");
     _ = @import("registry_pending_test.zig");
+    _ = @import("flashnext_pages_pending.zig");
 }
-test "pending CUDA records cannot pass a compiled resource check" {
+test "unmeasured CUDA records cannot pass a compiled resource check" {
     for (cuda_pending) |r| {
-        try std.testing.expectEqual(none, r.usage);
+        if (!std.meta.eql(none, r.usage)) continue;
         try std.testing.expectEqual(limits.sms.len, try checkCuda(std.testing.allocator, &.{r}, true));
     }
 }

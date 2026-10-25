@@ -11,6 +11,9 @@ const parts = @import("cuda_batch_state.zig");
 const batch_lanes = @import("cuda_batch_lanes.zig");
 const tiles = @import("cuda_tiles.zig");
 const tk = @import("cuda_tile_kernels.zig");
+const nvfp4_tile = @import("cuda_nvfp4_tile.zig");
+const zs = @import("cuda_zero_slice.zig");
+const ops = @import("cuda_batch_ops.zig");
 
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
@@ -113,45 +116,28 @@ pub fn Pass(comptime Tri: type) type {
         prepared: bool = false,
         /// The pending write-back's branch sits in fp32 in moe_f32 (something added to it, or it is kept).
         pending_f32: bool = false,
+        /// This layer's out projection leaves part's other slices alone; its writeback adds the zero slice once.
+        zero_slices: bool = false,
 
         // ---- launches ----------------------------------------------------------------------------------------
 
         /// qmm.cu's arithmetic over m rows into out (bf16) or part (fp32 K slices); returns the slices (1 when folded).
         pub fn lane(self: *Self, x: u64, xs: u64, w: Q4, out: u64, part: u64, m: usize, sk: usize) !usize {
+            if (try zs.lane(self.k, self.stream, self.s, self.zero_slices, x, w, part, m, sk)) |one| return one;
             return tiles.matmul(self.k, self.stream, x, xs, w, out, part, self.s.native_part, m, sk);
         }
 
         pub fn sumSlices(self: *Self, part: u64, out: u64, bf16: bool, n: usize, sk: usize) !void {
-            var a: cuda.Args = .{};
-            a.add(part);
-            a.add(out);
-            a.add(@as(c_int, @intFromBool(bf16)));
-            a.add(@as(c_longlong, @intCast(n)));
-            a.add(cint(sk));
-            try cuda.launch.launch(self.k.sum, .{ .grid = .{ .x = @intCast(cdiv(n, 256)) }, .block = .{ .x = 256 } }, self.stream, &a);
+            return ops.sumSlices(self.k, self.stream, part, out, bf16, n, sk);
         }
 
         pub fn shiftWindow(self: *Self, win: u64, rows_ptr: u64, stride: usize, n: usize, taps: usize, c: usize) !void {
-            var a: cuda.Args = .{};
-            a.add(win);
-            a.add(rows_ptr);
-            a.add(@as(c_longlong, @intCast(stride)));
-            a.add(cint(n));
-            a.add(cint(taps));
-            a.add(cint(c));
-            try cuda.launch.launch(self.k.shift, .{ .grid = .{ .x = @intCast(cdiv(c, 256)) }, .block = .{ .x = 256 } }, self.stream, &a);
+            return ops.shiftWindow(self.k, self.stream, win, rows_ptr, stride, n, taps, c);
         }
 
         /// rows x width 16-bit columns from src (src_pitch values a row) to dst (dst_pitch); dst 0: none.
         pub fn copyCols(self: *Self, src: u64, src_pitch: usize, dst: u64, dst_pitch: usize, width: usize, rows: usize) !void {
-            if (dst == 0 or rows == 0) return;
-            var a: cuda.Args = .{};
-            a.add(src);
-            a.add(@as(c_longlong, @intCast(src_pitch)));
-            a.add(dst);
-            a.add(@as(c_longlong, @intCast(dst_pitch)));
-            a.add(cint(width));
-            try cuda.launch.launch(self.k.copy_cols, .{ .grid = .{ .x = @intCast(cdiv(width, 256)), .y = @intCast(rows) }, .block = .{ .x = 256 } }, self.stream, &a);
+            return ops.copyCols(self.k, self.stream, src, src_pitch, dst, dst_pitch, width, rows);
         }
 
         /// The adds to layer `l`'s MoE output: a training pass's, else the model's pockets; null: none there.
@@ -389,9 +375,10 @@ pub fn Pass(comptime Tri: type) type {
             const vc = self.seq.vc[ai].ptr;
             const ikc = self.seq.ikc[ai].ptr;
             const pooled = self.seq.pooled[ai].ptr;
-            if (self.seq.media) |m| try m.attn(self.stream, pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n) else try self.tri.attnPrep(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, s.dummy, s.dummy, eps, n, 0);
+            const pg = self.seq.pg;
+            if (self.seq.media) |m| try m.attn(self.stream, pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, eps, n, pg) else try self.tri.attnPrep(pa, at.pos, lw.q_scale.ptr, lw.k_scale.ptr, lw.i_scale.ptr, s.inv, at.q, kc, vc, at.iq, ikc, s.dummy, s.dummy, eps, n, 0, pg);
             // attention.qsa_pool for the blocks these rows complete, then each block of rows' scores and attention
-            if (self.seq.media) |m| try m.pooled(self.stream, ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n) else try self.tri.qsaPool(ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n);
+            if (self.seq.media) |m| try m.pooled(self.stream, ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n, pg) else try self.tri.qsaPool(ikc, pooled, at.pos, lw.ik_scale.ptr, s.inv, eps, n, pg);
             const nb = scoreStride(self.seq.cap);
             // prompt rows: selections for up to fused_rows rows, then one fused launch (chunks merged in the program)
             const fused = n > att_rows and self.tri.fusedAttentionOwned();
@@ -408,7 +395,7 @@ pub fn Pass(comptime Tri: type) type {
                     const iq = at.iq + r0 * index_heads * index_dim * 2;
                     const sel = r0 - g0; // this block's rows in the selection buffers
                     // rows past `top` complete blocks score theirs; _scores leaves the rest, so skip it when none is
-                    if (ends / ratio > top) try self.tri.qsaScores(iq, pooled, pos, self.seq.scores, nb, m, @min(nb, cdiv(ends, ratio)));
+                    if (ends / ratio > top) try self.tri.qsaScores(iq, pooled, pos, self.seq.scores, nb, m, @min(nb, cdiv(ends, ratio)), pg);
                     var a: cuda.Args = .{};
                     a.add(self.seq.scores);
                     a.add(pos);
@@ -422,11 +409,11 @@ pub fn Pass(comptime Tri: type) type {
                     try cuda.launch.launch(self.k.select, .{ .grid = .{ .x = @intCast(m) }, .block = .{ .x = 1024 } }, self.stream, &a);
                     if (!fused) {
                         const chunks = cdiv(@min(ends, wt.dense_keys), 512);
-                        try self.tri.attnChunks(at.q + r0 * q_heads * head_dim * 2, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, kv_heads, chunks, true);
+                        try self.tri.attnChunks(at.q + r0 * q_heads * head_dim * 2, kc, vc, pos, s.po, s.pm, s.pl, s.qids, s.qnk, s.qspr, m, kv_heads, chunks, true, pg);
                         try self.tri.attnMerge(s.po, s.pm, s.pl, pos, at.ao + r0 * out_k * 2, s.qnk, s.qspr, m, kv_heads, true);
                     }
                 }
-                if (fused) try self.tri.attnFused(at.q + g0 * q_heads * head_dim * 2, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * out_k * 2, s.qids, s.qnk, s.qspr, gm, kv_heads);
+                if (fused) try self.tri.attnFused(at.q + g0 * q_heads * head_dim * 2, kc, vc, at.pos + (g0 / att_rows) * 16, at.ao + g0 * out_k * 2, s.qids, s.qnk, s.qspr, gm, kv_heads, pg);
             }
         }
 
@@ -449,11 +436,12 @@ pub fn Pass(comptime Tri: type) type {
             const plan: cuda.grouped.Plan = .{ .members = s.members, .items = s.items, .counts = s.counts, .rank = s.rank, .hist = s.hist };
             if (lw.native_experts) |*native| {
                 const owned = &native.experts;
-                try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
-                try self.k.router.route(self.stream, s.picks, pairs, e, 16, plan);
-                const items = cuda.grouped.maxItems(pairs, e, 16);
-                try self.k.nvfp4.run(self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, experts_n);
-                try self.k.nvfp4.run(self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, experts_n);
+                if (zs.clearsY(native.world, native.rank)) try self.stream.d.check(self.stream.d.api.cuMemsetD8Async(s.y, 0, pairs * dims * 4, self.stream.handle), "cuMemsetD8Async");
+                const pt = nvfp4_tile.size(n);
+                try self.k.router.route(self.stream, s.picks, pairs, e, pt, plan);
+                const items = cuda.grouped.maxItems(pairs, e, pt);
+                try nvfp4_tile.run(pt)(&self.k.nvfp4, self.stream, .up, .{ .x = s.mixed, .stride = dims, .slots = slots }, owned.view(), plan, s.moe_act, items, experts_n);
+                try nvfp4_tile.run(pt)(&self.k.nvfp4, self.stream, .down_f32, .{ .x = s.moe_act, .stride = owned.width }, owned.view(), plan, s.y, items, experts_n);
                 if (native.rank == 0) {
                     const glue = self.tri.own orelse return error.NativeGlueRequired;
                     try self.k.native_lane.matmul(self.stream, s.mixed, dims, n, native.shared[0].native.?, s.shared_gate, s.native_part);
@@ -549,13 +537,16 @@ pub fn Pass(comptime Tri: type) type {
                 }
                 try self.writeback(0, n);
                 try self.readoutKeep(lw.attn_hc, 0, n, keep.attn_hc);
+                self.zero_slices = zs.usable(self.s.part_zero, keep.mix_branch, self.m.collective != null, lw.out.native != null);
                 if (lw.linear) {
                     try self.gdnBlock(lw, layer, wt.linearIndex(layer), keep);
                 } else {
                     try self.attnBlockKeep(lw, wt.attnIndex(layer), keep);
                 }
                 if (keep.mix_branch != 0) try self.sumSlices(s.part, keep.mix_branch, true, n * dims, self.out_slices);
-                try self.tri.hcWriteback(s.h, s.h, s.pss, s.part, "*fp32", s.inj, s.dummy, "*bf16", s.dummy, "*bf16", n * dims, n, dims, streams, 4, 1, 1, self.out_slices);
+                const sl = zs.slices(self.zero_slices, s.cap, n, self.out_slices);
+                self.zero_slices = false;
+                try self.tri.hcWriteback(s.h, s.h, s.pss, s.part, "*fp32", s.inj, s.dummy, "*bf16", s.dummy, "*bf16", sl.stride, n, dims, streams, 4, 1, 1, sl.count);
                 try self.readoutKeep(lw.mlp_hc, 0, n, keep.mlp_hc);
                 try self.moeBlockKeep(lw, keep);
                 try self.moeAdds(layer, keep);
@@ -586,6 +577,7 @@ pub fn Pass(comptime Tri: type) type {
 }
 
 test "a pass's scratch at the dense cap stays near a gigabyte and a half" {
+    _ = @import("cuda_paging_batch_test.zig");
     try std.testing.expect(Scratch.bytes(default_chunk) < 2 << 30);
     try std.testing.expect(Scratch.bytes(1) < Scratch.bytes(2));
 }

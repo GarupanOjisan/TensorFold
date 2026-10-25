@@ -3,6 +3,30 @@ const std = @import("std");
 
 pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.Build.Step) void {
     const host = b.graph.host;
+    const prefill = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"Qwen stepped prefill:"} }));
+    b.step("test-qwen35-prefill-host", "Interrupted stepped prompt lifecycle without devices").dependOn(&prefill.step);
+    step.dependOn(&prefill.step);
+    const ct_admit = b.createModule(.{ .root_source_file = b.path("zig/qwen35_modelopt_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "qwen_vision", .module = mods.qwen_vision } } });
+    const ct_run = b.addRunArtifact(b.addTest(.{ .root_module = ct_admit }));
+    b.step("test-qwen35-modelopt-admission-host", "Synthetic stored-format admission and full-precision loading without devices").dependOn(&ct_run.step);
+    step.dependOn(&ct_run.step);
+    const admission = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/cuda_exl3_loader_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+    const admission_run = b.addRunArtifact(b.addTest(.{ .root_module = admission, .filters = &.{"EXL3 admission:"} }));
+    b.step("test-qwen35-exl3-admission-host", "Synthetic EXL3 tensors and dry-run refusals before upload").dependOn(&admission_run.step);
+    step.dependOn(&admission_run.step);
+    const late = b.createModule(.{ .root_source_file = b.path("zig/src/families/qwen3_5/cuda_engine_tail_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "lanes", .module = mods.lanes } } });
+    const late_run = b.addRunArtifact(b.addTest(.{ .root_module = late, .filters = &.{"EXL3 late init:"} }));
+    b.step("test-qwen35-exl3-owner-host", "Real EXL3 owners survive no late allocation or warm failure").dependOn(&late_run.step);
+    step.dependOn(&late_run.step);
+    const formats = b.createModule(.{ .root_source_file = b.path("zig/qwen35_formats_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core }, .{ .name = "lanes", .module = mods.lanes }, .{ .name = "qwen_vision", .module = mods.qwen_vision } } });
+    const formats_run = b.addRunArtifact(b.addTest(.{ .root_module = formats, .filters = &.{"format coexistence:"} }));
+    b.step("test-qwen35-formats-host", "MLX, ModelOpt and EXL3 admission and actual embedding dispatch without devices").dependOn(&formats_run.step);
+    step.dependOn(&formats_run.step);
+    @import("glm_contract_host.zig").host(b, cuda, mods.core, step);
+    @import("dory.zig").host(b, @import("dory.zig").module(b, host, .debug, cuda, mods.core, mods.lanes), step);
+    const attention = b.addRunArtifact(b.addTest(.{ .root_module = mods.qwen35, .filters = &.{"Qwen attention path:"} }));
+    b.step("test-qwen35-attention-path-host", "Contiguous and paged CUDA attention selection and graph identity without devices").dependOn(&attention.step);
+    step.dependOn(&attention.step);
     const proposal = b.createModule(.{ .root_source_file = b.path("zig/proposal_router_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "core", .module = mods.core }, .{ .name = "lanes", .module = mods.lanes } } });
     b.step("test-proposal-router-host", "Optional common proposal routing, legacy parity and lifecycle").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = proposal, .filters = &.{"proposal router:"} })).step);
 
@@ -26,9 +50,15 @@ pub fn steps(b: *std.Build, cuda: *std.Build.Module, mods: anytype, step: *std.B
     step.dependOn(&prompt_moe.step);
     const int8_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_w4a8_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
     int8_contract.addCSourceFile(.{ .file = b.path("zig/tests/cuda/w4a8_normalize_host.c"), .flags = &.{ "-std=c11", "-ffp-contract=off" } });
+    int8_contract.addCSourceFile(.{ .file = b.path("zig/tests/cuda/w4a8_store_host.cpp"), .flags = &.{ "-std=c++17", "-fno-exceptions", "-fno-rtti" } });
+    int8_contract.addCSourceFile(.{ .file = b.path("zig/tests/cuda/w4a8_quantize_host.cpp"), .flags = &.{ "-std=c++17", "-ffp-contract=off", "-fno-exceptions", "-fno-rtti" } });
     const int8_contract_run = b.addRunArtifact(b.addTest(.{ .root_module = int8_contract, .filters = &.{"w4a8 host:"} }));
     b.step("test-w4a8-contract-host", "Finite normalization, independent W4A8 references and numerical controls without CUDA").dependOn(&int8_contract_run.step);
     step.dependOn(&int8_contract_run.step);
+    const attn_contract = b.createModule(.{ .root_source_file = b.path("zig/tests/cuda/contract_q35_attn_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "core", .module = mods.core } } });
+    const attn_contract_run = b.addRunArtifact(b.addTest(.{ .root_module = attn_contract, .filters = &.{"q35 contract host:"} }));
+    b.step("test-qwen35-attn-contract-host", "Actual short and long TC attention adapter launches without devices").dependOn(&attn_contract_run.step);
+    step.dependOn(&attn_contract_run.step);
     const int8_prompt = b.createModule(.{ .root_source_file = b.path("zig/qwen35_prompt_int8_host.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "cuda", .module = cuda }, .{ .name = "qwen35", .module = mods.qwen35 } } });
     const int8_run = b.addRunArtifact(b.addTest(.{ .root_module = int8_prompt, .filters = &.{"prompt int8:"} }));
     b.step("test-qwen35-prompt-int8-host", "Prompt int8 allocation and actual projection recording without devices").dependOn(&int8_run.step);

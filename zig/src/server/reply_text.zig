@@ -8,14 +8,15 @@ pub const think_markers: Markers = .{ .open = "", .close = "</think>" };
 /// The opener a reply writes itself when its template leaves the think block to it (Kolibri 1's does).
 const think_open = "<think>";
 pub const channel_markers: Markers = .{ .open = "<|channel>thought", .close = "<channel|>" };
-/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block.
+/// (opener, closer) of a tool call's markup: Qwen's, Gemma 4's, DeepSeek-V4's DSML block, LFM2's.
 pub const calls = [_][2][]const u8{
     .{ "<tool_call>", "</tool_call>" },
     .{ "<|tool_call>", "<tool_call|>" },
     .{ "<\u{ff5c}DSML\u{ff5c}tool_calls>", "</\u{ff5c}DSML\u{ff5c}tool_calls>" },
+    .{ "<|tool_call_start|>", "<|tool_call_end|>" },
 };
-/// Each opener's payload lead: Gemma 4's ``call:`` (26B: ``:``), DSML's invoke; ``<tool_call>`` has none.
-const leads = [calls.len][]const []const u8{ &.{}, &.{ "call:", ":" }, &.{"<\u{ff5c}DSML\u{ff5c}invoke"} };
+/// Each opener's payload lead: Gemma 4's ``call:`` (26B: ``:``), DSML's invoke; ``<tool_call>`` and LFM2 have none.
+const leads = [calls.len][]const []const u8{ &.{}, &.{ "call:", ":" }, &.{"<\u{ff5c}DSML\u{ff5c}invoke"}, &.{} };
 
 /// Whether the text after an opener is a call's payload, may still become one, or is prose that names the opener.
 fn payloadOf(rest: []const u8, which: usize, finished: bool) enum { call, wait, prose } {
@@ -222,6 +223,12 @@ pub fn heldBack(text: []const u8, tools: bool) []const u8 {
 /// ``hideToolCalls`` of a finished reply; once a call is hidden, the prose's trailing whitespace stays unsent too.
 pub fn finishedProse(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
     const prose = try hideToolCalls(a, text, true);
+    return if (prose.len != text.len) prose[0..pyRstrip(prose).len] else prose;
+}
+
+/// A reply max_tokens cut inside a call it returns: the open envelope is that call, not text (#1238).
+pub fn cutProse(a: Allocator, text: []const u8) Allocator.Error![]const u8 {
+    const prose = try hideToolCalls(a, text, false);
     return if (prose.len != text.len) prose[0..pyRstrip(prose).len] else prose;
 }
 

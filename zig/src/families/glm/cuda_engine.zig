@@ -17,6 +17,7 @@ const tile = @import("cuda_tile.zig");
 const mm_mod = @import("cuda_mm.zig");
 const dflash = @import("dflash.zig");
 const prof_mod = @import("cuda_prof.zig");
+const pages_mod = @import("cuda_pages.zig");
 pub const Options = @import("cuda_engine_types.zig").Options;
 
 /// Rank 0's own word on its request (cancelled or not); the other ranks have none and hear rank 0's.
@@ -91,6 +92,7 @@ pub const Engine = struct {
     prompt_tried: bool = false, // that pass came: without buffers after it, the passes take the window's
     prompt_out: prompt_lp.Output, // a head pass's logprob words, then its picks, host-mapped (rank 0 reads them)
     structured: bool = false, // a structured output step: every rank's draws gather whole rows, rank 0 masks them
+    pages: ?*pages_mod.Pages = null, // the other streams' KV pages and sequences (cuda_pages), once the server attached them
 
     /// Opens rank `rank` of `world` over `comm`; the ranks agree on settings (cuda_ranks) before the weights load.
     pub fn init(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, ctx: *const cuda.Context, checkpoint: []const u8, lib: *const cuda.nccl.Library, comm: cuda.nccl.Comm, rank: usize, world: usize, o: Options) !*Engine {
@@ -103,8 +105,8 @@ pub const Engine = struct {
         const cfg_path = try std.fs.path.join(a, &.{ checkpoint, "config.json" });
         const text = try std.Io.Dir.cwd().readFileAlloc(io, cfg_path, a, .limited(1 << 24));
         var why: modelopt.Why = .{};
-        const admitted = if (exl3.isExl3(gpa, text)) exl3.admit(gpa, text, &why) else modelopt.admit(gpa, text, &why);
-        admitted catch |err| { // anything but ModelOpt NVFP4 or EXL3 (4-bit mcg routed experts) is refused before loading
+        const admitted = if (exl3.isExl3(gpa, text)) exl3.admit(gpa, text, &why) else @import("cuda_formats.zig").admit(gpa, text, &why);
+        admitted catch |err| { // anything but NVFP4, MIXED_PRECISION in recipes read here or EXL3 is refused by name before loading
             std.log.err("{s}: {s}", .{ cfg_path, why.text() });
             return err;
         };
@@ -165,7 +167,7 @@ pub const Engine = struct {
         e.m.mm.prompt_fixed_k = o.settings.prompt_fixed_k;
         e.m.tiled = o.settings.tiled;
         if (o.settings.tiled) e.m.packs = &e.packs;
-        try e.bind(0);
+        if (o.settings.pages) try pages_mod.ownSequence(e) else try e.bind(0); // on pages: no window, its pool places it
         errdefer {
             e.free(0);
             e.seqs.deinit(gpa);
@@ -220,6 +222,7 @@ pub const Engine = struct {
         e.bm.deinit();
         e.bd.deinit();
         e.bp.deinit();
+        if (e.pages) |p| p.deinit();
         for (0..e.seqs.items.len) |i| e.free(i);
         e.seqs.deinit(e.gpa);
         e.w.deinit();
@@ -246,7 +249,17 @@ pub const Engine = struct {
     /// Binds slot `slot`'s sequence for the steps that follow, making it (a zeroed state) on first use.
     pub fn bind(e: *Engine, slot: u32) !void {
         if (slot >= e.seqs.items.len) try e.seqs.appendNTimes(e.gpa, null, slot + 1 - e.seqs.items.len);
-        if (e.seqs.items[slot] == null) {
+        const made = e.seqs.items[slot] == null;
+        const previous = if (e.images != null) e.cur else null;
+        const previous_slot = if (e.images != null) e.slot else 0;
+        errdefer {
+            if (made) e.free(slot);
+            if (previous) |q| {
+                e.cur = q;
+                e.slot = previous_slot;
+            }
+        }
+        if (made) {
             const q = try e.gpa.create(Seq);
             errdefer e.gpa.destroy(q);
             q.* = .{ .st = try fw.State.initFormat(e.gpa, e.d, &e.w, e.capacity, e.settings.kv8) };
@@ -257,17 +270,18 @@ pub const Engine = struct {
         if (e.images) |v| try v.activate(slot);
     }
 
-    /// Frees slot `slot`'s sequence (slot 0 stays: the first stream's, made at init) and binds slot 0.
+    /// Frees slot `slot`'s sequence (slot 0 stays, and a paged one gives its pages back) and binds slot 0.
     pub fn release(e: *Engine, slot: u32) void {
         if (e.images) |v| v.release(slot);
-        if (slot != 0) e.free(slot);
+        const paged = if (e.pages) |p| p.paged(slot) else false;
+        if (paged) e.pages.?.close(slot) else if (slot != 0) e.free(slot);
         e.cur = e.seqs.items[0].?;
         e.slot = 0;
     }
 
     fn free(e: *Engine, slot: usize) void {
         const q = e.seqs.items[slot] orelse return;
-        e.stream.synchronize() catch {};
+        cuda.completion.drain(e.d, e.stream, "GLM sequence release did not drain");
         q.st.deinit();
         e.gpa.destroy(q);
         e.seqs.items[slot] = null;

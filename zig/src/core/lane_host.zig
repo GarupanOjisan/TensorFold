@@ -56,6 +56,7 @@ pub const LaneHost = struct {
     live_generated: u64 = 0,
     lone: ?api.Lone = null, // the backend's driver for a lone greedy stream; null: every stream in the lane core
     lone_job: ?*Job = null, // the job that driver holds now
+    cache_status: ?api.Status.PromptCache = null, // published under mutex; HTTP threads never read the store
     cache: ?*pc.Store = null, // kept prompt states (engine thread only); the backend restores and saves them
     recall: ?*lanes.recall_store.Store = null, // Recall's record: drafts from earlier requests (lane_host_recall.zig)
     decoded_rows: bool = false, // the backend prefills Request.decode_spans with decoded rows' arithmetic, cache or not
@@ -76,6 +77,7 @@ pub const LaneHost = struct {
     /// opt-in: a family round planner (prompt pieces, decode rows in one pass); null: whole or `prefill_step` prompts
     rounds: ?Rounds = null,
     pieces: std.ArrayList(Rounds.Piece) = .empty,
+    share: fill.Share = .{}, // prompt work's share of wall time beside decoding streams (lane_host_fill.zig)
     finals: std.ArrayList(usize) = .empty,
 
     pub const ThreadInit = struct { ctx: *anyopaque, run: *const fn (ctx: *anyopaque) anyerror!void };
@@ -85,7 +87,7 @@ pub const LaneHost = struct {
     pub const Job = @import("lane_job.zig").Job;
 
     pub fn init(gpa: Allocator, io: std.Io, core: *lanes.Engine, info_: Info) LaneHost {
-        return .{ .gpa = gpa, .io = io, .core = core, .info_ = info_.ofLanes() };
+        return .{ .gpa = gpa, .io = io, .core = core, .info_ = info_.ofLanes(), .share = .fromEnv() };
     }
 
     pub fn start(h: *LaneHost) !void {
@@ -279,7 +281,7 @@ pub const LaneHost = struct {
     }
 
     /// The next queued request into a free lane (or several, when the backend batches prompts); false when none can go.
-    fn admitOne(h: *LaneHost) bool {
+    pub fn admitOne(h: *LaneHost) bool {
         if (admit.batches(h)) return admit.many(h);
         const job = switch (h.takeJob()) {
             .none => return false,
@@ -360,10 +362,8 @@ pub const LaneHost = struct {
         };
     }
 
-    /// The next filling job's next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
-    fn fillOne(h: *LaneHost) void {
-        if (h.filling.items.len == 0) return;
-        const at = fill.next(h);
+    /// Filling job `at`'s next prompt chunk: the other streams' rounds run between chunks, not after the prompt.
+    pub fn fillAt(h: *LaneHost, at: usize) void {
         const job = h.filling.items[at];
         const first = !job.fill_began;
         job.fill_began = true;
@@ -529,7 +529,7 @@ pub const LaneHost = struct {
             scoring.answer(h);
             learn.refuse(h);
             while (h.admitOne()) {}
-            h.fillOne();
+            fill.run(h);
             h.core.sweep() catch |err| {
                 ends.failAll(h, @errorName(err));
                 continue;
@@ -565,10 +565,13 @@ pub const LaneHost = struct {
                 continue;
             }
             h.unlock();
+            const owed = h.share.debt_ns > 0; // a round is timed only while it pays a prompt step's debt down
+            const r0 = if (owed) std.Io.Clock.awake.now(h.io) else std.Io.Timestamp.zero;
             h.core.step() catch |e| {
                 ends.failAll(h, @errorName(e));
                 continue;
             };
+            if (owed) h.share.rounded(@intCast(r0.durationTo(std.Io.Clock.awake.now(h.io)).toNanoseconds()));
             h.deliverPending();
             lone.reclaim(h);
         }

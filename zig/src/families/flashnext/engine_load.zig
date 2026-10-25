@@ -98,6 +98,8 @@ pub fn loadConfigured(gpa: Allocator, io: std.Io, model_dir: []const u8, dump_di
     e.peer_budget = 0;
     e.peer_held = 0;
     e.identity_hash = 0;
+    e.tree = null;
+    e.gate = null;
     e.arena_state = std.heap.ArenaAllocator.init(gpa);
     errdefer e.arena_state.deinit();
     const arena = e.arena_state.allocator();
@@ -132,9 +134,13 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
     r.xnew = true;
     r.dense = true;
     r.hc_up = true;
-    r.event = try r.ownResource(try device.sharedEvent());
+    r.event = try r.ownResource(try device.event());
     if (dump_dir) |d| try r.compile(d) else try r.compileChecked();
     r.sel = try Select.init(r, MAXR);
+    if (r.tp == null and !std.mem.eql(u8, std.mem.span(platform.c.getenv("FZ_ATTN2") orelse @as([*:0]const u8, "on")), "off")) { // two heads a threadgroup, checked
+        r.attn2 = try @import("attn2.zig").init(r, "q4_attn_parts#[24, 256]");
+        r.attn2_mtp = try @import("attn2.zig").init(r, "mtp:q4_attn_parts#[24, 256]");
+    }
     r.lane_new = platform.c.getenv("FZ_LANE") != null; // core lane and fz_gdn on the target (the recorded bits)
     if (platform.c.getenv("FZ_GDN")) |v| {
         r.gdn_pipe = try fz.gdn_step.compile(r, false);
@@ -297,7 +303,9 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
         .vocab = try i32Buf(r, &.{VOCAB}),
     };
     {
-        const ids_n = try fz.draftCount((try r.entry("mtp.draft_ids")).len);
+        const ids_all = try fz.draftCount((try r.entry("mtp.draft_ids")).len);
+        const keep = if (platform.c.getenv("FZ_DRAFT_N")) |v| try std.fmt.parseInt(usize, std.mem.span(v), 10) else ids_all; // dev
+        const ids_n = @max(64, @min(ids_all, keep) / 64 * 64); // FZ_DRAFT_N: the head scores the first ids only
         const ids = try r.load("mtp.draft_ids");
         const mtp_root = @import("index.zig").mtpRoot(index.object.get("weight_map").?.object);
         var ex: [18]Buf = undefined;
@@ -377,6 +385,31 @@ fn finishLoad(context: Construction, r: *Run) !*Engine {
         m,
         @import("index.zig").mtpRoot(index.object.get("weight_map").?.object),
     );
+    if (r.tp == null) if (platform.c.getenv("FZ_GX")) |v| { // dev: windows from this many rows on the grouped experts
+        r.gx = try @import("gx.zig").init(r, try std.fmt.parseInt(usize, std.mem.span(v), 10));
+        std.log.info("flash next: grouped experts from {d} rows", .{r.gx.?.min_rows});
+    };
+    if (platform.c.getenv("FZ_SKIP")) |v| r.skip = try std.fmt.parseInt(u32, std.mem.span(v), 10); // dev: knock-outs by Run.class bit
+    // GPU-gated lanes at this probability product: 0.4 without tensor units (FZ_GATE=tau sets it, FZ_GATE=off none)
+    const gate_tau: ?[]const u8 = if (platform.c.getenv("FZ_GATE")) |v| std.mem.span(v) else if (!r.device.tensorUnits()) "0.4" else null;
+    if (r.tp == null) if (gate_tau) |v| if (!std.mem.eql(u8, v, "off")) {
+        const tau = try std.fmt.parseFloat(f32, v);
+        const width = if (platform.c.getenv("FZ_GATE_ROWS")) |w| try std.fmt.parseInt(usize, std.mem.span(w), 10) else @import("gate.zig").WMAX; // dev
+        e.gate = try @import("gate.zig").init(r, tau, m.mtp.ids_n, width);
+        std.log.info("flash next: gated lanes, up to {d} rows while the drafts' probability stays >= {d}", .{ width, tau });
+    };
+    if (r.tp == null) if (platform.c.getenv("FZ_TREE")) |v| { // dev: a,b (the branch from FZ_FEED) or a,k,sib (head siblings)
+        var it = std.mem.tokenizeScalar(u8, std.mem.span(v), ',');
+        const a = try std.fmt.parseInt(usize, it.next() orelse "0", 10);
+        const b = try std.fmt.parseInt(usize, it.next() orelse "0", 10);
+        const sib: usize = if (it.next()) |w| (if (std.mem.eql(u8, w, "sib")) b else return error.TreeShape) else 0;
+        const feed: ?[]const u8 = if (platform.c.getenv("FZ_FEED")) |f| blk: {
+            const file = try r.mapFile(std.mem.span(f));
+            break :blk file.bytes[0..file.size];
+        } else null;
+        e.tree = try @import("tree.zig").init(r, a, if (sib > 0) a * sib else b, feed, sib);
+        if (sib > 0) std.log.info("flash next: tree rounds, a head chain of {d} and {d} head siblings a depth", .{ a, sib }) else std.log.info("flash next: tree rounds, a head chain of {d} and a branch of {d}", .{ a, b });
+    };
     return e;
 }
 

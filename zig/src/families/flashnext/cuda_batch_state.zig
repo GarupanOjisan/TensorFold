@@ -7,7 +7,6 @@ const ple = @import("cuda_ple.zig");
 const wt = @import("cuda_prompt_wt.zig");
 const tk = @import("cuda_tile_kernels.zig");
 const load = @import("cuda_prompt_load.zig");
-
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
 const dims = wt.dims;
@@ -290,6 +289,8 @@ pub const Scratch = struct {
     xsm: u64 = 0,
     proj: u64 = 0,
     part: u64 = 0,
+    /// part's second cap-stride slice is zeros (native lanes write only the first): a writeback adds it once.
+    part_zero: bool = false,
     gout: u64 = 0,
     gxs: u64 = 0,
     ys: u64 = 0,
@@ -439,6 +440,8 @@ pub const Scratch = struct {
         s.xsm = try s.add(gpa, d, cap * (dims / 32) * 4);
         s.proj = try s.add(gpa, d, cap * proj_row * 2);
         s.part = try s.add(gpa, d, out_sk * cap * dims * 4);
+        try s.bufs.items[s.bufs.items.len - 1].fill8(0, stream.handle);
+        s.part_zero = true;
         s.gout = try s.add(gpa, d, cap * gdn.value_dim * 2);
         s.gxs = try s.add(gpa, d, cap * (gdn.value_dim / 32) * 4);
         s.ys = try s.add(gpa, d, cap * gdn.value_dim * 4);
@@ -525,6 +528,8 @@ pub const SeqState = struct {
     cap: usize,
     /// Block scores for an attention block's rows [min(rows, att_rows), scoreStride(cap)] fp32 (the engine's).
     scores: u64,
+    /// The attention caches' pages (pt 0: kc, vc, ikc and pooled are contiguous rows).
+    pg: @import("cuda_glue.zig").Pg = .{},
 };
 
 /// The block scores' row stride for a cache of `cap` tokens: its blocks rounded up to 16 (the captured _scores').
@@ -591,3 +596,5 @@ pub const Gather = struct {
 test {
     _ = @import("cuda_batch_state_test.zig");
 }
+
+pub const Pg = @import("cuda_glue.zig").Pg;

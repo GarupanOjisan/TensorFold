@@ -72,6 +72,8 @@ pub const Request = struct {
     shared_prefixes: []const u32 = &.{},
     /// Where the latest user message's text starts: a state kept before it lets an edit of that turn resume (0: none).
     rewind_len: u32 = 0,
+    /// End of the latest user message in this prompt (0: unknown); background reply passes leave it unknown.
+    user_end: u32 = 0,
     /// Prompt chunk starts after 0 (Python PrefillPlan); empty selects the engine's plan.
     chunks: []const u32 = &.{},
     /// Decoded intervals [start,end), sorted, nonempty and strictly separated; an empty list uses prompt arithmetic.
@@ -264,6 +266,10 @@ pub const Open = struct {
     context: ?i64 = null,
     max_frames: ?u32 = null,
     silence: speech_guard.Config = .{},
+    /// Allocate an independent backbone state per speech lane; Metal Drama only.
+    cfg_enabled: bool = false,
+    /// Submit the two independent CFG sequences in one Metal command buffer, not vectorized GEMM.
+    cfg_batched: bool = false,
     lanes: u32 = 8,
     /// --parallel named a number: an engine whose memory fits fewer streams refuses instead of serving fewer.
     lanes_fixed: bool = false,
@@ -311,6 +317,8 @@ pub const Open = struct {
     policy: []const u8 = "",
     /// --vision: load the checkpoint's image tower (null: text only; an engine without one refuses).
     vision: ?VisionOpen = null,
+    /// --loops: passes over a looped model's recurrent block (Dory's; null: the checkpoint's own count).
+    loops: ?u32 = null,
 };
 
 /// A packed decision: a trunk (pictures expand at `at`), a branch a question, and each branch's labels (`counts`).
