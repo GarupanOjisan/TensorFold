@@ -196,6 +196,10 @@ pub const Stream = struct {
     cost_probe_spacing: u64 = 8, // the latest trial interval, including its expected repayment bound
     cost_probes: [129]@import("lone_costs.zig").Cooldown = @splat(.{}), // per-width losing-trial retry deadlines
     cost_probe_trial: ?@import("lone_costs.zig").Trial = null, // priced selection, consumed only by its completed width
+    shared_round: bool = false, // a round beside another stream: its times are not this stream's alone
+    prices_seeded: bool = false, // its own prices started from the engine's kept calibration
+    copy_landed: [2]f64 = .{ -1, -1 }, // a lone context copy's rows that landed, decayed, by short and long match (-1: unprimed)
+    copy_broke: [2]f64 = .{ 0, 0 }, // and its chains that broke before their end: their ratio is a copied row's landing rate
     drafted: u64 = 0,
     accepted: u64 = 0,
     branch_rows: u64 = 0, // suffix-match branch rows verified (lanes/fill.zig)
@@ -325,6 +329,12 @@ pub const Stream = struct {
     pub fn isCancelled(s: *const Stream) bool {
         const c = s.cancel_check orelse return false;
         return c.check(c.ptr);
+    }
+
+    /// Keep a completed, resumable prompt prefix before cancellation releases the backend's state.
+    pub fn keepInterruptedPrefill(s: *Stream, at: u32) void {
+        if (at <= s.cached or at >= s.prompt_len) return;
+        if (s.reuse.hook) |hook| hook.at(hook.ptr, s, at);
     }
 
     /// Whether a background prompt pass should step aside now (false with no hook); asked before each chunk.

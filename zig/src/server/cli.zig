@@ -38,14 +38,17 @@ fn servedBy(list: []const []const u8, name: []const u8) bool {
 /// The CUDA build's own flags and variables (the Metal build refuses them).
 const cuda_build = builtin.os.tag == .linux;
 
-/// Every Python serve flag (``cli_args.build_parser``), the ones this binary serves marked native.
+/// Python serve flags plus this binary's native-only flags; supported flags are marked native.
 pub const flags = [_]Flag{
     .{ .name = "--host", .native = true },
     .{ .name = "--allowed-host", .kind = .append, .native = true },
     .{ .name = "--allowed-origin", .kind = .append, .native = true },
+    .{ .name = "--allowed-controls", .native = true },
     .{ .name = "--port", .native = true },
     .{ .name = "--name", .native = true },
     .{ .name = "--chat-template", .native = true },
+    .{ .name = "--voices", .native = true },
+    .{ .name = "--default-voice", .native = true },
     .{ .name = "--alias", .kind = .append, .native = true },
     .{ .name = "--api-key", .kind = .append, .native = true },
     .{ .name = "--api-key-file", .native = true },
@@ -59,6 +62,7 @@ pub const flags = [_]Flag{
     .{ .name = "--vision-image-tokens", .native = true },
     .{ .name = "--vision-video-tokens", .native = true },
     .{ .name = "--context", .native = true },
+    .{ .name = "--max-frames", .native = true },
     .{ .name = "--speed-up", .native = !cuda_build },
     .{ .name = "--max-tokens", .native = true },
     .{ .name = "--temperature", .native = true },
@@ -74,6 +78,21 @@ pub const flags = [_]Flag{
     .{ .name = "--loop-guard", .kind = .store_true, .native = true },
     .{ .name = "--no-drafts", .kind = .store_true, .native = true },
     .{ .name = "--keep-warm", .native = true },
+    .{ .name = "--silence-floor-dbfs", .native = true },
+    .{ .name = "--silence-seconds", .native = true },
+    .{ .name = "--silence-onset-s", .native = true },
+    .{ .name = "--silence-onset-voiced-s", .native = true },
+    .{ .name = "--silence-mid-s", .native = true },
+    .{ .name = "--silence-mid-min-voiced-s", .native = true },
+    .{ .name = "--silence-redraws", .native = true },
+    .{ .name = "--silence-redraw-budget-s", .native = true },
+    .{ .name = "--silence-redraw-controls", .native = true },
+    .{ .name = "--short-reply-ratio", .native = true },
+    .{ .name = "--short-reply-chars-per-s", .native = true },
+    .{ .name = "--register-redraw-st", .native = true },
+    .{ .name = "--register-redraw-high", .native = true },
+    .{ .name = "--register-high-hz", .native = true },
+    .{ .name = "--idle-unload", .native = true },
     .{ .name = "--compact-at", .native = true },
     .{ .name = "--compact-keep", .native = true },
     .{ .name = "--compact-memory", .native = true },
@@ -83,6 +102,7 @@ pub const flags = [_]Flag{
     .{ .name = "--drafter-bits", .choices = &.{ "0", "4" }, .native = true },
     .{ .name = "--record", .native = true },
     .{ .name = "--kv-cache", .choices = &.{ "bf16", "fp8" }, .native = true },
+    .{ .name = "--prompt-precision", .choices = &.{ "bf16", "int8" }, .native = true },
     .{ .name = "--mtp-drafts", .native = served("--mtp-drafts") },
     .{ .name = "--mtp-confidence", .native = served("--mtp-confidence") },
     .{ .name = "--lane-kernels", .choices = &.{ "auto", "on", "off" } },
@@ -140,14 +160,20 @@ pub const Args = struct {
     port: u16 = 8080,
     name: []const u8 = "",
     chat_template: ?[]const u8 = null,
+    voices: ?[]const u8 = null,
+    default_voice: []const u8 = "default",
     alias: []const []const u8 = &.{},
     api_key: []const []const u8 = &.{},
     allowed_host: []const []const u8 = &.{},
     allowed_origin: []const []const u8 = &.{},
+    allowed_controls: ?@import("drama_allow.zig").Policy = null,
     api_key_file: ?[]const u8 = null,
     metrics_open: bool = false,
     dashboard: bool = false,
     context: ?i64 = null,
+    max_frames: ?u32 = null,
+    silence: api.speech_guard.Config = .{},
+    redraw: @import("speech_redraw.zig").Policy = .{},
     speed_up: ?[]const u8 = null, // speed-up mode: this Mac's settings for the two-Mac link (Flash Next and the GLMs)
     prompt_cache_gib: ?f64 = null, // kept prompt states' budget (0: none; null: what 70% of RAM leaves past the loaded server)
     prompt_cache_over_cap: bool = false, // a --prompt-cache-gib past that is kept, not refused
@@ -174,6 +200,7 @@ pub const Args = struct {
     loop_guard: bool = false,
     no_drafts: bool = false,
     keep_warm: i64 = 900, // seconds the idle keepalive runs after the last request ends (0: off)
+    idle_unload: i64 = 0, // seconds of idle past the last request before the engine closes (0: never; the next request reloads)
     compact_auto: bool = false,
     compact_fraction: ?f64 = null,
     compact_keep: ?u32 = null,
@@ -182,6 +209,7 @@ pub const Args = struct {
     drafter_bits: u8 = 4,
     record: ?[]const u8 = null, // drafter training rows written under this folder
     kv_cache: []const u8 = "bf16", // fp8: e4m3 attention caches with a scale a row, about twice the context
+    prompt_precision: []const u8 = "bf16", // int8: prompt matmuls quantize their inputs to int8 a 64-input group
     slide: bool = false, // Sliding Weights learns what /v1/slide/learn is told into the served weights, live
     slide_graph: ?[]const u8 = null, // the Sliding Weights fact graph's file (null: memory only)
     parallel: []const u8 = "auto",
@@ -255,7 +283,11 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
     }
     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
     try ranks(u, a, out);
+    out.silence.validate() catch |err|
+        return fail(u, a, "invalid silence guard configuration: {s}", .{@errorName(err)});
+    out.redraw.validate(out.silence) catch |err| return fail(u, a, "invalid redraw configuration: {s}", .{@errorName(err)});
     if (out.vision_urls and !out.vision) return fail(u, a, "--vision-urls needs --vision", .{});
+    if (out.idle_unload < 0 or out.idle_unload > std.math.maxInt(i64) / std.time.ns_per_s) return fail(u, a, "argument --idle-unload: expected a seconds count from 0 (off) under {d}: '{d}'", .{ std.math.maxInt(i64) / std.time.ns_per_s, out.idle_unload });
     out.alias = repeated.alias.items;
     out.api_key = repeated.keys.items;
     if (repeated.hosts.items.len > 64 or repeated.origins.items.len > 64) return fail(u, a, "at most 64 --allowed-host and 64 --allowed-origin entries are allowed", .{});
@@ -288,6 +320,24 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
             return std.mem.eql(u8, x, y);
         }
     }.f;
+    if (is(name, "--silence-floor-dbfs")) {
+        out.silence.floor_dbfs = try float(u, a, name, v);
+        return;
+    }
+    if (is(name, "--silence-seconds")) {
+        out.silence.seconds = try float(u, a, name, v);
+        return;
+    }
+    if (is(name, "--silence-mid-s") or is(name, "--silence-mid-min-voiced-s")) {
+        const seconds = try float(u, a, name, v);
+        if (is(name, "--silence-mid-s")) out.silence.mid_seconds = seconds else out.silence.mid_min_voiced_s = seconds;
+        return;
+    }
+    if (is(name, "--allowed-controls")) {
+        out.allowed_controls = @import("drama_allow.zig").parse(v) catch
+            return fail(u, a, "argument --allowed-controls: expected comma-separated UTF-8 names without square brackets: '{s}'", .{v});
+        return;
+    }
     if (is(name, "--allowed-host")) {
         if (!@import("request_guard.zig").validHost(v)) return fail(u, a, "argument --allowed-host: expected a hostname or bracketed IP without a port: '{s}'", .{v});
         return repeated.hosts.append(a, v);
@@ -298,11 +348,27 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
     }
     if (try cudaFlag(a, out, name, v, u) or try gpuFlag(a, out, name, v, u)) return;
     if (try recallFlag(a, out, name, v, u)) return;
+    if (is(name, "--voices")) {
+        out.voices = v;
+        return;
+    }
+    if (is(name, "--default-voice")) {
+        if (!std.mem.eql(u8, v, "default") and !@import("drama_voice.zig").validName(v))
+            return fail(u, a, "invalid --default-voice: {s}", .{v});
+        out.default_voice = v;
+        return;
+    }
     if (is(name, "--chat-template")) {
         out.chat_template = v;
         return;
     }
-    if (is(name, "--host")) out.host = v else if (is(name, "--port")) {
+    if (is(name, "--max-frames")) {
+        const n = try int(u, a, name, v);
+        if (n < 1 or n > 8190) return fail(u, a, "argument --max-frames: expected 1 through 8190: '{s}'", .{v});
+        out.max_frames = @intCast(n);
+        return;
+    }
+    if (is(name, "--silence-onset-s")) out.silence.onset_seconds = try float(u, a, name, v) else if (is(name, "--silence-onset-voiced-s")) out.silence.onset_voiced_seconds = try float(u, a, name, v) else if (is(name, "--host")) out.host = v else if (is(name, "--port")) {
         const p = try int(u, a, name, v);
         if (p < 0 or p > 65535) return fail(u, a, "argument --port: invalid port: '{s}'", .{v});
         out.port = @intCast(p);
@@ -321,7 +387,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         out.learn_daily_gib = try gib(u, a, name, v);
     } else if (is(name, "--prompt-seed")) {
         out.prompt_seed = true;
-    } else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--thinking-reserve")) out.thinking_reserve = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--drafter")) out.drafter = v else if (is(name, "--drafter-bits")) out.drafter_bits = @intCast(try int(u, a, name, v)) else if (is(name, "--record")) out.record = v else if (is(name, "--kv-cache")) out.kv_cache = v else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--compact-at")) {
+    } else if (is(name, "--max-tokens")) out.max_tokens = try int(u, a, name, v) else if (is(name, "--temperature")) out.temperature = try float(u, a, name, v) else if (is(name, "--top-p")) out.top_p = try float(u, a, name, v) else if (is(name, "--top-k")) out.top_k = try int(u, a, name, v) else if (is(name, "--min-p")) out.min_p = try float(u, a, name, v) else if (is(name, "--thinking")) out.thinking = true else if (is(name, "--no-thinking")) out.thinking = false else if (is(name, "--reasoning-effort")) out.reasoning_effort = v else if (is(name, "--thinking-budget")) out.thinking_budget = try int(u, a, name, v) else if (is(name, "--thinking-reserve")) out.thinking_reserve = try int(u, a, name, v) else if (is(name, "--loop-guard")) out.loop_guard = true else if (is(name, "--drafter")) out.drafter = v else if (is(name, "--drafter-bits")) out.drafter_bits = @intCast(try int(u, a, name, v)) else if (is(name, "--record")) out.record = v else if (is(name, "--kv-cache")) out.kv_cache = v else if (is(name, "--prompt-precision")) out.prompt_precision = v else if (is(name, "--no-drafts")) out.no_drafts = true else if (is(name, "--keep-warm")) out.keep_warm = try int(u, a, name, v) else if (is(name, "--idle-unload")) out.idle_unload = try int(u, a, name, v) else if (is(name, "--compact-at")) {
         if (std.mem.eql(u8, v, "auto")) out.compact_auto = true else {
             const f = try float(u, a, name, v);
             if (!(f > 0 and f <= 1)) return fail(u, a, "argument --compact-at: expected auto or a fraction in (0, 1]: '{s}'", .{v});
@@ -345,10 +411,16 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
         out.vision_video_tokens = @intCast(n);
     } else if (is(name, "--vision-image-tokens")) {
         const n = try int(u, a, name, v);
-        if (n < 16 or n > 16384) return fail(u, a, "argument --vision-image-tokens: expected 16 to 16384 tokens: '{s}'", .{v});
+        if (n < 16 or n > 262144) return fail(u, a, "argument --vision-image-tokens: expected 16 to 262144 tokens: '{s}'", .{v});
         out.vision_image_tokens = @intCast(n);
         out.vision_image_tokens_set = true;
-    }
+    } else if (is(name, "--silence-redraws")) {
+        out.redraw.max = std.math.cast(u8, try int(u, a, name, v)) orelse return fail(u, a, "argument --silence-redraws: expected 0 to 255 redraws: '{s}'", .{v});
+    } else if (is(name, "--silence-redraw-budget-s")) {
+        out.redraw.budget_s = try float(u, a, name, v);
+    } else if (is(name, "--short-reply-ratio")) out.redraw.short_ratio = try float(u, a, name, v) else if (is(name, "--short-reply-chars-per-s")) out.redraw.short_chars_per_s = try float(u, a, name, v) else if (is(name, "--silence-redraw-controls")) {
+        out.redraw.controls = @import("drama_allow.zig").parse(v) catch return fail(u, a, "argument --silence-redraw-controls: expected comma-separated UTF-8 names without square brackets, or an empty list: '{s}'", .{v});
+    } else if (is(name, "--register-redraw-st")) out.redraw.register.st = try float(u, a, name, v) else if (is(name, "--register-redraw-high")) out.redraw.register.high = try float(u, a, name, v) else if (is(name, "--register-high-hz")) out.redraw.register.high_hz = try float(u, a, name, v);
 }
 
 /// --recall and the flags that imply it; false for any other flag.
@@ -435,6 +507,8 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .dir = dir,
         .model_type = model_type,
         .context = args.context,
+        .max_frames = args.max_frames,
+        .silence = args.silence,
         .lanes = parallel(args.parallel) orelse 8,
         .lanes_fixed = parallelFixed(args.parallel),
         .drafts = !args.no_drafts,
@@ -442,6 +516,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .drafter_bits = args.drafter_bits,
         .record = args.record,
         .kv8 = std.mem.eql(u8, args.kv_cache, "fp8"),
+        .prompt_int8 = std.mem.eql(u8, args.prompt_precision, "int8"),
         .speed_up = args.speed_up,
         .prompt_cache_gib = args.prompt_cache_gib,
         .prompt_cache_over_cap = args.prompt_cache_over_cap,
@@ -510,56 +585,14 @@ pub fn capabilities(w: *std.Io.Writer, e: Engines) !void {
     try w.writeAll("}\n");
 }
 
-test "--device and --segments: CUDA builds serve them, values checked; --speed-up is the Mac build's" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var u: Usage = .{};
-    if (cuda_build) {
-        const args = try parse(a, &.{ "m", "--device", "1", "--segments=2" }, &u);
-        try std.testing.expectEqual(@as(?u32, 1), args.device);
-        try std.testing.expectEqual(@as(?u32, 2), args.segments);
-    } else try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--device", "1" }, &u));
-    if (cuda_build) try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--speed-up", "pair.json" }, &u)) else try std.testing.expectEqualStrings("pair.json", (try parse(a, &.{ "m", "--speed-up", "pair.json" }, &u)).speed_up.?);
-    var out: Args = .{};
-    try std.testing.expect(try cudaFlag(a, &out, "--device", "0", &u));
-    try std.testing.expectEqual(@as(?u32, 0), out.device);
-    try std.testing.expectError(error.Usage, cudaFlag(a, &out, "--device", "-1", &u));
-    try std.testing.expectError(error.Usage, cudaFlag(a, &out, "--segments", "0", &u));
-    try std.testing.expect(try cudaFlag(a, &out, "--segments", "4", &u));
-    try std.testing.expectEqual(@as(?u32, 4), out.segments);
-    try std.testing.expect(!try cudaFlag(a, &out, "--port", "1", &u));
-    try std.testing.expect(parallelFixed("3") and !parallelFixed("auto") and !parallelFixed("x"));
-}
+const cli = @This();
 
-test "the GPU engine's flags: refused and unlisted unless the backend serves them, values checked" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var u: Usage = .{};
-    // each flag, a value, and the `serves` entry that turns it on
-    const gated = [_][3][]const u8{ .{ "--tp", "2", "--tp" }, .{ "--rank", "0", "--tp" }, .{ "--master", "node0", "--tp" }, .{ "--master-port", "29600", "--tp" }, .{ "--policy", "matrix=off", "--policy" }, .{ "--mtp-drafts", "2", "--mtp-drafts" }, .{ "--mtp-confidence", "0.5", "--mtp-confidence" }, .{ "--checkpoint-slots", "3", "--checkpoint-slots" } };
-    var out: std.Io.Writer.Allocating = .init(a);
-    try capabilities(&out.writer, .{ .version = "0" });
-    for (gated) |g| {
-        const listed = std.mem.indexOf(u8, out.written(), try std.fmt.allocPrint(a, "\"{s}\"", .{g[0]})) != null;
-        try std.testing.expectEqual(servedBy(native_serves, g[2]), listed);
-        if (!listed) try std.testing.expectError(error.Usage, parse(a, &.{ "m", g[0], g[1] }, &u));
-    }
-    try std.testing.expect(servedBy(&.{ "--tp", "--policy" }, "--tp") and !servedBy(&.{"--tp"}, "--policy") and !servedBy(&.{}, "--tp"));
-    var args: Args = .{};
-    for ([_][2][]const u8{ .{ "--tp", "4" }, .{ "--rank", "2" }, .{ "--master", "node0" }, .{ "--master-port", "29600" }, .{ "--mtp-drafts", "2" }, .{ "--mtp-confidence", "0.5" }, .{ "--checkpoint-slots", "3" }, .{ "--policy", "matrix=off" }, .{ "--policy", "kernels=reference" } }) |g| try std.testing.expect(try gpuFlag(a, &args, g[0], g[1], &u));
-    try std.testing.expectEqual(@as(u32, 4), args.tp);
-    try std.testing.expectEqual(@as(u32, 2), args.rank);
-    try std.testing.expectEqualStrings("node0", args.master);
-    try std.testing.expectEqual(@as(u16, 29600), args.master_port);
-    try std.testing.expectEqual(@as(?u32, 2), args.mtp_drafts);
-    try std.testing.expectEqual(@as(?f64, 0.5), args.mtp_confidence);
-    try std.testing.expectEqual(@as(?i64, 3), args.checkpoint_slots);
-    try std.testing.expectEqualStrings("matrix=off,kernels=reference", args.policy);
-    try ranks(&u, a, args);
-    args.rank = 4;
-    try std.testing.expectError(error.Usage, ranks(&u, a, args));
-    for ([_][2][]const u8{ .{ "--rank", "-1" }, .{ "--master-port", "70000" }, .{ "--mtp-drafts", "65" }, .{ "--mtp-confidence", "1.5" }, .{ "--checkpoint-slots", "-1" }, .{ "--policy", "matrix" } }) |g| try std.testing.expectError(error.Usage, gpuFlag(a, &args, g[0], g[1], &u));
-    try std.testing.expect(!try gpuFlag(a, &args, "--port", "1", &u));
-}
+/// The private flag helpers cli_test.zig checks.
+pub const Test = if (builtin.is_test) struct {
+    pub const cuda_build = cli.cuda_build;
+    pub const native_serves = cli.native_serves;
+    pub const servedBy = cli.servedBy;
+    pub const cudaFlag = cli.cudaFlag;
+    pub const gpuFlag = cli.gpuFlag;
+    pub const ranks = cli.ranks;
+} else struct {};

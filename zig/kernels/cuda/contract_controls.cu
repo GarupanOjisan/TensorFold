@@ -75,6 +75,11 @@ extern "C" __global__ void __launch_bounds__(tf_qk_round::WIDE) tf_ctl_qk_round(
     tf_qk_round::rows(in, nw, cosv, sinv, inv, rot, pos, slot, dst, kc, vc, len, h, hk, eps, keep);
 }
 
+// Gate 3: act_rows.cu's tf_softcap_rows keeping only the rounding points in `keep`; the exact check must go red.
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_softcap(const __nv_bfloat16* x, __nv_bfloat16* out, int n,
+                                                                  float cap, int keep) {
+    tf_act_round::softcap_rows(x, out, n, cap, keep);
+}
 
 // Gate 3: embed_rows.cu's scaled MLX rows keeping the rounding points in `keep`; the exact check must go red.
 #include "embed_affine.cuh"
@@ -135,3 +140,98 @@ TF_CTL_TAIL(tf_ctl_tail_drop_branch_out, tf_rms_tail::BRANCH_OUT)
 TF_CTL_TAIL(tf_ctl_tail_drop_sum, tf_rms_tail::SUM)
 TF_CTL_TAIL(tf_ctl_tail_drop_row, tf_rms_tail::ROW)
 #undef TF_CTL_TAIL
+
+// Gate 3: window_rows.cu's kernels at head dims 256 and 512, each with one planted fault (window_rows.cuh's Fault).
+#include "window_rows.cuh"
+
+extern "C" __global__ void __launch_bounds__(tf_wrows::NT) tf_ctl_wrows_part_edge(const __nv_bfloat16* q, const __nv_bfloat16* kc,
+                                                                                 const __nv_bfloat16* vc, const int* pos, const int* slot,
+                                                                                 float* po, float* pm, float* pl, int h, int hk, int win,
+                                                                                 long long ring, float scale) {
+    tf_wrows::part<256, tf_wrows::EDGE>(q, kc, vc, pos, slot, po, pm, pl, h, hk, win, ring, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(tf_wrows::NT) tf_ctl_wrows_merge_rescale(const float* po, const float* pm, const float* pl,
+                                                                                     __nv_bfloat16* out, int h, int hk, int chunks,
+                                                                                     const __nv_bfloat16* q, const __nv_bfloat16* kc,
+                                                                                     const __nv_bfloat16* vc, const int* pos, const int* slot,
+                                                                                     int win, long long ring, float scale) {
+    tf_wrows::merge<256, tf_wrows::RESCALE>(po, pm, pl, out, h, hk, chunks, q, kc, vc, pos, slot, win, ring, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(tf_wrows::NT) tf_ctl_wrows_merge_trunc(const float* po, const float* pm, const float* pl,
+                                                                                   __nv_bfloat16* out, int h, int hk, int chunks,
+                                                                                   const __nv_bfloat16* q, const __nv_bfloat16* kc,
+                                                                                   const __nv_bfloat16* vc, const int* pos, const int* slot,
+                                                                                   int win, long long ring, float scale) {
+    tf_wrows::merge<256, tf_wrows::TRUNC>(po, pm, pl, out, h, hk, chunks, q, kc, vc, pos, slot, win, ring, scale);
+}
+
+extern "C" __global__ void __launch_bounds__(tf_wrows::NT, 1) tf_ctl_wrows_prompt_edge(const __nv_bfloat16* q, const __nv_bfloat16* kc,
+                                                                                      const __nv_bfloat16* vc, __nv_bfloat16* out,
+                                                                                      const int* hi, int p0, int W, int H, int HK, int G,
+                                                                                      float scale, int win, int ring) {
+    tf_wrows::prompt::kernel<256, true, tf_wrows::EDGE>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring);
+}
+
+extern "C" __global__ void __launch_bounds__(tf_wrows::NT, 1) tf_ctl_wrows_prompt_last(const __nv_bfloat16* q, const __nv_bfloat16* kc,
+                                                                                      const __nv_bfloat16* vc, __nv_bfloat16* out,
+                                                                                      const int* hi, int p0, int W, int H, int HK, int G,
+                                                                                      float scale, int win, int ring) {
+    tf_wrows::prompt::kernel<256, true, tf_wrows::LAST>(q, kc, vc, out, hi, p0, W, H, HK, G, scale, win, ring);
+}
+
+extern "C" __global__ void __launch_bounds__(tf_wrows::NT) tf_ctl_wrows_merge_rescale_512(const float* po, const float* pm, const float* pl,
+                                                                                         __nv_bfloat16* out, int h, int hk, int chunks,
+                                                                                         const __nv_bfloat16* q, const __nv_bfloat16* kc,
+                                                                                         const __nv_bfloat16* vc, const int* pos, const int* slot,
+                                                                                         int win, long long ring, float scale) {
+    tf_wrows::merge<512, tf_wrows::RESCALE>(po, pm, pl, out, h, hk, chunks, q, kc, vc, pos, slot, win, ring, scale);
+}
+
+// Gate 3: deliberately omit the bias output's BF16 round before adding the residual (RADIO act=none).
+extern "C" __global__ void tf_ctl_vit_unrounded_bias(const float* ACC, const __nv_bfloat16* BIAS,
+                                                   const __nv_bfloat16* R, __nv_bfloat16* O, int N) {
+    const int c = blockIdx.y * blockDim.x + threadIdx.x;
+    if (c >= N) return;
+    const int64_t at = static_cast<int64_t>(blockIdx.x) * N + c;
+    O[at] = __float2bfloat16_rn(__fadd_rn(__fadd_rn(ACC[at], __bfloat162float(BIAS[c])), __bfloat162float(R[at])));
+}
+
+
+// Gate 3: vit.cu's LayerNorm rows (8192 wide) keeping the points in `keep`; the shapes gate must go red.
+#include "vit_norm.cuh"
+
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_vit_norm(const __nv_bfloat16* x, const __nv_bfloat16* w,
+                                                                   const __nv_bfloat16* b, __nv_bfloat16* y, int d,
+                                                                   float eps, int keep) {
+    tf_vit_norm::layer_norm<32>(x, w, b, y, d, eps, keep);
+}
+
+// Gate 3: tree_round.cu's picks to ids keeping the points in `keep`; the exact check must go red.
+#include "round_ids.cuh"
+
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_pick_ids(const uint32_t* picks, int* ids, unsigned rows,
+                                                                   unsigned vocab, int fallback, int keep) {
+    tf_round_ids::pick_ids(picks, ids, rows, vocab, fallback, keep);
+}
+
+// Gate 3: vit.cu's Gemma 4 tower glue keeping the points in `keep`; the shapes gate must go red.
+#include "vit_gemma.cuh"
+
+extern "C" __global__ void __launch_bounds__(32) tf_ctl_vit_g4_qkv(__nv_bfloat16* qkv, const __nv_bfloat16* qw, const __nv_bfloat16* kw,
+                                                                const __nv_bfloat16* cs, const __nv_bfloat16* sn, int P, int H, int D,
+                                                                float eps, int keep) {
+    tf_vit_g4::qkv_norm_rope(qkv, qw, kw, cs, sn, P, H, D, eps, keep);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_vit_g4_gelu_mul(const __nv_bfloat16* gate, const __nv_bfloat16* up,
+                                                                        __nv_bfloat16* out, long long count, int keep) {
+    tf_vit_g4::gelu_mul(gate, up, out, count, keep);
+}
+
+extern "C" __global__ void __launch_bounds__(256) tf_ctl_vit_g4_pool(const __nv_bfloat16* x, const __nv_bfloat16* bias,
+                                                                    const __nv_bfloat16* scale, __nv_bfloat16* out, int gw, int C,
+                                                                    float root, int keep) {
+    tf_vit_g4::pool_std(x, bias, scale, out, gw, C, root, keep);
+}

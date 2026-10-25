@@ -14,7 +14,7 @@ const DeviceBuffer = cuda.DeviceBuffer;
 const dr = lanes.drafter;
 const Stream = lanes.Stream;
 const head_dim = geometry.head_dim;
-const max_rows = engine.max_rows;
+const max_rows = engine.most_verify; // taps absorbed at most this many rows a call (a prompt chunk's in pieces)
 const most_window = engine.most_window;
 
 /// Drafts a round at most (the frozen engine's DEPTH); TF_MTP_DRAFTS=N sets it, up to a window's rows less one.
@@ -256,6 +256,11 @@ pub const Mtp = struct {
         return precision.routed(d.e, router, experts, x, out, rows, d.projection_role);
     }
 
+    /// The layer's actual grouped Q/K/V dispatch, sharing only the input sums.
+    pub fn projQkv(d: *Mtp, rows: usize) !void {
+        try d.e.projManySums(&.{ d.w.q, d.w.k, d.w.v }, d.x, d.xs, &.{ d.qraw, d.kraw, d.vb }, rows, precision.prompt(d.projection_role, rows, precision.mtp_projection_prompt_cutoff), 0);
+    }
+
     /// out = norm(h + r) with w; h takes the sum (r 0: no residual).
     fn norm(d: *Mtp, h: u64, r: u64, w: u64, out: u64, rows: usize) !void {
         const e = d.e;
@@ -278,9 +283,7 @@ pub const Mtp = struct {
         try d.proj(.{ .a4 = w.fc_e }, d.en, d.h, rows);
         try d.proj(.{ .a4 = w.fc_h }, d.hn, d.r, rows);
         try d.norm(d.h, d.r, w.input_norm, d.x, rows);
-        try d.proj(w.q, d.x, d.qraw, rows);
-        try d.proj(w.k, d.x, d.kraw, rows);
-        try d.proj(w.v, d.x, d.vb, rows);
+        try d.projQkv(rows);
         try e.run(d.fns.norm_rope, .{ rows * g.q_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.qraw, w.q_norm, d.q, @as(c_int, @intCast(g.q_heads)), @as(c_int, @intCast(2 * aw)), @as(c_int, 2 * head_dim), p0, step, g.eps, geometry.theta });
         try e.run(d.fns.norm_rope, .{ rows * g.kv_heads, 1, 1 }, .{ 32, 1, 1 }, .{ d.kraw, w.k_norm, d.kb, @as(c_int, @intCast(g.kv_heads)), @as(c_int, @intCast(kw)), @as(c_int, head_dim), p0, step, g.eps, geometry.theta });
         const heads: c_int = @intCast(g.q_heads);
@@ -345,7 +348,7 @@ pub const Mtp = struct {
         if (rows_) |rs| if (rs.len != n or n > most_window) return error.BadDraftRows;
         if (start < ctx.end) ctx.end = start;
         if (start > ctx.end) ctx.begin = start; // a gap (a prompt restored from a cache): the context starts here
-        const held = engine.tap_rows - max_rows; // the target's ring holds this many rows behind its newest
+        const held = engine.tap_rows - engine.max_rows; // the target's ring holds this many rows behind its newest chunk
         if (n > held) {
             fi = n - held;
             start += n - held;

@@ -12,6 +12,7 @@ const shape = @import("shape.zig");
 const plan_lanes = @import("plan_lanes.zig");
 const fill = @import("fill.zig");
 const trail = @import("trail.zig");
+const lone_costs = @import("lone_costs.zig");
 const open = @import("open.zig");
 const handover = @import("handover.zig");
 const trim = @import("trim.zig");
@@ -46,6 +47,7 @@ pub const Engine = struct {
     accepted: u64 = 0,
     shared_rounds: u64 = 0,
     alone: bool = true, // this step has one live stream: its copies may take their ramp
+    lone_kept: [2][lone_costs.bands]?lone_costs.Kept = @splat(@splat(null)), // the newest lone calibrations, greedy then sampled, a band each
     steps: u64 = 0,
     arena: std.heap.ArenaAllocator, // a round's temporaries
     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
@@ -79,6 +81,7 @@ pub const Engine = struct {
         e.live.deinit(e.gpa);
         e.unread.deinit(e.gpa);
         e.rule.deinit();
+        for (&e.lone_kept) |*mode| for (mode) |*k| if (k.*) |*x| x.deinit(e.gpa);
         e.arena.deinit();
     }
 
@@ -132,6 +135,9 @@ pub const Engine = struct {
             live.shrinkRetainingCapacity(kept);
         }
         e.alone = live.items.len == 1;
+        if (!e.alone) for (live.items) |s| {
+            s.shared_round = true;
+        };
         if (live.items.len > 1 and e.cfg.family_streams) {
             const chosen = try e.takeTurns(live.items);
             e.shared_rounds += 1;
@@ -195,7 +201,7 @@ pub const Engine = struct {
         s.priced = null;
         const a = e.arena.allocator();
         var plans = [_]Plan{try win.plan(e, s, copied)};
-        if (plans[0].kind == .head and (e.cfg.node_probabilities or e.trim != null or @import("lone_costs.zig").enabled(e, plans[0]))) try win.allocate(e, &plans);
+        if (plans[0].kind == .head and (e.cfg.node_probabilities or e.trim != null or lone_costs.enabled(e, plans[0]))) try win.allocate(e, &plans);
         try win.constrain(e, &plans[0]);
         const plan = plans[0];
         const early = e.cfg.family_mtp and s.drafts and plan.kind != .forced and e.cfg.speculate_early and plan.parents == null and s.grammar == null;
@@ -222,7 +228,7 @@ pub const Engine = struct {
                 const first = s.rounds == 1; // a stream's first round carries the prefill-to-decode switch
                 try trail.event(e, &.{ f("ev", str("cost")), f("stream", str(s.id)), f("drafts", int(rows - 1)), f("init", .{ .bool = first }), f("ms", ev.bits(ms)) });
                 try e.rule.observeCost(@intCast(rows - 1), ms, first, win.who(s));
-                @import("lone_costs.zig").observe(s, plan.cost_probe_rows, rows, ms);
+                lone_costs.observe(s, plan.cost_probe_rows, rows, ms);
             }
         }
         if (e.cfg.timed and s.graft_room != null and s.rounds > 1) {
@@ -323,7 +329,7 @@ pub const Engine = struct {
             try committed.append(a, s.popForce() orelse sampled[rows - 1]);
         } else {
             path = try accept.acceptPath(a, tokens, parents, sampled);
-            for (path[1..]) |r| try committed.append(a, tokens[r]);
+            for (path[1..]) |r| try committed.append(a, accept.targetPick(sampled, parents, r));
             try committed.append(a, sampled[path[path.len - 1]]);
             if (s.proposer) |pr| pr.round(@intCast(rows), @intCast(path.len - 1));
             if (rows > 1) {
@@ -364,6 +370,10 @@ pub const Engine = struct {
                     };
                     s.branch_accepted += kept_branch + kept_recall;
                     if (p.context_copy) if (s.proposer) |pr| pr.observe(@intCast(rows - p.branch_from), @intCast(kept_branch));
+                    // a copy whose anchor row landed: its kept run, and whether it broke before its end
+                    const anchor = parents[p.branch_from];
+                    if (p.context_copy and (anchor <= 0 or std.mem.indexOfScalar(u32, path, @intCast(anchor)) != null))
+                        win.observeCopy(e, s, p.copy_trusted, kept_branch, rows - p.branch_from);
                 }
                 if (p.tried) {
                     // grafting nothing is the context's miss; rows Recall grafted count for Recall alone
@@ -448,7 +458,7 @@ pub const Engine = struct {
             const cap: usize = @intCast(@max(1, @min(@min(shape.max_depth, e.cfg.head_depth), s.draftRoom() - 1)));
             const costs = plan_lanes.Costs{ .window = &e.cfg.lane_costs, .head_ms = e.cfg.mtp_step_ms, .over_ms = s.round_over orelse 0, .tree_over_ms = s.tree_over, .measured = if (e.cfg.own_prices and e.cfg.timed) &s.measured else null };
             // every eighth round one size wider than the best, so the odds of deeper lanes stay measured
-            const p = try plan_lanes.pick(e.gpa, s.odds.?, costs, e.cfg.head_lanes, cap, try e.graftProspect(s), s.rounds % 8 == 4);
+            const p = try plan_lanes.pick(e.gpa, s.odds.?, costs, e.cfg.head_lanes, cap, try win.graftProspect(e, s), s.rounds % 8 == 4);
             s.picks[p.choice] += 1;
             s.graft_room = p.grafts;
             if (plan_lanes.tablePrice(costs, p)) |ms| s.priced = .{ .choice = p.choice, .ms = ms };
@@ -480,25 +490,6 @@ pub const Engine = struct {
                 if (try tree(e.backend.ptr, r.stream, e.gpa)) |held| r.stream.next = held;
             };
         }
-    }
-
-    /// The rows the context's matches and Recall's would graft this round, and the share it keeps (null: none).
-    fn graftProspect(e: *Engine, s: *Stream) !?plan_lanes.Grafts {
-        if (e.cfg.fill_lanes == 0) return null;
-        const probe_round = s.rounds % 8 == 0;
-        const a = e.arena.allocator();
-        const room = e.cfg.fill_lanes -| 1;
-        const found = try win.candidates(e, s, room, probe_round);
-        if (found.len == 0) return null;
-        const b = try fill.graft(a, .{}, found, room);
-        // each source's recent share of grafted rows kept; every eighth round at least the floor, so grafts get retried
-        const own_hit = if (probe_round) @max(s.graft_hit, e.cfg.fill_floor) else s.graft_hit;
-        const recall_hit = if (probe_round) @max(s.recall_hit, e.cfg.fill_floor) else s.recall_hit;
-        var recalled: f64 = 0;
-        for (b.recalled) |x| recalled += @floatFromInt(@intFromBool(x));
-        const rows: f64 = @floatFromInt(b.tokens.len);
-        const hit = if (recalled == 0) own_hit else (own_hit * (rows - recalled) + recall_hit * recalled) / rows;
-        return .{ .rows = @intCast(b.tokens.len), .hit = hit };
     }
 
     /// One token, the next forward queued first; a copied continuation ahead switches to verify windows.
@@ -593,6 +584,8 @@ pub const Engine = struct {
     }
 
     pub fn release(e: *Engine, s: *Stream) void {
+        if (e.cfg.lone_cost_tile > 0) lone_costs.keep(e.gpa, lone_costs.slot(&e.lone_kept, s), s) catch {};
+        if (s.inflight) |h| _ = e.backend.read(h) catch 0; // the handle frees the backend's ring slot
         s.dropRoundState(e.gpa);
         e.backend.release(s);
     }

@@ -42,6 +42,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "flashnext_fact", .flags = &.{"-O3"} }, // ours: prompt rows on qmm.cu's factored arithmetic
     .{ .name = "flashnext_hcf", .flags = glue }, // ours: the hyper-connection read-out's prompt tiles, fn_hc's bits
     .{ .name = "flashnext_fexp", .flags = &.{"-O3"} }, // ours: prompt pairs' experts on expert_rows' factored arithmetic
+    .{ .name = "w4a8_prefill", .flags = &.{"-O3"} }, // ours: prompt matmuls, int8 activations on MLX affine 4-bit weights
     .{ .name = "experts", .flags = &.{"-O3"} }, // cuda/experts.py, tensorfold_experts_v7
     .{ .name = "experts_prefill", .flags = &.{"-O3"} },
     .{ .name = "experts_pack", .flags = &.{"-O3"} },
@@ -63,6 +64,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "qwen35_draft", .flags = &.{"-O3"} }, // ours: the DFlash2 drafter's glue (draft_ops.metal's rounding)
     .{ .name = "qwen35_keep", .flags = &.{"-O3"} }, // ours: a verified window's kept path applied to its stream's state
     .{ .name = "qwen_vision", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the Qwen3.5 vision tower's glue and attention
+    .{ .name = "gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // ours: a prompt chunk's gated delta rule (v0.6.6's chain)
     .{ .name = "qwen35_kv8", .flags = &.{"-O3"} }, // ours: --kv-cache fp8's e4m3 attention rows for the Qwen3.5 hybrids
     .{ .name = "nemotron_norms", .flags = glue }, // ours, each with a host reference (glue_ref.zig): Nemotron's glue
     .{ .name = "nemotron_route", .flags = glue },
@@ -85,6 +87,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "tree_attention", .flags = &.{"-O3"} }, // ours: committed keys and paths (cuda/tree_attention.zig)
     .{ .name = "block_attention", .flags = &.{"-O3"} }, // ours: a drafter's block over its context (cuda/block_attention.zig)
     .{ .name = "window_attention", .flags = &.{"-O3"} }, // ours: sliding-window attention (cuda/window_attention.zig)
+    .{ .name = "window_rows", .flags = &.{"-O3"} }, // ours: window attention at head dims 256 and 512 (cuda/window_attention.zig)
     .{ .name = "moe_glue", .flags = &.{"-O3"} }, // ours: sigmoid top-k and the weighted combine (cuda/moe_glue.zig)
     .{ .name = "dense_rows", .flags = &.{"-O3"} }, // ours: bf16 rows times weight rows into fp32 (cuda/dense_rows.zig)
     .{ .name = "modelopt_pack", .flags = &.{"-O3"} }, // ours: ModelOpt tensors into the lane, prompt and expert layouts

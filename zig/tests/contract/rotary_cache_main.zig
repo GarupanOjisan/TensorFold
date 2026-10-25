@@ -1,4 +1,4 @@
-//! Hash the four real rotary consumers against the precise baseline, including an intentional cache poison control.
+//! Hash the six real rotary consumers against the precise baseline, including an intentional cache poison control.
 const std = @import("std");
 const mtl = @import("metal");
 const family = @import("tensorfold");
@@ -70,8 +70,7 @@ fn check(comptime Probe: type, a: std.mem.Allocator, device: mtl.Device, queue: 
     var positions: []const i32 = undefined;
     var pos: rig_.Ref = undefined;
     if (comptime pooled) {
-        const values = try a.alloc(i32, rows);
-        for (values, 0..) |*v, i| v.* = @intCast(4 * (p.firstBlock() + i));
+        const values = try @import("rotary_cache_positions.zig").pooled(a, p.firstBlock(), rows, if (which == .positioned) p.blocks else null);
         positions = values;
         pos = try p.rig.input(std.mem.sliceAsBytes(values));
     } else {
@@ -130,7 +129,7 @@ pub fn main(init: std.process.Init) !void {
     defer pipe.deinit();
     if (pipe.simdWidth() != 32 or pipe.maxThreads() < 128) return error.UnsupportedCachePipeline;
     var rows: std.ArrayList(Row) = .empty;
-    for ([_]f.Which{ .target, .mtp, .pooled, .absolute, .mrope }) |which| for ([_]usize{ 1, 4, 8, 16 }) |width| for ([_]f64{ 0, 4 }) |factor| for ([_]bool{ false, true }) |long| {
+    for ([_]f.Which{ .target, .mtp, .pooled, .absolute, .mrope, .positioned }) |which| for ([_]usize{ 1, 4, 8, 16 }) |width| for ([_]f64{ 0, 4 }) |factor| for ([_]bool{ false, true }) |long| {
         const case_pool = mtl.objc.Pool.push();
         defer case_pool.pop();
         var scratch = std.heap.ArenaAllocator.init(std.heap.c_allocator);
@@ -139,9 +138,9 @@ pub fn main(init: std.process.Init) !void {
         const result = if (f.isPool(which)) try check(pool.Probe, mem, device, queue, pipe, which, width, factor, long) else try check(prep.Probe, mem, device, queue, pipe, which, width, factor, long);
         try rows.append(a, result);
     };
-    if (rows.items.len != 80) return error.IncompleteRotaryCacheCheck;
+    if (rows.items.len != 96) return error.IncompleteRotaryCacheCheck;
     const identity = try @import("rotary_deployment.zig").current(a, init.io, device);
-    const host_sources = try std.mem.concat(a, u8, &.{ cache.host_source, @embedFile("rotary_cache_main.zig"), @embedFile("metal_flashnext.zig"), @embedFile("metal_flashnext_pool.zig"), @embedFile("rig.zig") });
+    const host_sources = try std.mem.concat(a, u8, &.{ cache.host_source, @embedFile("rotary_cache_main.zig"), @embedFile("rotary_cache_positions.zig"), @embedFile("metal_flashnext.zig"), @embedFile("metal_flashnext_pool.zig"), @embedFile("rig.zig") });
     const receipt = .{ .complete = true, .identity = identity, .tensor_units = device.tensorUnits(), .host_sources = hash(host_sources), .producer_source = hash(producer), .cache_bytes = cache.bytes, .rows = rows.items };
     const encoded = try std.json.Stringify.valueAlloc(a, receipt, .{ .whitespace = .indent_2 });
     const temporary = try std.fmt.allocPrint(a, "{s}.part-{d}", .{ args[2], @import("sys").c.getpid() });

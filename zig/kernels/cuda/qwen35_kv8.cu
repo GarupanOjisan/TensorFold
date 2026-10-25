@@ -37,76 +37,26 @@ extern "C" __global__ void __launch_bounds__(256) tf_q35_rope8(Geo geo, __nv_bfl
     rope_rows(geo, Qn, Kn, Vr, segs, rowseg, rowanc, P, M, StoreFp8{layer, geo.kvh, red});
 }
 
-// Eight e4m3 values as floats.
-__device__ __forceinline__ void widen8(uint2 w, float (&f)[8]) {
-    const __nv_fp8x2_storage_t* p = reinterpret_cast<const __nv_fp8x2_storage_t*>(&w);
-#pragma unroll
-    for (int i = 0; i < 4; i++) {
-        const float2 v = __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2(p[i], __NV_E4M3)));
-        f[2 * i] = v.x;
-        f[2 * i + 1] = v.y;
-    }
+
+#include "qwen35_attn_tc.cuh"
+
+// Decode attention over e4m3 rows on tensor cores: a short stream's rows a block each, a long stream's in groups.
+extern "C" __global__ void __launch_bounds__(128) tf_q35_attn_partial8(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                                                         const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                         const int* __restrict__ P, float scale,
+                                                                         float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    __shared__ __align__(16) uint4 kt[tf_q35_tc::TK * tf_q35_tc::CH], vt[tf_q35_tc::TK * tf_q35_tc::CH];
+    __shared__ float ksc[tf_q35_tc::TK], vsc[tf_q35_tc::TK];
+    tf_q35_tc::attn_one<tf_q35_tc::Fp8Tiles<128>>({kt, vt, ksc, vsc}, geo, Q, segs, rowseg, rowanc, layer, P, scale, PM, PL, PO);
 }
 
-// tf_q35_attn_partial over e4m3 rows: a key's dot taken on its codes, then scaled; a value's weight carries its scale.
-extern "C" __global__ void tf_q35_attn_partial8(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
-                                                  const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
-                                                  const int* __restrict__ P, float scale,
-                                                  float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
-    constexpr int DPL = HD / 32;
-    const int QH = geo.qh, KVH = geo.kvh;
-    const int lane = threadIdx.x & 31, g = threadIdx.x >> 5;
-    const int c = blockIdx.x, h = blockIdx.y;
-    if (c >= MAXCH || past_rows(P, blockIdx.z)) return;
-    const size_t m = blockIdx.z;
-    const int qh = h * (QH / KVH) + g;
-    const Seg sg = segs[rowseg[m]];
-    const Ancestor anc = rowanc[m];
-    const int keys = sg.len + rows_seen(anc), ck = chunk_keys(keys);
-    const int k0 = c * ck, k1 = min(k0 + ck, keys);
-    const size_t slot = (m * QH + qh) * MAXCH + c;
-    if (k0 >= k1) {
-        if (lane == 0) {
-            PM[slot] = -INFINITY;
-            PL[slot] = 0.0f;
-        }
-        return;
-    }
-    const unsigned char* K = layer_at(sg, layer, KVH);
-    const unsigned char* V = K + (size_t)KVH * sg.cap * HD;
-    const float* KS = reinterpret_cast<const float*>(V + (size_t)KVH * sg.cap * HD);
-    const float* VS = KS + (size_t)KVH * sg.cap;
-    float q[DPL], o[DPL];
-#pragma unroll
-    for (int i = 0; i < DPL; i++) {
-        q[i] = bf(Q[(m * QH + qh) * HD + lane * DPL + i]);
-        o[i] = 0.0f;
-    }
-    float mx = -INFINITY, l = 0.0f;
-    for (int t = k0; t < k1; t++) {
-        const int pos = t < sg.len ? t : sg.len + seen_row(anc, t - sg.len);
-        const size_t row = (size_t)h * sg.cap + pos;
-        float kf[DPL], vf[DPL];
-        widen8(*reinterpret_cast<const uint2*>(K + row * HD + lane * DPL), kf);
-        float dot = 0.0f;
-#pragma unroll
-        for (int i = 0; i < DPL; i++) dot = fmaf(q[i], kf[i], dot);
-        const float s = warp_sum(dot) * KS[row] * scale;
-        const float mn = fmaxf(mx, s);
-        const float a = __expf(mx - mn), b = __expf(s - mn);
-        l = l * a + b;
-        widen8(*reinterpret_cast<const uint2*>(V + row * HD + lane * DPL), vf);
-        const float bv = b * VS[row];
-#pragma unroll
-        for (int i = 0; i < DPL; i++) o[i] = fmaf(bv, vf[i], o[i] * a);
-        mx = mn;
-    }
-    if (lane == 0) {
-        PM[slot] = mx;
-        PL[slot] = l;
-    }
-#pragma unroll
-    for (int i = 0; i < DPL; i++) PO[slot * HD + lane * DPL + i] = o[i];
+extern "C" __global__ void __launch_bounds__(256) tf_q35_attn_rows8(Geo geo, const __nv_bfloat16* __restrict__ Q, const Seg* __restrict__ segs,
+                                                                      const int* __restrict__ rowseg, const Ancestor* __restrict__ rowanc, int layer,
+                                                                      const int* __restrict__ P, float scale, int total,
+                                                                      float* __restrict__ PM, float* __restrict__ PL, float* __restrict__ PO) {
+    __shared__ __align__(16) uint4 kt[tf_q35_tc::TK * tf_q35_tc::CH], vt[tf_q35_tc::TK * tf_q35_tc::CH];
+    __shared__ float ksc[tf_q35_tc::TK], vsc[tf_q35_tc::TK];
+    tf_q35_tc::attn_rows<4, tf_q35_tc::Fp8Tiles<256>>({kt, vt, ksc, vsc}, geo, Q, segs, rowseg, rowanc, layer, P, scale, total, PM, PL, PO);
 }
 
 // tf_q35k_compact over e4m3 rows: the path's keys, values and their scales move down to the slots after the cache.

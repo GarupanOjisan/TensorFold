@@ -129,7 +129,8 @@ pub const SpeechResult = @import("speech_api.zig").SpeechResult;
 pub const SpeechInfo = @import("speech_api.zig").SpeechInfo;
 pub const SpeechSubmitError = error{ Closed, Busy, InvalidRequest, Unsupported };
 
-pub const Reason = enum { stop, length, cancelled, failed };
+pub const Reason = enum { stop, length, cancelled, failed, silence };
+pub const speech_guard = @import("speech_guard.zig");
 
 /// What a finished reply's rounds did, for its runtime fields and /metrics.
 pub const Stats = struct {
@@ -197,6 +198,8 @@ pub const Info = struct {
     prefill_step: u32 = 0,
     /// The engine keeps prompt states between requests, so ``prefilled`` counts the tokens it restored.
     prompt_cache: bool = false,
+    /// Startup cache budget and the smallest state admitted by the family's existing keep plan.
+    prompt_cache_capacity: ?PromptCacheCapacity = null,
     /// The policy the engine runs under, one line (`/health` shows it); empty: none.
     policy: []const u8 = "",
     /// A line the server prints once at startup (the engine's memory plan); empty: none.
@@ -234,6 +237,8 @@ pub const Admit = struct {
     fits: *const fn (ctx: *anyopaque, prompt: u32, max_tokens: u32) bool,
 };
 
+pub const PromptCacheCapacity = struct { budget_bytes: u64, minimum_state_bytes: u64 };
+
 pub const PromptCachePlan = struct {
     source: enum { physical_footprint, explicit, metal_working_set },
     budget_bytes: u64,
@@ -257,6 +262,8 @@ pub const Open = struct {
     dir: []const u8,
     model_type: []const u8,
     context: ?i64 = null,
+    max_frames: ?u32 = null,
+    silence: speech_guard.Config = .{},
     lanes: u32 = 8,
     /// --parallel named a number: an engine whose memory fits fewer streams refuses instead of serving fewer.
     lanes_fixed: bool = false,
@@ -284,6 +291,7 @@ pub const Open = struct {
     /// --recall: the server attaches Recall's record once the engine loads; an engine that reads none refuses first.
     recall: bool = false,
     kv8: bool = false, // --kv-cache fp8: e4m3 attention caches, an fp32 scale a row (families whose Options take kv8)
+    prompt_int8: bool = false, // --prompt-precision int8: prompt matmuls on int8 activations (Options taking prompt_int8)
     /// --device and --segments (CUDA); null: the backend's environment fallback, then its default.
     device: ?u32 = null,
     segments: ?u32 = null,
@@ -470,6 +478,7 @@ pub const Lone = struct {
     sampled: bool = false, // it drives sampled streams too
     logprobs: bool = false, // it gives each token its logprob row too
     structures: bool = false, // it masks each window's rows by the stream's grammar too
+    images: bool = true, // it takes image requests too (false: they stay in the lane core)
     // thinking budgets above this and loop guards: it hands the stream over before a forced close (0: never)
     min_budget: u32 = 0,
     resumes: bool = false, // it takes the lane core's stream back between rounds (LoneHooks.resumed); else only opens
@@ -522,6 +531,7 @@ pub const save_guard = @import("save_guard");
 
 test {
     _ = @import("lane_embedding_test.zig");
+    _ = speech_guard;
     _ = @import("lane_host.zig");
     _ = @import("lane_host_test.zig");
     _ = @import("lane_root_copy_test.zig");

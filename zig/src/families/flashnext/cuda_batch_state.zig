@@ -59,6 +59,10 @@ pub const cubin_qmm: [:0]const u8 = "_ZN6tf_qmm10qmm_kernelILi32ELi16ELi64ELi1EL
 pub const qmm_smem: u32 = 9472;
 /// fn_gdn_chain_tpr's staged rows: 2 x 16 steps of q, k, v (128 fp32 each) and g, beta.
 pub const chain_tpr_smem: u32 = 2 * 16 * (3 * 128 * 4 + 16);
+/// fn_gdn_fused's shared memory (its SMEM): two chain stages, two readout batches, the conv rows and 16 norm scales.
+pub const gdn_fused_smem: u32 = chain_tpr_smem + 2 * 16 * 128 * 4 + 16 * 2 * 128 * 4 + 16 * 4;
+/// fn_gdn_fused's block: 256 chain threads and 128 producer threads.
+pub const gdn_fused_threads: u32 = 384;
 /// Pairs an expert item takes: the core rows kernel's tile.
 const rows_tile: usize = cuda.experts.RowsExperts.tile;
 const plan_small: usize = cuda.grouped.small;
@@ -155,6 +159,8 @@ pub const Kernels = struct {
     chain: cuda.Function,
     chain_to: cuda.Function,
     chain_tpr: cuda.Function,
+    /// front + chain + gated norm in one kernel a value head (prompt passes of 64 rows or more).
+    gdn_fused: cuda.Function,
     gnorm: cuda.Function,
     sum: cuda.Function,
     moe_sum: cuda.Function,
@@ -198,6 +204,8 @@ pub const Kernels = struct {
         k.chain_to = try k.batch.function("fn_gdn_rows_to");
         k.chain_tpr = try k.batch.function("fn_gdn_chain_tpr");
         try k.chain_tpr.allowDynamicShared(chain_tpr_smem);
+        k.gdn_fused = try k.batch.function("fn_gdn_fused");
+        try k.gdn_fused.allowDynamicShared(gdn_fused_smem);
         k.gnorm = try k.batch.function("fn_gdn_norm");
         return k;
     }
@@ -406,7 +414,10 @@ pub const Scratch = struct {
 
     pub fn alloc(gpa: std.mem.Allocator, d: *const cuda.Driver, stream: cuda.Stream, cap: usize) !Scratch {
         var s: Scratch = .{ .cap = cap };
-        errdefer s.free(gpa);
+        errdefer {
+            cuda.completion.drain(d, stream, "Flash Next scratch work did not drain before rollback");
+            s.free(gpa);
+        }
         const pairs = cap * slots;
         const nblk = cdiv(pairs, plan_small);
         const items = cdiv(pairs, tile) + experts_n + 1;
@@ -526,8 +537,8 @@ pub fn scoreBytes(cap: usize, rows: usize) usize {
     return @min(rows, att_rows) * scoreStride(cap) * 4;
 }
 
-/// One row of a decode round: its stream's next token, on that stream's own caches at its own position.
-pub const Lane = struct { seq: SeqState, pos: usize };
+/// One stream's rows in a shared pass from `pos` on its own caches, and its window's rollback, hidden rows and scores.
+pub const Lane = struct { seq: SeqState, pos: usize, rows: usize = 1, keep: ?*const Keep = null, streams: u64 = 0, logits: u64 = 0 };
 
 /// The engine's resident weights the pass reads.
 pub const Model = struct {
@@ -566,11 +577,13 @@ pub const Gather = struct {
             };
             return;
         }
-        for (g.lanes, 0..) |l, r| {
-            g.ngram.rows(l.seq.history[0..], g.ids[r..][0..1], g.emb[r * dims ..][0..dims], g.xs[r * (dims / 32) ..][0 .. dims / 32]) catch |err| {
+        var row0: usize = 0;
+        for (g.lanes) |l| {
+            g.ngram.rows(l.seq.history[0..], g.ids[row0..][0..l.rows], g.emb[row0 * dims ..][0 .. l.rows * dims], g.xs[row0 * (dims / 32) ..][0 .. l.rows * (dims / 32)]) catch |err| {
                 g.failed = err;
                 return;
             };
+            row0 += l.rows;
         }
     }
 };

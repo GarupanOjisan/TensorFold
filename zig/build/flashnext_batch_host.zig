@@ -30,10 +30,17 @@ pub fn tests(b: *std.Build, all: *std.Build.Step) void {
     const rotary_cache = b.addRunArtifact(b.addTest(.{ .root_module = root, .filters = &.{"rotary cache:"} }));
     b.step("test-rotary-cache-host", "Rotary source fallback and same-command cache dispatch without shaders").dependOn(&rotary_cache.step);
     all.dependOn(&rotary_cache.step);
+    const standard = b.addRunArtifact(b.addTest(.{ .root_module = root, .filters = &.{ "Flash Next standard frame:", "the standard frame:" } }));
+    b.step("test-flashnext-standard-frame-host", "Standard image positions, decode windows and session growth without shaders").dependOn(&standard.step);
+    all.dependOn(&standard.step);
     const tests_ = b.addTest(.{ .root_module = root, .filters = &.{"batch widths:"} });
     const run = b.addRunArtifact(tests_);
     run.has_side_effects = true;
     const step = b.step("test-flashnext-batch-host", "Actual shared lane verification at checkpoint widths, without Metal execution");
     step.dependOn(&run.step);
     all.dependOn(step);
+    const plan = b.createModule(.{ .root_source_file = b.path("zig/src/families/flashnext/cuda_mtp_plan_test.zig"), .target = b.graph.host });
+    const plan_step = b.step("test-flashnext-mtp-plan-host", "The batched MTP head's requests fit the admitted capacity, without a device");
+    plan_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = plan })).step);
+    all.dependOn(plan_step);
 }

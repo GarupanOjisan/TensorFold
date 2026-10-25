@@ -29,6 +29,8 @@ const nvfp4_experts_tests = @import("nvfp4_experts_tests.zig");
 const quant_ref_tests = @import("quant_ref_tests.zig");
 const glm_ref_tests = @import("glm_ref_tests.zig");
 const affine8_tests = @import("affine8_tests.zig");
+const affine4_decode_tests = @import("affine4_decode_tests.zig");
+const w4a8_tests = @import("w4a8_tests.zig");
 const glm_exl3_tests = @import("glm_exl3_tests.zig");
 const glm_vision_tests = @import("glm_vision_tests.zig");
 const glm_mm_fixed = @import("glm_mm_fixed_tests.zig");
@@ -52,6 +54,7 @@ const embed_tests = @import("embed_tests.zig");
 const pocket_tests = @import("pocket_tests.zig");
 const recapture_tests = @import("recapture_tests.zig");
 const contract_tests = @import("contract_tests.zig");
+const glue_contract = @import("contract_flashnext_glue.zig");
 const lfm2_attention_tests = @import("lfm2_attention_tests.zig");
 const lfm2_kernel_tests = @import("lfm2_kernel_tests.zig");
 const lfm2_vision_tests = @import("lfm2_vision_tests.zig");
@@ -65,6 +68,8 @@ const act_rows_tests = @import("act_rows_tests.zig");
 const gdn_prep_tests = @import("gdn_prep_tests.zig");
 const qk_rows_tests = @import("qk_rows_tests.zig");
 const window_tests = @import("window_tests.zig");
+const window_rows_tests = @import("window_rows_tests.zig");
+const window_bench = @import("window_bench.zig");
 const moe_glue_tests = @import("moe_glue_tests.zig");
 const dense_rows_tests = @import("dense_rows_tests.zig");
 
@@ -73,6 +78,9 @@ const route_rows_tests = @import("route_rows_tests.zig");
 const flashnext_model_rank_tests = @import("flashnext_model_rank_tests.zig");
 const flashnext_fidelity_tests = @import("flashnext_fidelity_tests.zig");
 const flashnext_window_tests = @import("flashnext_window_tests.zig");
+const flashnext_windows_tests = @import("flashnext_windows_tests.zig");
+const flashnext_mtp_parity_tests = @import("flashnext_mtp_parity_tests.zig");
+const flashnext_score_tests = @import("flashnext_score_tests.zig");
 const flashnext_rank_tests = @import("flashnext_rank_tests.zig");
 const flashnext_draft_affine_tests = @import("flashnext_draft_affine_tests.zig");
 const flashnext_shared_tests = @import("flashnext_shared_tests.zig");
@@ -103,6 +111,9 @@ const usage =
     \\  flashnext-fidelity-single MODEL FIXTURE OUTPUT  single-rank reference isolation
     \\  flashnext-fidelity-rank MODEL RANK PORT FIXTURE OUTPUT  fixed-history full score rows
     \\  flashnext-window-rank MODEL RANK PORT IDS_FILE  two-rank serial/window and rollback parity
+    \\  flashnext-windows MODEL IDS_FILE  several streams' windows in one shared verify against each alone
+    \\  flashnext-mtp-parity MODEL IDS_FILE  several streams' MTP heads in one shared pass against each alone
+    \\  flashnext-score MODEL IDS_FILE  decisions' label scores against a plain pass's last row
     \\  flashnext-model-rank MODEL RANK PORT IDS_FILE  explicit full-model replay experiment (no drafts)
     \\  flashnext-rank RANK PORT [sum|eof|timeout|missing]  two-process collective and failure probes
     \\  flashnext-draft-affine    proposal-head affine projection against FP64 and row-count invariance
@@ -174,6 +185,8 @@ const usage =
     \\  mxfp8                     MXFP8 strided projections against FP64 and row-count invariance
     \\  quant-ref                 FP8 and NVFP4 projections and experts against float64 references (synthetic)
     \\  affine8                   MLX affine 2 to 8-bit tiles and the 8-bit lane_gemv: widened codes, float64, rows (synthetic)
+    \\  affine4-decode            affine-4 decode at the Qwen3.5 shapes: row counts and segmented launches byte for byte
+    \\  w4a8                      int8-activation prompt matmuls on affine-4 tiles: float64 of their formula, rows (synthetic)
     \\  carveout [MiB] [card]     GB10 display memory: round trips and bandwidth (SKIP without the card)
     \\  nvfp4 <dir>               NVFP4 projections against recorded lane-matmul and prompt-GEMM fixture bytes
     \\  moe                       softmax routing and SwiGLU experts against host references, then moe-live
@@ -189,6 +202,8 @@ const usage =
     \\  tree                      tree attention (committed keys and paths) against float64 references (synthetic)
     \\  block                     DFlash block attention over windowed contexts against float64 (synthetic)
     \\  window                    sliding-window attention against float64 references (synthetic)
+    \\  window-rows               window attention at head dims 256 and 512 against float64 ranges (synthetic)
+    \\  window-bench WHICH        window attention's GPU time: callers (Kolibri-1's shapes) or gemma (head dims 256, 512)
     \\  moe-glue                  sigmoid top-k routing and the weighted combine against float64 references (synthetic)
     \\  dense-rows                bf16 rows times weight rows (routers, heads) against float64 references (synthetic)
     \\  exl3 [dir]                EXL3 decode-row linear: float64 checks, row invariance, the Python engine's fixture (dir none skips it)
@@ -248,7 +263,18 @@ fn arg(rest: []const [:0]const u8, i: usize) ![]const u8 {
     return rest[i];
 }
 
+/// The contract glue's device path, compiled with the runner: the device reaches prepare through the vtable.
+fn compileContractGlue() !void {
+    const cores = std.Thread.getCpuCount() catch 1;
+    if (cores != 0) return;
+    var g: glue_contract.Glue = undefined;
+    g.kind = .chain;
+    const kernels = [_]@import("core").contract.gates.Kernel{g.kernel()};
+    for (kernels) |k| _ = try k.vt.prepare(k.ctx, .{ .rows = 0, .n = 0, .k = 0 }, .random, 0);
+}
+
 fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
+    if (std.mem.eql(u8, cmd, "compile-contract-glue")) return compileContractGlue();
     if (std.mem.eql(u8, cmd, "qwen-draft-frames")) {
         if (rest.len != 4) return error.FrameGateArguments;
         return qwen_draft_frames.run(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), try arg(rest, 3));
@@ -258,6 +284,9 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-single")) return flashnext_fidelity_tests.runSingle(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), false);
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-single-serial")) return flashnext_fidelity_tests.runSingle(gpu, try arg(rest, 0), try arg(rest, 1), try arg(rest, 2), true);
     if (std.mem.eql(u8, cmd, "flashnext-fidelity-rank")) return flashnext_fidelity_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3), try arg(rest, 4));
+    if (std.mem.eql(u8, cmd, "flashnext-windows")) return flashnext_windows_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "flashnext-mtp-parity")) return flashnext_mtp_parity_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
+    if (std.mem.eql(u8, cmd, "flashnext-score")) return flashnext_score_tests.run(gpu, try arg(rest, 0), try arg(rest, 1));
     if (std.mem.eql(u8, cmd, "flashnext-window-rank")) return flashnext_window_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "flashnext-model-rank")) return flashnext_model_rank_tests.run(gpu, try arg(rest, 0), try std.fmt.parseInt(usize, try arg(rest, 1), 10), try std.fmt.parseInt(u16, try arg(rest, 2), 10), try arg(rest, 3));
     if (std.mem.eql(u8, cmd, "flashnext-rank")) return flashnext_rank_tests.run(gpu, try std.fmt.parseInt(usize, try arg(rest, 0), 10), try std.fmt.parseInt(u16, try arg(rest, 1), 10), if (rest.len > 2) rest[2] else "sum");
@@ -301,6 +330,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "quant-ref")) return quant_ref_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-ref")) return glm_ref_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "affine8")) return affine8_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "affine4-decode")) return affine4_decode_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "w4a8")) return w4a8_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-exl3")) return glm_exl3_tests.run_(gpu);
     if (std.mem.eql(u8, cmd, "glm-mm-fixed")) return glm_mm_fixed.run(gpu);
     if (std.mem.eql(u8, cmd, "glm-mm-bench")) return glm_mm_bench.run(gpu);
@@ -379,6 +410,8 @@ fn run(gpu: check.Gpu, cmd: []const u8, rest: []const [:0]const u8) !void {
     if (std.mem.eql(u8, cmd, "tree")) return tree_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "block")) return block_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "window")) return window_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "window-rows")) return window_rows_tests.run(gpu);
+    if (std.mem.eql(u8, cmd, "window-bench")) return window_bench.run(gpu, try arg(rest, 0));
     if (std.mem.eql(u8, cmd, "moe-glue")) return moe_glue_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "dense-rows")) return dense_rows_tests.run(gpu);
     if (std.mem.eql(u8, cmd, "train-pack")) return train_pack.run(gpu, try arg(rest, 0), try arg(rest, 1), if (rest.len > 2) try std.fmt.parseInt(usize, rest[2], 10) else 24);

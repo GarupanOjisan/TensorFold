@@ -12,7 +12,7 @@ constexpr int HD = 256;   // attention head width
 constexpr int MAXQ = 32;  // attention query heads at most
 constexpr int MAXW = 64;  // a window's rows at most (the log's rows a stream)
 constexpr int MAXCH = 64; // attention chunks a row at most (cuda_engine.zig's max_chunks)
-constexpr int MAXR = 128;  // a forward's rows at most (cuda_engine.zig's max_rows): an image chunk's position rows
+constexpr int MROPE = 3;  // an image row's t, h and w positions (cuda_round.zig's mrope_axes)
 
 // The model's widths: hidden, linear key heads, linear value heads, attention query and key/value heads, linear layers.
 struct Geo {
@@ -110,13 +110,13 @@ __device__ __forceinline__ int seen_row(Ancestor anc, int n) {
     return __ffsll(anc.bits) - 1;
 }
 
-// A row's t, h and w: an image prompt's chunk reads them from M ([3][MAXR]); other rows are text, shifted past images.
+// A row's t, h and w: an image chunk reads them from M (three axes a row); other rows are text.
 __device__ __forceinline__ void row_positions(const Seg& sg, Ancestor anc, size_t m, const int* M, int pos[3]) {
     const int text = sg.len + rows_seen(anc) - 1 + sg.delta;
-    for (int a = 0; a < 3; a++) pos[a] = M != nullptr ? M[a * MAXR + m] : text;
+    for (int a = 0; a < MROPE; a++) pos[a] = M != nullptr ? M[m * MROPE + a] : text;
 }
 
-// The rope kernels' body for either cache: queries rotated in place, each key head's rotated key and value stored.
+// The rope kernels' body, a block a row and head (y: query heads, then key heads): rotated in place, or stored.
 template <typename Store>
 __device__ __forceinline__ void rope_rows(const Geo& geo, __nv_bfloat16* __restrict__ Qn, const __nv_bfloat16* __restrict__ Kn,
                                           const __nv_bfloat16* __restrict__ Vr, const Seg* __restrict__ segs,
@@ -130,11 +130,16 @@ __device__ __forceinline__ void rope_rows(const Geo& geo, __nv_bfloat16* __restr
     int pos[3];
     row_positions(sg, rowanc[m], m, M, pos);
     const int slot = sg.len + (int)m - sg.row0;
-    __shared__ __nv_bfloat16 qs[MAXQ * HD];
-    for (int h = 0; h < QH; h++) qs[h * HD + d] = Qn[(m * QH + h) * HD + d];
-    __syncthreads();
-    for (int h = 0; h < QH; h++) Qn[(m * QH + h) * HD + d] = rotate(qs + h * HD, d, pos);
-    for (int h = 0; h < KVH; h++) store(sg, h, slot, d, rotate(Kn + (m * KVH + h) * HD, d, pos), Vr[(m * KVH + h) * HD + d]);
+    const int h = blockIdx.y;
+    if (h < QH) {
+        __shared__ __nv_bfloat16 qs[HD];
+        qs[d] = Qn[(m * QH + h) * HD + d];
+        __syncthreads();
+        Qn[(m * QH + h) * HD + d] = rotate(qs, d, pos);
+    } else if (h < QH + KVH) {
+        const int kh = h - QH;
+        store(sg, kh, slot, d, rotate(Kn + (m * KVH + kh) * HD, d, pos), Vr[(m * KVH + kh) * HD + d]);
+    }
 }
 
 }  // namespace tf_q35

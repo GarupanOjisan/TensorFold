@@ -14,6 +14,17 @@ pub const calls = [_][2][]const u8{
     .{ "<|tool_call>", "<tool_call|>" },
     .{ "<\u{ff5c}DSML\u{ff5c}tool_calls>", "</\u{ff5c}DSML\u{ff5c}tool_calls>" },
 };
+/// Each opener's payload lead: Gemma 4's ``call:`` (26B: ``:``), DSML's invoke; ``<tool_call>`` has none.
+const leads = [calls.len][]const []const u8{ &.{}, &.{ "call:", ":" }, &.{"<\u{ff5c}DSML\u{ff5c}invoke"} };
+
+/// Whether the text after an opener is a call's payload, may still become one, or is prose that names the opener.
+fn payloadOf(rest: []const u8, which: usize, finished: bool) enum { call, wait, prose } {
+    if (leads[which].len == 0) return .call;
+    const body = std.mem.trimStart(u8, rest, " \t\r\n");
+    for (leads[which]) |lead| if (std.mem.startsWith(u8, body, lead)) return .call;
+    if (!finished) for (leads[which]) |lead| if (std.mem.startsWith(u8, lead, body)) return .wait;
+    return .prose;
+}
 
 /// ``text.find(tag, from)`` led by a vector scan for the tag's first byte: markup is rare in prose, so it is fast.
 pub fn findTag(text: []const u8, from: usize, tag: []const u8) ?usize {
@@ -49,44 +60,54 @@ fn trimNewlines(s: []const u8) []const u8 {
 
 pub const Split = struct { reasoning: []const u8, answer: []const u8 };
 
-const Cut = struct { at: usize, len: usize };
+/// Where a reply's reasoning ends: the model's own close token, or the text's first spelling of the marker.
+pub const Close = union(enum) {
+    /// The close marker is not one token in this tokenizer: the first spelling of it in the text ends the reasoning.
+    spelled,
+    /// The close token's bytes begin here: the reasoning ends there, and a marker the reply quotes stays text.
+    token: usize,
+    /// The close marker is one token and the reply has not written it yet: all of the text so far is reasoning.
+    pending,
+};
+
+/// Where the reply's reasoning ends, from its tokens: the close token's bytes, the text's spelling, or all of it.
+pub fn closeWhere(a: Allocator, decode: anytype, ctx: anytype, tokens: []const u32, close_id: ?u32) !Close {
+    const id = close_id orelse return .spelled;
+    const at = std.mem.indexOfScalar(u32, tokens, id) orelse return .pending;
+    if (at == 0) return .{ .token = 0 };
+    const through = try decode(ctx, a, tokens[0 .. at + 1]);
+    defer a.free(through);
+    const marker = try decode(ctx, a, tokens[at .. at + 1]);
+    defer a.free(marker);
+    // Include separators the decoder inserts before the selected token, without searching for a quoted spelling.
+    return .{ .token = through.len -| marker.len };
+}
 
 /// (reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back.
 pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers) Allocator.Error!Split {
-    return splitCore(a, full, finished, m, true, null);
+    return splitThinkingAt(a, full, finished, m, .spelled);
 }
 
-/// Split at the first close-marker token when that marker is one id; otherwise the decoded text.
-pub fn splitThinkingTokens(a: Allocator, full: []const u8, finished: bool, m: Markers, tokens: []const u32, close_id: ?u32, ctx: anytype, decode: anytype) Allocator.Error!Split {
-    const id = close_id orelse return splitThinking(a, full, finished, m);
-    return splitCore(a, full, finished, m, false, try tokenCut(a, full, tokens, id, ctx, decode));
+/// As `splitThinkingAt`, but the close is found in the reply's tokens: the close token's own bytes end the reasoning.
+pub fn splitThinkingTokens(a: Allocator, decode: anytype, ctx: anytype, full: []const u8, finished: bool, m: Markers, tokens: []const u32, close_id: ?u32) !Split {
+    return splitThinkingAt(a, full, finished, m, try closeWhere(a, decode, ctx, tokens, close_id));
 }
 
-fn tokenCut(a: Allocator, full: []const u8, tokens: []const u32, id: u32, ctx: anytype, decode: anytype) Allocator.Error!?Cut {
-    const i = std.mem.indexOfScalar(u32, tokens, id) orelse return null;
-    const before = try decode(ctx, a, tokens[0..i]);
-    const through = try decode(ctx, a, tokens[0 .. i + 1]);
-    if (!std.mem.startsWith(u8, through, before) or !std.mem.startsWith(u8, full, before)) return null;
-    const len = through.len - before.len;
-    if (before.len + len > full.len) return null;
-    return .{ .at = before.len, .len = len };
-}
-
-fn moved(full: []const u8, text: []const u8, cut: ?Cut) ?Cut {
-    const c = cut orelse return null;
-    const off = @intFromPtr(text.ptr) - @intFromPtr(full.ptr);
-    if (c.at < off or c.at + c.len > off + text.len) return null;
-    return .{ .at = c.at - off, .len = c.len };
-}
-
-fn splitCore(a: Allocator, full: []const u8, finished: bool, m: Markers, search: bool, cut: ?Cut) Allocator.Error!Split {
+/// As `splitThinking`, but the close marker is the model's own close token: the reasoning ends at that token's bytes.
+pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Markers, close: Close) Allocator.Error!Split {
     var text = full;
-    var mark = cut;
+    var at: ?usize = switch (close) {
+        .spelled, .pending => null,
+        .token => |v| v,
+    };
     if (m.open.len > 0 and !std.mem.startsWith(u8, text, m.open)) {
         if (find(text, m.open)) |start| if (start > 0) {
             var prefix = text[0..start];
             prefix = prefix[0 .. prefix.len - partialTag(prefix, m.open)]; // a stray partial opener
-            const inner = try splitCore(a, text[start..], finished, m, search, moved(full, text[start..], mark));
+            const inner = try splitThinkingAt(a, text[start..], finished, m, switch (close) {
+                .spelled, .pending => close,
+                .token => |v| .{ .token = if (v >= start) v - start else 0 },
+            });
             return .{ .reasoning = inner.reasoning, .answer = try std.mem.concat(a, u8, &.{ prefix, inner.answer }) };
         };
         if (!finished) {
@@ -96,30 +117,41 @@ fn splitCore(a: Allocator, full: []const u8, finished: bool, m: Markers, search:
         }
         return .{ .reasoning = "", .answer = text };
     }
+    var shift: usize = 0;
     if (m.open.len > 0) {
-        text = trimNewlines(text[m.open.len..]);
-        mark = moved(full, text, mark);
+        const rest = text[m.open.len..];
+        const trimmed = trimNewlines(rest);
+        shift = m.open.len + (rest.len - trimmed.len);
+        text = trimmed;
     } else if (std.mem.startsWith(u8, text, think_open)) {
-        text = trimNewlines(text[think_open.len..]);
-        mark = moved(full, text, mark);
+        const rest = text[think_open.len..];
+        const trimmed = trimNewlines(rest);
+        shift = think_open.len + (rest.len - trimmed.len);
+        text = trimmed;
     } else if (!finished and std.mem.startsWith(u8, think_open, text)) {
         return .{ .reasoning = "", .answer = "" }; // held while the reply may still be writing that opener
     }
-    if (search) {
-        if (find(text, m.close)) |end| return .{ .reasoning = text[0..end], .answer = trimNewlines(text[end + m.close.len ..]) };
-    } else if (mark) |c| {
-        // one close id: its first token, not an earlier spelling of the same text
-        return .{ .reasoning = text[0..c.at], .answer = trimNewlines(text[c.at + c.len ..]) };
+    if (at) |v| at = if (v >= shift) v - shift else null;
+    const end: ?usize = switch (close) {
+        .spelled => find(text, m.close),
+        .pending => null,
+        .token => at,
+    };
+    if (end) |at_end| {
+        if (at_end + m.close.len <= text.len and std.mem.startsWith(u8, text[at_end..], m.close)) {
+            return .{ .reasoning = text[0..at_end], .answer = trimNewlines(text[at_end + m.close.len ..]) };
+        }
+        // the close token's bytes are not where the text says: the whole text is reasoning
     }
     var call: ?usize = null;
-    for (calls) |c| if (find(text, c[0])) |at| {
-        if (call == null or at < call.?) call = at;
+    for (calls) |c| if (find(text, c[0])) |at_call| {
+        if (call == null or at_call < call.?) call = at_call;
     };
-    if (call) |at| {
+    if (call) |at_call| {
         // a call written before the block closes: held while the block may still close, the answer if the reply ends
-        if (!finished) return .{ .reasoning = text[0..at], .answer = "" };
-        for (calls) |c| if (std.mem.startsWith(u8, text[at..], c[0]) and find(text[at..], c[1]) != null)
-            return .{ .reasoning = text[0..at], .answer = text[at..] };
+        if (!finished) return .{ .reasoning = text[0..at_call], .answer = "" };
+        for (calls) |c| if (std.mem.startsWith(u8, text[at_call..], c[0]) and find(text[at_call..], c[1]) != null)
+            return .{ .reasoning = text[0..at_call], .answer = text[at_call..] };
         return .{ .reasoning = text, .answer = "" };
     }
     var held: usize = 0;
@@ -163,8 +195,21 @@ pub fn hideInto(a: Allocator, out: *std.ArrayList(u8), text: []const u8, finishe
             return out.items;
         }
         try out.appendSlice(a, text[pos..start.?]);
-        const opener = calls[which][0];
-        const end = findTag(text, start.? + opener.len, calls[which][1]) orelse return out.items;
+        const after = start.? + calls[which][0].len;
+        switch (payloadOf(text[after..], which, finished)) {
+            .call => {},
+            .wait => return out.items,
+            .prose => {
+                try out.appendSlice(a, text[start.?..after]);
+                pos = after;
+                continue;
+            },
+        }
+        const end = findTag(text, after, calls[which][1]) orelse {
+            // a finished reply's envelope that never closed is text, as tool_parse.parse keeps it in the content
+            if (finished) try out.appendSlice(a, text[start.?..]);
+            return out.items;
+        };
         pos = end + calls[which][1].len;
     }
 }
@@ -277,7 +322,7 @@ pub fn isSpaceByte(ch: u8) bool {
     return ch == ' ' or (ch >= 0x09 and ch <= 0x0d) or (ch >= 0x1c and ch <= 0x1f);
 }
 
-fn spaceAt(s: []const u8, i: usize) usize {
+pub fn spaceAt(s: []const u8, i: usize) usize {
     const c = s[i];
     if (c == ' ' or (c >= 0x09 and c <= 0x0d) or (c >= 0x1c and c <= 0x1f)) return 1;
     if (c < 0x80) return 0;
@@ -367,6 +412,15 @@ pub const Incremental = struct {
     text: std.ArrayList(u8) = .empty,
     prefix: usize = 0,
     read: usize = 0,
+    close: ?Close = null, // where the reasoning ends, once the close token has arrived
+
+    /// Where the reply's reasoning ends: the close token's bytes once it has arrived, or the text's spelling of it.
+    pub fn closeOf(inc: *Incremental, a: Allocator, decode: anytype, ctx: anytype, close_id: ?u32) !Close {
+        if (inc.close) |c| return c;
+        const c = try closeWhere(a, decode, ctx, inc.tokens.items, close_id);
+        if (c != .pending) inc.close = c; // a pending close is not kept: the token may still arrive
+        return c;
+    }
 
     pub fn extend(inc: *Incremental, a: Allocator, ctx: anytype, decode: anytype, more: []const u32) ![]const u8 {
         try inc.tokens.appendSlice(a, more);
@@ -386,6 +440,11 @@ pub const Incremental = struct {
         return inc.tokens.items.len > 0 and inc.read < inc.tokens.items.len;
     }
 };
+
+/// The decode callback `Incremental.extend` takes: any tokenizer's text decode, as `decode(ctx, a, tokens)`.
+pub fn decodeText(t: anytype, a: Allocator, tokens: []const u32) ![]u8 {
+    return t.decode(a, tokens);
+}
 
 test "splits and holds" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
@@ -421,73 +480,24 @@ test "a reply that writes its own think opener keeps the tag out of its reasonin
     }
 }
 
-const marker_id: u32 = 0x110000;
-
-fn decodePieces(_: *const anyopaque, a: Allocator, ids: []const u32) Allocator.Error![]u8 {
-    var out: std.ArrayList(u8) = .empty;
-    for (ids) |id| if (id == marker_id) try out.appendSlice(a, "</think>") else try out.append(a, @intCast(id));
-    return out.items;
-}
-
-fn pushBytes(a: Allocator, ids: *std.ArrayList(u32), s: []const u8) Allocator.Error!void {
-    for (s) |b| try ids.append(a, b);
-}
-
-fn thinkAt(a: Allocator, ids: []const u32, finished: bool, id: ?u32) Allocator.Error!Split {
-    const text = try decodePieces(@ptrFromInt(1), a, ids);
-    return splitThinkingTokens(a, text, finished, think_markers, ids, id, @as(*const anyopaque, @ptrFromInt(1)), decodePieces);
-}
-
-test "a quoted </think> stays in reasoning; the answer starts at the close token" {
+test "an opener the reply names in prose keeps the text after it, streamed and whole" {
     var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    var ids: std.ArrayList(u32) = .empty;
-    try pushBytes(a, &ids, "<think>\nleft </think> stays quoted\n");
-    try ids.append(a, marker_id);
-    try pushBytes(a, &ids, "\n\nright");
-    const s = try thinkAt(a, ids.items, true, marker_id);
-    try std.testing.expectEqualStrings("left </think> stays quoted\n", s.reasoning);
-    try std.testing.expectEqualStrings("right", s.answer);
-    const spelled = try thinkAt(a, ids.items[0 .. ids.items.len - "\n\nright".len - 1], true, null);
-    try std.testing.expectEqualStrings("left ", spelled.reasoning);
-    try std.testing.expectEqualStrings(" stays quoted\n", spelled.answer);
-}
-
-test "echo <think>hello</think> world: the spelled tag is the answer, not the end of reasoning" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var ids: std.ArrayList(u32) = .empty;
-    try pushBytes(a, &ids, "<think>\nquote </think> here\n");
-    try ids.append(a, marker_id);
-    try pushBytes(a, &ids, "\n\n<think>hello</think> world");
-    const s = try thinkAt(a, ids.items, true, marker_id);
-    try std.testing.expectEqualStrings("quote </think> here\n", s.reasoning);
-    try std.testing.expectEqualStrings("<think>hello</think> world", s.answer);
-}
-
-test "streaming chunks keep a quoted </think> in reasoning until the close token" {
-    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    var ids: std.ArrayList(u32) = .empty;
-    try pushBytes(a, &ids, "<think>\nquote </think> here\n");
-    const quoted = ids.items.len;
-    try ids.append(a, marker_id);
-    const closed = ids.items.len;
-    try pushBytes(a, &ids, "\n\n<think>hello</think> world");
-    var prev_r: []const u8 = "";
-    var prev_a: []const u8 = "";
-    for (1..ids.items.len + 1) |n| {
-        const s = try thinkAt(a, ids.items[0..n], false, marker_id);
-        try std.testing.expect(std.mem.startsWith(u8, s.reasoning, prev_r));
-        try std.testing.expect(std.mem.startsWith(u8, s.answer, prev_a));
-        if (n < closed) try std.testing.expectEqualStrings("", s.answer);
-        if (n == quoted) try std.testing.expect(std.mem.indexOf(u8, s.reasoning, "</think>") != null);
-        if (n == closed) try std.testing.expectEqualStrings("quote </think> here\n", s.reasoning);
-        prev_r = s.reasoning;
-        prev_a = s.answer;
+    const prose = "Gemma writes <|tool_call>call:f{...} and DSML uses <\u{ff5c}DSML\u{ff5c}tool_calls>. The rest of my answer.";
+    try std.testing.expectEqualStrings(prose, try finishedProse(a, prose));
+    const named = "Gemma opens a call with <|tool_call> and DSML with <\u{ff5c}DSML\u{ff5c}tool_calls> too.";
+    try std.testing.expectEqualStrings(named, try hideToolCalls(a, named, false));
+    for ([_][]const u8{ prose, named, "a <tool_call>{\"name\"", "a <|tool_call>call:f{x:1}<tool_call|>b" }) |reply| {
+        const whole = try hideToolCalls(a, reply, true);
+        for (0..reply.len + 1) |n| try std.testing.expect(std.mem.startsWith(u8, whole, try hideToolCalls(a, reply[0..n], false)));
     }
-    try std.testing.expectEqualStrings("<think>hello</think> world", prev_a);
+    // a call being written still hides: its payload's lead, a partial lead, or a <tool_call> block that has not closed
+    try std.testing.expectEqualStrings("x ", try hideToolCalls(a, "x <|tool_call>call:f{", false));
+    try std.testing.expectEqualStrings("x ", try hideToolCalls(a, "x <|tool_call> ca", false));
+    try std.testing.expectEqualStrings("x ", try hideToolCalls(a, "x <\u{ff5c}DSML\u{ff5c}tool_calls>\n<\u{ff5c}DSML\u{ff5c}inv", false));
+    try std.testing.expectEqualStrings("a ", try hideToolCalls(a, "a <tool_call>{\"name\"", false));
+    try std.testing.expectEqualStrings("a b", try hideToolCalls(a, "a <|tool_call>call:f{x:1}<tool_call|>b", false));
+    // a finished reply's unclosed envelope is text, as tool_parse.parse keeps it in the content
+    try std.testing.expectEqualStrings("a <tool_call>{\"name\"", try finishedProse(a, "a <tool_call>{\"name\""));
 }

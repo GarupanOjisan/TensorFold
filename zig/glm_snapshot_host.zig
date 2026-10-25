@@ -48,6 +48,7 @@ test "GLM snapshots: a short prefix fits 4 GiB even with a 524288-token configur
         std.debug.print("GLM snapshot sizing rank=0 world=2 at={d} bytes={d} arena={d}\n", .{ at, glm.native.snap_bytes(&e, at), seq.st.arena.buf.len });
     }
     const short = glm.native.snap_bytes(&e, 2048);
+    try t.expectEqual(short, glm.native.snap_min_bytes(&e));
     const longer = glm.native.snap_bytes(&e, 34816);
     try t.expect(short < 4 * @as(u64, 1 << 30));
     try t.expect(short < longer);
@@ -193,7 +194,11 @@ const Control = struct {
     prepares: usize = 0,
     fail_prepare: bool = false,
     peer_failed: bool = false,
+    position: u32 = 0,
+    kept_at: u32 = 0,
+    fail_shared: bool = false,
     pub fn shared(c: *@This(), word: f64) !f64 {
+        if (c.fail_shared) return error.PeerFailed;
         const i = c.calls;
         c.calls += 1;
         if (c.share.rank == 0) c.words[i] = word;
@@ -205,12 +210,47 @@ const Control = struct {
     pub fn keepAs(c: *@This(), id: u64) !void {
         if (c.held != 0) return error.PeerStillHoldsEvictedPages;
         c.held = id;
+        c.kept_at = c.position;
     }
     pub fn prepareSnapshots(c: *@This(), _: u64) !void {
         c.prepares += 1;
         if (c.fail_prepare) return error.OutOfMemory;
     }
+    fn mark(ctx: *anyopaque, at: u32) void {
+        const c: *Control = @ptrCast(@alignCast(ctx));
+        c.held = 2;
+        c.kept_at = at;
+        c.announce = 2;
+    }
 };
+
+test "GLM snapshots: cancellation publishes the completed prefix and evictions before ranks rebind" {
+    var leader: Control = .{ .share = .{ .rank = 0 }, .position = 2048 };
+    defer leader.dropped.deinit(t.allocator);
+    try leader.dropped.append(t.allocator, 1);
+    const marks: glm.engine.Marks = .{ .at = &.{}, .ctx = &leader, .call = Control.mark, .interrupted = Control.mark };
+    try glm.snapshots.interrupted(&leader, marks, 2048);
+    try t.expectEqualSlices(f64, &.{ 3, 4 }, leader.words[0..leader.calls]);
+    var peer: Control = .{ .share = .{ .rank = 1 }, .position = 2048, .words = leader.words };
+    try glm.snapshots.interrupted(&peer, null, 2048);
+    leader.position = 0;
+    peer.position = 0;
+    try t.expectEqual(@as(u64, 2), peer.held);
+    try t.expectEqual(@as(u32, 2048), leader.kept_at);
+    try t.expectEqual(leader.kept_at, peer.kept_at);
+    try t.expectEqual(@as(u64, 0), leader.announce);
+    try t.expectEqual(@as(usize, 0), leader.dropped.items.len);
+    leader.calls = 0;
+    peer.calls = 0;
+    try glm.snapshots.interrupted(&leader, null, 0);
+    peer.words = leader.words;
+    try glm.snapshots.interrupted(&peer, null, 0);
+    try t.expectEqual(@as(usize, 1), leader.calls);
+    try t.expectEqual(@as(f64, 0), leader.words[0]);
+    try t.expectEqual(@as(u64, 2), peer.held);
+    peer.fail_shared = true;
+    try t.expectError(error.PeerFailed, glm.snapshots.interrupted(&peer, null, 0));
+}
 
 test "GLM snapshots: in-chunk eviction reaches the follower before its replacement takes pages" {
     var leader: Control = .{ .share = .{ .rank = 0 }, .announce = 2 };
@@ -357,4 +397,36 @@ test "GLM snapshots: FP8 prefix rows and separate scales restore for every rank 
         }
         try t.expectEqual(allocs, rec.allocs);
     };
+}
+
+test "GLM snapshots: 0.3 GiB fits the first default TP2 prefix at 256K but not a longer prefix" {
+    var d: cuda.Driver = undefined;
+    d.api.cuMemAlloc_v2 = Sizing.alloc;
+    d.api.cuMemFree_v2 = Sizing.free;
+    d.api.cuMemsetD8_v2 = Sizing.zero;
+    var w: glm.weights.Weights = undefined;
+    w.config = .{};
+    w.share = try glm.shard.Share.of(&w.config, 0, 2);
+    var layers: [glm.config.max_layers]glm.weights.Layer = undefined;
+    w.layers = layers[0..w.config.layers];
+    for (w.layers, 0..) |*layer, i| {
+        layer.* = undefined;
+        layer.mixer = switch (w.config.kind(@intCast(i))) {
+            .mla => .{ .mla = undefined },
+            .kda => .{ .kda = undefined },
+        };
+    }
+    var e: glm.engine.Engine = undefined;
+    var seq: @TypeOf(e.cur.*) = undefined;
+    seq.st = try glm.forward.State.init(t.allocator, &d, &w, glm.native.capacity(262144));
+    defer seq.st.deinit();
+    e.cur = &seq;
+    e.c = w.config;
+    e.mtp = true;
+    e.capacity = seq.st.capacity;
+    const minimum = glm.native.snap_min_bytes(&e);
+    const budget: u64 = 322122547;
+    try t.expectEqual(@as(u64, 203423744), minimum);
+    try t.expect(minimum <= budget);
+    try t.expect(glm.native.snap_bytes(&e, 34816) > budget);
 }

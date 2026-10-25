@@ -86,6 +86,8 @@ pub const Backend = struct {
         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
         /// One chunk of the prompt pass, false while chunks remain; null: the pass runs whole.
         prefill_step: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!bool = null,
+        /// Keep a cancelled partial prompt before release, between prefill_step calls; no prompt work may run.
+        cancel_prefill: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!void = null,
         /// Several prompts in one pass, each as after `prefill`; false or an error leaves none prefilled.
         prefill_many: ?*const fn (ptr: *anyopaque, ss: []const *Stream) anyerror!bool = null,
         /// Prompts of at most this many tokens prefill_many takes while prompts otherwise fill by chunks (0: none).
@@ -120,6 +122,8 @@ pub const Backend = struct {
         prefill_features: ?*const fn (ptr: *anyopaque, s: *Stream, taps: []const u32, sink: FeatureSink) anyerror!void = null,
         /// The first token's logprob row (the prompt's last row) for a stream with `logprobs`; null: not given.
         first_row: ?*const fn (ptr: *anyopaque, s: *Stream) anyerror!Row = null,
+        /// One logit per label at the row after `prompt` and, when `mass`, the vocabulary's logsumexp (decisions).
+        score: ?*const fn (ptr: *anyopaque, prompt: []const u32, labels: []const u32, logits: []f64, mass: bool) anyerror!f64 = null,
         /// `first` with the first token drawn among `mask`'s allowed tokens (structured output).
         first_masked: ?*const fn (ptr: *anyopaque, s: *Stream, position: u64, mask: []const u32) anyerror!u64 = null,
         /// The stream's held drafts as host tokens in window order, waiting for the draft (a grammar walks them).
