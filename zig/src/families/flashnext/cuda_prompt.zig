@@ -1,5 +1,4 @@
 //! The loaded engine and one stream's caches: prompts and windows on the batched pass, decode rounds over streams.
-
 const std = @import("std");
 const cuda = @import("cuda");
 const embed = @import("cuda_embed.zig");
@@ -10,7 +9,6 @@ const load = @import("cuda_prompt_load.zig");
 pub const batch = @import("cuda_batch.zig");
 const fb = @import("cuda_fn_back.zig");
 const pocket = @import("cuda_pocket.zig");
-
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
 const attn_n = weights.attn_n;
@@ -46,7 +44,6 @@ const loadHc = weights.loadHc;
 const stitch = weights.stitch;
 const Layer = load.Layer;
 const loadLayer = load.loadLayer;
-
 pub fn argmax(raw: []const u8) u32 {
     var best = promote(std.mem.readInt(u16, raw[0..2], .little));
     var at: usize = 0;
@@ -60,7 +57,6 @@ pub fn argmax(raw: []const u8) u32 {
     }
     return @intCast(at);
 }
-
 /// `n` zeroed buffers, the fill on the compute stream: a legacy-stream memset returns before it lands.
 fn zeros(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, n: usize, len: usize) ![]cuda.DeviceBuffer {
     const Zeroed = struct {
@@ -79,7 +75,6 @@ fn zeros(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, n: u
     };
     return made(cuda.DeviceBuffer, gpa, n, Zeroed{ .driver = driver, .stream = stream, .len = len });
 }
-
 /// `n` buffers from `src.make`, each through `src.fill`; on a failure every buffer made so far is freed, the last too.
 fn made(comptime B: type, gpa: std.mem.Allocator, n: usize, src: anytype) ![]B {
     const out = try gpa.alloc(B, n);
@@ -96,28 +91,31 @@ fn made(comptime B: type, gpa: std.mem.Allocator, n: usize, src: anytype) ![]B {
     }
     return out;
 }
-
 pub const vocabulary: usize = vocab;
 /// Prompt plus reply tokens a sequence can hold: the model's window.
 pub const max_tokens: usize = weights.window;
-
 /// One position's keys and values in one attention layer, bf16.
 pub const kv_row_bytes: usize = kv_heads * head_dim * 2;
-
 /// Device bytes `Engine.newSeq(cap)` allocates: conv tails, recurrent states, KV with indexer keys, the n-gram tail.
 pub fn seqBytes(cap: usize) usize {
     const linear = linear_n * ((gdn.taps - 1) * gdn.conv_dim * 2 + state_n * 4);
     const attn = attn_n * (cap * (2 * kv_row_bytes + index_dim * 2) + pooledBytes(cap));
     return linear + attn + ple_tail_n * wide * 2;
 }
-
+/// Contiguous storage or the page diagnostic's rounded arena and table, with every live allocation priced.
+pub fn seqBytesPaged(cap: usize, tokens: usize) !usize {
+    if (cap == 0 or cap > max_tokens) return error.BadFlashNextPageTest;
+    if (tokens == 0) return seqBytes(cap);
+    const p = try pages.checkedLayout(cap, tokens);
+    const attention = attn_n * (cap * (2 * kv_row_bytes + index_dim * 2) + pooledBytes(cap));
+    return std.math.add(usize, seqBytes(cap) - attention, p.total) catch error.BadFlashNextPageTest;
+}
 /// One attention layer's pooled indexer keys for a cache of `cap` tokens: a bf16 row of 128 a block of 4.
 pub fn pooledBytes(cap: usize) usize {
     return (cap + weights.index_ratio - 1) / weights.index_ratio * index_dim * 2;
 }
-
 const round_graph = @import("cuda_round_graph.zig");
-
+const pages = @import("cuda_pages.zig");
 /// One loaded checkpoint: the embedding table, every layer, the mixer and head, and the batched pass's scratch.
 pub const Engine = struct {
     gpa: std.mem.Allocator,
@@ -148,11 +146,9 @@ pub const Engine = struct {
     pockets: pocket.Pockets = .{},
     /// During a round of taught and untaught streams: its rows' pocket scales (0 on an untaught row); 0: none.
     taught_rows: u64 = 0,
-
     pub fn init(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8) !*Engine {
         return initRank(gpa, io, driver, stream, model_dir, 1, 0);
     }
-
     pub fn initRank(gpa: std.mem.Allocator, io: std.Io, driver: *cuda.Driver, stream: *cuda.Stream, model_dir: []const u8, world: usize, rank: usize) !*Engine {
         if (!cuda.kernels.available) return error.BuiltWithoutKernels;
         if ((world != 1 and world != 2) or rank >= world) return error.BadRank;
@@ -291,10 +287,21 @@ pub const Engine = struct {
 
     /// A fresh cache. `cap` is how many tokens it can hold, prompt plus generated.
     pub fn newSeq(e: *Engine, cap: usize) !Seq {
+        if (cap == 0 or cap > max_tokens) return error.UnexpectedTensor;
+        const test_pages = try pages.pageTest();
+        return e.newSeqOn(cap, if (test_pages > 0) try pages.testPages(e.gpa, e.driver, e.stream.*, cap, test_pages) else null);
+    }
+
+    /// A fresh cache whose attention caches are `given` pages (owned by the cache from here), else contiguous.
+    pub fn newSeqOn(e: *Engine, cap: usize, given: ?pages.Paged) !Seq {
+        var paged = given;
+        errdefer if (paged) |*p| p.deinit(e.gpa);
         e.round_graph.clear();
-        if (cap == 0) return error.UnexpectedTensor;
+        if (cap == 0 or cap > max_tokens) return error.UnexpectedTensor;
+        _ = try seqBytesPaged(cap, if (paged) |p| p.tokens else 0);
         var seq: Seq = .{
             .stream = e.stream.*,
+            .paged = paged,
             .conv = &.{},
             .state = &.{},
             .kc = &.{},
@@ -307,18 +314,31 @@ pub const Engine = struct {
             .logits = &.{},
             .cap = cap,
         };
+        paged = null; // seq owns the pages from here
         // One rollback owns every published array, and drains before releasing any destination.
         errdefer seq.deinit(e.gpa);
         seq.logits = try e.gpa.alloc(u8, vocab * 2);
         seq.conv = try zeros(e.gpa, e.driver, e.stream.*, linear_n, (gdn.taps - 1) * gdn.conv_dim * 2);
         seq.state = try zeros(e.gpa, e.driver, e.stream.*, linear_n, state_n * 4);
-        seq.kc = try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * kv_heads * head_dim * 2);
-        seq.vc = try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * kv_heads * head_dim * 2);
-        seq.ikc = try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * index_dim * 2);
-        seq.pooled = try zeros(e.gpa, e.driver, e.stream.*, attn_n, pooledBytes(cap));
+        seq.kc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .key) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * kv_heads * head_dim * 2);
+        seq.vc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .value) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * kv_heads * head_dim * 2);
+        seq.ikc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .index) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, cap * index_dim * 2);
+        seq.pooled = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .pooled) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, pooledBytes(cap));
         seq.tail = try cuda.DeviceBuffer.alloc(e.driver, ple_tail_n * wide * 2);
         try seq.tail.fill8(0, e.stream.handle);
         return seq;
+    }
+
+    /// A pool lane's cache made fresh for its next stream: zero states and tail, nothing fed, `cap` rows.
+    pub fn clearSeq(e: *Engine, s: *Seq, cap: usize) !void {
+        e.round_graph.clear();
+        for (s.conv) |b| try b.fill8(0, e.stream.handle);
+        for (s.state) |b| try b.fill8(0, e.stream.handle);
+        try s.tail.fill8(0, e.stream.handle);
+        s.history = .{ e.eos, e.eos };
+        s.fed = 0;
+        s.cap = cap;
+        s.untaught = false;
     }
 
     /// Run `ids` on from `seq.fed` and leave the next token's scores in `seq.logits`.
@@ -460,6 +480,8 @@ pub const Seq = struct {
     vc: []cuda.DeviceBuffer,
     ikc: []cuda.DeviceBuffer,
     pooled: []cuda.DeviceBuffer,
+    /// kc, vc, ikc and pooled as borrowed views of page 0 of these pages (null: each its own contiguous buffer).
+    paged: ?pages.Paged = null,
     tail: cuda.DeviceBuffer,
     history: [2]i64,
     fed: usize,
@@ -470,7 +492,12 @@ pub const Seq = struct {
 
     /// The caches a batched pass reads and leaves; `scores` the engine's block scores (Engine.reserveScores).
     pub fn view(s: *Seq, scores: u64) batch.SeqState {
-        return .{ .media = if (s.media) |*m| m.view() else null, .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .pooled = s.pooled, .tail = s.tail, .history = &s.history, .cap = s.cap, .scores = scores };
+        return .{ .media = if (s.media) |*m| m.view() else null, .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .pooled = s.pooled, .tail = s.tail, .history = &s.history, .cap = s.cap, .scores = scores, .pg = s.pg() };
+    }
+
+    /// The attention kernels' page argument (zero: contiguous caches).
+    pub fn pg(s: *const Seq) @import("cuda_glue.zig").Pg {
+        return if (s.paged) |*p| p.pg() else .{};
     }
 
     pub fn deinit(s: *Seq, gpa: std.mem.Allocator) void {
@@ -488,6 +515,7 @@ pub const Seq = struct {
         gpa.free(s.vc);
         gpa.free(s.ikc);
         gpa.free(s.pooled);
+        if (s.paged) |*p| p.deinit(gpa);
         if (s.tail.ptr != 0) s.tail.free();
         gpa.free(s.logits);
     }

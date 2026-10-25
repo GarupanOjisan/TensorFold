@@ -32,11 +32,15 @@ pub const Script = struct {
     cancelled: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
     seeds: [4]u64 = undefined,
+    reference_rows: [4]u32 = undefined,
     takes: usize = 0,
     voices: []const @import("drama_voice.zig").Voice = &.{},
     get_voices: bool = false,
     expected_rows: ?[]const [11]i32 = null,
     rows_equal: bool = false,
+    expected_unconditioned: []const [11]i32 = &.{},
+    unconditioned_equal: bool = false,
+    cfg_gamma: f32 = 1,
 
     fn engine(e: *Script) api.Engine {
         return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory, .submit_speech = speech } };
@@ -48,6 +52,8 @@ pub const Script = struct {
     fn speech(ctx: *anyopaque, id: api.Id, request: *const api.SpeechRequest, sink: api.Sink) api.SpeechSubmitError!void {
         const e: *Script = @ptrCast(@alignCast(ctx));
         if (e.expected_rows) |expected| e.rows_equal = std.mem.eql(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(request.frames));
+        e.unconditioned_equal = std.mem.eql(u8, std.mem.sliceAsBytes(e.expected_unconditioned), std.mem.sliceAsBytes(request.unconditioned));
+        e.cfg_gamma = request.cfg_gamma;
         if (e.takes >= e.busy_from) return error.Busy;
         if (e.takes > 0 and e.busy_replies < e.busy_redraws) {
             e.busy_replies += 1;
@@ -55,6 +61,7 @@ pub const Script = struct {
         }
         const take = e.takes;
         e.seeds[take] = request.seed;
+        e.reference_rows[take] = request.reference_rows;
         e.takes += 1;
         if (e.inline_) return run(e, id, request, sink, take);
         e.thread = std.Thread.spawn(.{}, run, .{ e, id, request, sink, take }) catch return error.Busy;
@@ -518,13 +525,14 @@ test "voices: HTTP listing and reference rows use the family CLI builder" {
         }
     };
     const expected = try family.build(a, CliTokenizer{}, "hi", &refs);
-    var script: Script = .{ .steps = &.{frame}, .voices = &voices, .expected_rows = expected };
+    var script: Script = .{ .steps = &.{frame}, .voices = &voices, .expected_rows = expected.frames };
     var s: Served = undefined;
     try s.start(&script, "HTTP/1.1", "{\"model\":\"m\",\"input\":\"hi\",\"voice\":\"tone\",\"response_format\":\"pcm\"}", 2000);
     defer s.deinit();
     try expectHeader(try s.readHead(), " 200 ");
     s.join(&script);
     try std.testing.expect(script.rows_equal);
+    try std.testing.expectEqual(expected.reference_rows, script.reference_rows[0]);
     try std.testing.expectEqualStrings(&pcm(1), try s.readRest());
     var listing_script: Script = .{ .steps = &.{}, .voices = &voices, .get_voices = true };
     var listing: Served = undefined;
@@ -532,7 +540,7 @@ test "voices: HTTP listing and reference rows use the family CLI builder" {
     defer listing.deinit();
     try expectHeader(try listing.readHead(), " 200 ");
     listing.join(&listing_script);
-    try std.testing.expectEqualStrings("{\"voices\": [\"default\", \"tone\"]}", try listing.readRest());
+    try std.testing.expectEqualStrings("{\"voices\": [\"default\", \"tone\"], \"details\": [{\"id\": \"tone\", \"description\": \"\"}]}", try listing.readRest());
 }
 
 test "voices: without configuration the default prompt rows stay unchanged" {
@@ -553,5 +561,6 @@ test "voices: without configuration the default prompt rows stay unchanged" {
     try expectHeader(try s.readHead(), " 200 ");
     s.join(&script);
     try std.testing.expect(script.rows_equal);
+    try std.testing.expectEqual(@as(u32, 0), script.reference_rows[0]);
     try std.testing.expectEqualStrings(&pcm(1), try s.readRest());
 }

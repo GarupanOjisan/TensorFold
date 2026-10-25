@@ -44,6 +44,11 @@ pub const Run = struct {
     argmax_pipe: mtl.Pipeline = undefined,
     add_pipe: mtl.Pipeline = undefined,
     argids_pipe: mtl.Pipeline = undefined,
+    argpart_pipe: mtl.Pipeline = undefined, // the round's argmaxes in two launches (fz_argmax_part, fz_argmax_join)
+    argjoin_pipe: mtl.Pipeline = undefined,
+    arg_parts: Buf = undefined, // their winners: rows x parts x (value bits, index)
+    attn2: ?*Variant = null, // attention parts at two heads a threadgroup (attn2.zig), main layers and the head
+    attn2_mtp: ?*Variant = null,
     pleids_pipe: mtl.Pipeline = undefined,
     copy_pipe: mtl.Pipeline = undefined,
     accept_pipe: mtl.Pipeline = undefined,
@@ -69,7 +74,7 @@ pub const Run = struct {
     split: bool = false,
     gdn_step: bool = false,
     hc_mma: bool = false,
-    event: mtl.SharedEvent = undefined,
+    event: mtl.Event = undefined, // GPU-side rounds: each waits for the one before (a shared event's wait goes through the OS)
     event_value: u64 = 0,
     dense8_pipe: mtl.Pipeline = undefined,
     grouped: bool = false,
@@ -103,6 +108,10 @@ pub const Run = struct {
     lane_shape: std.AutoHashMapUnmanaged(*Variant, [3]usize) = .empty, // recorded lane kernels' N, K, SK
     gdn_pipe: ?mtl.Pipeline = null, // the DeltaNet window step on fz_gdn (gdn.zig) when set
     gdn_kept: ?mtl.Pipeline = null, // GPU-side rounds: fz_gdn keeping one state a layer, kept rows replayed (gdn.zig)
+    tree: ?*@import("tree.zig").Tree = null, // the tree window decode is running, if any (tree.zig)
+    limit: ?Buf = null, // a GPU-gated window's or head step's row count for the 4-bit row kernels (gate.zig)
+    head_md1: ?Buf = null, // a gated head step's one-row dims, in place of the head's own
+    gx: ?*@import("gx.zig").Gx = null, // FZ_GX=rows: windows from that many rows on the grouped experts (gx.zig)
     xnew_header: []const u8 = "",
     tp: ?*Tp2 = null, // TP=2 across two Macs (tp.zig): the target layers' experts split by id, outputs exchanged
     tp_layer: bool = false, // the experts being encoded are a target layer's (the MTP head keeps all of its own)
@@ -275,6 +284,31 @@ pub const Run = struct {
         r.enc.setBuffer(r.sink.b, 0, 1);
         r.enc.setBytes(std.mem.asBytes(&n), 2);
         r.enc.dispatchThreads(mtl.Size.of(256 * 64, 1, 1), mtl.Size.of(256, 1, 1));
+    }
+
+    /// The attention parts launch: two heads a threadgroup when its load check passed (`two`), else as recorded.
+    pub fn attnParts(r: *Run, role: []const u8, two: ?*Variant, ins: []const Buf, outs: []const Buf) !void {
+        if (two) |v| return @import("attn2.zig").call(r, role, v, ins, outs);
+        return r.call(role, ins, outs);
+    }
+
+    /// Each of `rows` rows' first largest of `n` logits into `out[row]` (ids[pick] with `ids`): fz_argmax's pick.
+    pub fn argmax(r: *Run, logits: Buf, n: Buf, out: Buf, ids: ?Buf, rows: usize) void {
+        const parts: u32 = 64;
+        r.enc.setPipeline(r.argpart_pipe);
+        for ([_]Buf{ logits, r.arg_parts, n }, 0..) |b, j| r.enc.setBuffer(b.b, b.off, j);
+        r.enc.dispatchGroups(mtl.Size.of(parts, rows, 1), mtl.Size.of(256, 1, 1));
+        if (!r.serial) r.enc.barrier();
+        r.enc.setPipeline(r.argjoin_pipe);
+        r.enc.setBuffer(r.arg_parts.b, r.arg_parts.off, 0);
+        r.enc.setBuffer(out.b, out.off, 1);
+        r.enc.setBytes(std.mem.asBytes(&parts), 2);
+        const map: u32 = @intFromBool(ids != null);
+        const id = ids orelse out;
+        r.enc.setBuffer(id.b, id.off, 3);
+        r.enc.setBytes(std.mem.asBytes(&map), 4);
+        r.enc.dispatchGroups(mtl.Size.of(rows, 1, 1), mtl.Size.of(32, 1, 1));
+        if (!r.serial) r.enc.barrier();
     }
 
     /// fz_copy_kept: `layers` copies of `n` words from row (keep + base) of src (row and layer strides in words).

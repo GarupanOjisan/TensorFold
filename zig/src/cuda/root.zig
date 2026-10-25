@@ -4,6 +4,7 @@ pub const abi = @import("abi.zig");
 pub const Driver = @import("driver.zig").Driver;
 pub const copy_source = @import("copy_source.zig");
 pub const completion = @import("completion.zig");
+pub const paging_test_device = if (@import("builtin").is_test) @import("paging_test_device.zig") else struct {};
 pub const Error = @import("driver.zig").Error;
 pub const Context = @import("context.zig").Context;
 pub const DeviceBuffer = @import("memory.zig").DeviceBuffer;
@@ -156,3 +157,4 @@ test {
 test {
     _ = @import("graph_instantiate_failure_test.zig");
 }
+pub const qwen35_bf16_rows = @import("qwen35_bf16_rows.zig");

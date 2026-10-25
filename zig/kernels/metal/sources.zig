@@ -105,6 +105,8 @@ pub const flashnext_gdn = @embedFile("decode/fn_gdn.metal");
 /// Flash Next decode products one input row a simdgroup, for GPUs without tensor units (0.6.6's rows.py).
 pub const flashnext_rows = @embedFile("decode/fn_rows.metal");
 pub const flashnext_rows_hc = @embedFile("decode/fn_rows_hc.metal");
+/// Flash Next experts grouped by expert for wide decode windows, the recorded expert kernels' bits (gx.zig).
+pub const flashnext_gx = @embedFile("decode/fn_gx.metal");
 
 /// GLM-5.3-Flash's decode kernels from our Python family (tools/zig/gen_glm_kernels.py).
 pub const glm = @import("glm/kernels.zig");
@@ -176,6 +178,8 @@ pub const drama3 = struct {
     pub const gdn = @embedFile("drama3/gdn.metal");
     pub const attn = @embedFile("drama3/attn.metal");
     pub const moe = @embedFile("drama3/moe.metal");
+    pub const nvfp4 = @embedFile("drama3/nvfp4.metal");
+    pub const guidance = @embedFile("drama3/guidance.metal");
     pub const sample = @embedFile("drama3/sample.metal");
     pub const codec = @embedFile("drama3/codec.metal");
 };

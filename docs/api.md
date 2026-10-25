@@ -149,6 +149,7 @@ delete runs gets 503, an id that is not a number 400, and an id the graph does n
 | `reasoning_effort` | `none`, `minimal`, `low`, `medium`, `high`, `xhigh` or `max` | Both |
 | `thinking_budget` | Token-count limit inside reasoning | Both |
 | `priority` | `background` yields to foreground requests | Both |
+| `return_token_ids` | The reply's token ids in the response's `tensorfold.token_ids`, the tokens its `token_sha256` hashes | Native |
 
 `n` must be 1; multiple choices receive HTTP 400.
 
@@ -337,10 +338,11 @@ the same prompt for the same request. Effort support depends on the checkpoint's
 token budget. With thinking off, GLM-5.3's prompt is its thinking-off template's: no reasoning-effort line and an
 empty think block. GLM-5.3 keeps every earlier assistant turn's reasoning in the prompt, as zai-org's template does by
 default (`clear_thinking` false), also on checkpoints whose template still clears it before the last user message, so
-a new user message leaves the earlier turns' tokens, and their kept prompt states, as they were. A request's
-`chat_template_kwargs.clear_thinking: true` drops it, as the model card advises for plain chat. In the Python 0.6.6
-engine that works on CUDA, and on a Mac `TF_GLM_CLEAR_THINKING=1` sets it for the server, from @MiaAI-Lab's
-[#236](https://github.com/ashhart/TensorFold/pull/236); the native binary does not read that variable.
+a new user message leaves the earlier turns' tokens, and their kept prompt states, as they were. The native server
+gives the template `clear_thinking` false on every render, and `TF_GLM_CLEAR_THINKING=1` sets it true for the server,
+from @MiaAI-Lab's [#236](https://github.com/ashhart/TensorFold/pull/236); any value but 0 or 1 refuses to load. A
+request's `chat_template_kwargs.clear_thinking` (true or false) overrides the server's setting for that request, as the
+model card advises `true` for plain chat; any other value is a 400, and other families' templates never receive it.
 
 A tool call written before the think block closes is the reply's tool call when the reply ends inside the block,
 on both backends; the reasoning stops where the call starts, and streamed reasoning never carries the call's markup.
@@ -422,7 +424,9 @@ TensorFold also reports generation statistics such as decode rate, time to first
 Native JSON replies also carry a `tensorfold` runtime block with `engine`, `enable_thinking`,
 `reasoning_effort`, `tokens_per_second`, `seconds`, `time_to_first_token`, `prefill_seconds`,
 `prefill_widths`, `prefill_raised`, `sampling`, `drafts`, `token_sha`, and the draft counters
-`rounds`, `drafted`, `accepted`, `acceptance_rate`, and `tokens_per_round`. A loop-guarded reply adds
+`rounds`, `drafted`, `accepted`, `acceptance_rate`, and `tokens_per_round`. A request that sends
+`return_token_ids` adds `token_ids`, the reply's tokens, to the block — the tokens `token_sha` and
+`token_sha256` hash — on the whole reply and on the streamed finish event alike. A loop-guarded reply adds
 `runtime.loop.period`; these fields describe the native reply and are absent
 from Python replies that do not provide them.
 In the native block, `seconds` is the reply's decode time, from the end of its prompt pass to its last token, and

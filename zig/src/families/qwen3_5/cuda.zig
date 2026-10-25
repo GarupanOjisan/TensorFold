@@ -14,6 +14,7 @@ pub const vision = @import("cuda_vision.zig");
 pub const reuse = @import("cuda_reuse.zig");
 
 test {
+    _ = @import("cuda_attention.zig");
     _ = @import("cuda_forward.zig");
     _ = engine;
     _ = native;
@@ -28,6 +29,9 @@ test {
     _ = @import("cuda_vision_prompt.zig");
     _ = reuse;
     _ = native;
+    _ = @import("cuda_pages.zig");
+    _ = @import("cuda_pages_init_test.zig");
+    _ = @import("cuda_pages_lifetime_test.zig");
 }
 
 pub const slide = @import("cuda_slide.zig");

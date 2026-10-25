@@ -20,7 +20,6 @@ pub const Flag = struct {
     /// The values it honours when only some of the choices.
     native_values: ?[]const []const u8 = null,
 };
-
 const backend_values: []const []const u8 = if (builtin.os.tag == .macos) &.{ "auto", "mlx" } else if (served("--backend=rocm")) &.{ "auto", "rocm" } else &.{ "auto", "cuda" };
 
 /// The flags past the common ones the binary's backend serves, from its root's `serves` (test roots: none).
@@ -49,6 +48,7 @@ pub const flags = [_]Flag{
     .{ .name = "--chat-template", .native = true },
     .{ .name = "--voices", .native = true },
     .{ .name = "--default-voice", .native = true },
+} ++ @import("drama_cfg.zig").flags ++ [_]Flag{
     .{ .name = "--alias", .kind = .append, .native = true },
     .{ .name = "--api-key", .kind = .append, .native = true },
     .{ .name = "--api-key-file", .native = true },
@@ -134,6 +134,7 @@ pub const flags = [_]Flag{
     // the CUDA CLI's own: the GPU ordinal, and whole prompt chunks a call runs as staggered segments
     .{ .name = "--device", .native = cuda_build },
     .{ .name = "--segments", .native = cuda_build },
+    .{ .name = "--loops", .native = cuda_build }, // a looped model's recurrent passes (Dory: 1 to 4)
     // the native server's own: shared prompt states (a harness) kept on disk for later sessions and servers
     .{ .name = "--learn", .kind = .store_true, .native = true },
     .{ .name = "--learn-dir", .native = true },
@@ -173,6 +174,7 @@ pub const Args = struct {
     context: ?i64 = null,
     max_frames: ?u32 = null,
     silence: api.speech_guard.Config = .{},
+    cfg: @import("drama_cfg.zig").Flags = .{},
     redraw: @import("speech_redraw.zig").Policy = .{},
     speed_up: ?[]const u8 = null, // speed-up mode: this Mac's settings for the two-Mac link (Flash Next and the GLMs)
     prompt_cache_gib: ?f64 = null, // kept prompt states' budget (0: none; null: what 70% of RAM leaves past the loaded server)
@@ -216,6 +218,7 @@ pub const Args = struct {
     backend: []const u8 = "auto",
     device: ?u32 = null,
     segments: ?u32 = null,
+    loops: ?u32 = null, // passes over a looped model's recurrent block (null: the checkpoint's own)
     precision: ?api.Precision = null, // an NVFP4 checkpoint's math on CUDA: NVIDIA's own (checkpoint) or full precision
     mtp_drafts: ?u32 = null,
     mtp_confidence: ?f64 = null,
@@ -282,6 +285,7 @@ pub fn parse(a: Allocator, argv: []const []const u8, u: *Usage) error{ Usage, Ou
         try apply(a, &out, name, value, u, &repeated);
     }
     out.model = model orelse return fail(u, a, "the following arguments are required: model", .{});
+    if ((out.cfg.batched or out.cfg.force_guided) and out.cfg.options() == null) return fail(u, a, "--cfg-batched and --cfg-force-guided need --cfg-gamma or --cfg-allow-request-gamma", .{});
     try ranks(u, a, out);
     out.silence.validate() catch |err|
         return fail(u, a, "invalid silence guard configuration: {s}", .{@errorName(err)});
@@ -348,6 +352,7 @@ fn apply(a: Allocator, out: *Args, name: []const u8, value: ?[]const u8, u: *Usa
     }
     if (try cudaFlag(a, out, name, v, u) or try gpuFlag(a, out, name, v, u)) return;
     if (try recallFlag(a, out, name, v, u)) return;
+    if (out.cfg.set(name, v) catch return fail(u, a, "--cfg-gamma must be 0 (off) or 1 (unguided) through 5", .{})) return;
     if (is(name, "--voices")) {
         out.voices = v;
         return;
@@ -444,7 +449,7 @@ fn cudaFlag(a: Allocator, out: *Args, name: []const u8, v: []const u8, u: *Usage
         out.precision = std.meta.stringToEnum(api.Precision, v) orelse return fail(u, a, "argument --precision: checkpoint or full: '{s}'", .{v});
     } else if (std.mem.eql(u8, name, "--device")) {
         out.device = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --device: a GPU ordinal from 0: '{s}'", .{v});
-    } else if (std.mem.eql(u8, name, "--segments")) {
+    } else if (std.mem.eql(u8, name, "--loops")) out.loops = std.math.cast(u32, try int(u, a, name, v)) orelse return fail(u, a, "argument --loops: a count from 1: '{s}'", .{v}) else if (std.mem.eql(u8, name, "--segments")) {
         const n = try int(u, a, name, v);
         out.segments = if (n >= 1) @intCast(@min(n, std.math.maxInt(u32))) else return fail(u, a, "argument --segments: a count from 1: '{s}'", .{v});
     } else return false;
@@ -503,7 +508,7 @@ pub fn parallelFixed(text: []const u8) bool {
 
 /// What a server asks of its engine, from its flags.
 pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args) !api.Open {
-    return .{
+    return @import("drama_cfg.zig").withGuidance(args.cfg, .{
         .dir = dir,
         .model_type = model_type,
         .context = args.context,
@@ -529,6 +534,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .recall = args.recall,
         .device = args.device,
         .segments = args.segments,
+        .loops = args.loops,
         .precision = args.precision,
         .mtp_drafts = args.mtp_drafts,
         .mtp_confidence = args.mtp_confidence,
@@ -539,7 +545,7 @@ pub fn request(a: Allocator, dir: []const u8, model_type: []const u8, args: Args
         .master_port = args.master_port,
         .policy = args.policy,
         .vision = if (args.vision) .{ .image_tokens = args.vision_image_tokens, .image_tokens_set = args.vision_image_tokens_set, .max_images = args.vision_max_images, .max_videos = args.vision_max_videos, .video_tokens = args.vision_video_tokens } else null,
-    };
+    });
 }
 
 /// What ``capabilities --json`` reports about the engine side: its version, chip, backends and families.
@@ -553,37 +559,7 @@ pub const Engines = struct {
 };
 
 /// The native capabilities document: the table's native flags and the honoured variables.
-pub fn capabilities(w: *std.Io.Writer, e: Engines) !void {
-    try w.print("{{\"schema\": 1, \"engine\": \"zig\", \"version\": \"{s}\", \"chip\": ", .{e.version});
-    if (e.chip) |c| try w.print("\"{s}\"", .{c}) else try w.writeAll("null");
-    try w.writeAll(", \"backends\": [");
-    for (e.backends, 0..) |b, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", b });
-    try w.writeAll("], \"families\": {");
-    for (e.families, 0..) |f, i| {
-        try w.print("{s}\"{s}\": [", .{ if (i > 0) ", " else "", f.model_type });
-        for (f.formats, 0..) |fmt, j| try w.print("{s}\"{s}\"", .{ if (j > 0) ", " else "", fmt });
-        try w.writeAll("]");
-    }
-    try w.writeAll("}, \"serve\": {\"flags\": {");
-    var first = true;
-    for (flags) |f| {
-        if (!f.native) continue;
-        try w.print("{s}\"{s}\": {{", .{ if (first) "" else ", ", f.name });
-        first = false;
-        const values = f.native_values orelse f.choices;
-        if (values.len > 0) {
-            try w.writeAll("\"values\": [");
-            for (values, 0..) |v, j| try w.print("{s}\"{s}\"", .{ if (j > 0) ", " else "", v });
-            try w.writeAll("]");
-        }
-        try w.writeAll("}");
-    }
-    try w.writeAll("}}, \"env\": [");
-    for (env, 0..) |name, i| try w.print("{s}\"{s}\"", .{ if (i > 0) ", " else "", name });
-    try w.writeAll("], \"optional_libraries\": ");
-    try std.json.Stringify.value(e.optional_libraries, .{}, w);
-    try w.writeAll("}\n");
-}
+pub const capabilities = @import("cli_capabilities.zig").capabilities;
 
 const cli = @This();
 

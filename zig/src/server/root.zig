@@ -32,9 +32,13 @@ test {
     _ = @import("fields.zig");
     _ = @import("reply_text.zig");
     _ = @import("tool_parse.zig");
+    _ = @import("tool_lfm2.zig");
+    _ = @import("tool_lfm2_stream_test.zig");
     _ = @import("tool_stream.zig");
     _ = @import("tool_params.zig");
     _ = @import("tool_grammar.zig");
+    _ = @import("tool_grammar_lfm2.zig");
+    _ = @import("tool_grammar_lfm2_test.zig");
     _ = @import("tool_required_test.zig");
     _ = @import("grammar.zig");
     _ = @import("pyrepr.zig");
@@ -49,6 +53,8 @@ test {
     _ = @import("chunk_plan.zig");
     _ = @import("status_routes.zig");
     _ = @import("speech.zig");
+    _ = @import("drama_cfg.zig");
+    if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_cfg_test.zig");
     if (comptime @import("builtin").os.tag != .windows) _ = @import("speech_stream_test.zig"); // over a Unix socket pair
     _ = @import("drama_voice_tool.zig");
     _ = @import("speech_redraw.zig");
@@ -69,6 +75,7 @@ test {
     _ = @import("videos.zig");
     _ = @import("stream_preflight_test.zig");
     _ = @import("stream_dsml_test.zig");
+    _ = @import("tool_cut_test.zig");
     _ = @import("logprobs_test.zig");
     _ = @import("think_split_test.zig");
     _ = @import("thinking_reserve_test.zig");
