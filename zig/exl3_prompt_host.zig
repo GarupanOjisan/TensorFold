@@ -12,10 +12,10 @@ const Capture = struct {
     var copied: usize = 0;
     fn launch(f: cuda.abi.Function, gx: c_uint, gy: c_uint, gz: c_uint, bx: c_uint, _: c_uint, _: c_uint, _: c_uint, _: cuda.abi.Stream, args: ?[*]?*anyopaque, _: ?[*]?*anyopaque) callconv(.c) cuda.abi.Result {
         calls[count] = .{ .id = @intFromPtr(f), .grid = .{ gx, gy, gz }, .block = bx };
-        if (@intFromPtr(f) >= 11 and @intFromPtr(f) <= 13) {
+        if (@intFromPtr(f) >= 11 and @intFromPtr(f) <= 15) {
             const sizes: []const u8 = switch (@intFromPtr(f)) {
                 11 => &.{ 8, 4, 8, 8, 4 },
-                12 => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4 },
+                12, 14 => &.{ 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 4, 4, 4, 4, 4 },
                 else => &.{ 8, 8, 8, 8, 8, 8, 8, 4, 4, 4 },
             };
             for (sizes, 0..) |size, i| {
@@ -49,15 +49,18 @@ fn function(d: *const cuda.Driver, id: usize) cuda.Function {
     return .{ .d = d, .handle = @ptrFromInt(id) };
 }
 fn run(rows: usize, prompt: bool, shared: bool) !void {
+    return runBits(rows, prompt, shared, 8);
+}
+fn runBits(rows: usize, prompt: bool, shared: bool, half_bits: u32) !void {
     Capture.reset();
     var d: cuda.Driver = undefined;
     d.api.cuLaunchKernel = Capture.launch;
     d.api.cuMemcpy2DAsync_v2 = Capture.copy;
     const s: cuda.Stream = .{ .d = &d, .handle = null };
     var k: ex.Experts = .{ .mod = undefined, .group = function(&d, 1), .rot_in = function(&d, 2), .grouped = @splat(function(&d, 3)), .gateup = function(&d, 4), .down_combine = function(&d, 5) };
-    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13) };
+    if (comptime @hasField(ex.Experts, "prompt")) k.prompt = .{ .rotate = function(&d, 11), .gateup = function(&d, 12), .down = function(&d, 13), .gateup3 = function(&d, 14), .down3 = function(&d, 15) };
     const ek: glm.experts.Kernels = .{ .nvfp4 = undefined, .router = .{ .plan_small = function(&d, 20), .plan_rank = function(&d, 21), .plan_offsets = function(&d, 22), .plan_scatter = function(&d, 23), .plan_rows = function(&d, 24), .plan_rank_rows = function(&d, 25), .plan_scatter_rows = function(&d, 26) } };
-    const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .shx = shared };
+    const w: glm.exl3.Experts = .{ .gt = 100, .ut = 200, .dt = 300, .k2 = 400, .suh_g = 500, .suh_u = 600, .svh_g = 700, .svh_u = 800, .suh_d = 900, .svh_d = 1000, .half_bits = half_bits, .shx = shared };
     const sc: glm.exl3.Scratch = .{ .picks = 0x100000000, .xg = 0, .xu = 0, .z = 0 };
     const plan: cuda.grouped.Plan = .{ .items = 10000, .members = 20000, .counts = 30000, .rank = 40000, .hist = 50000 };
     try glm.exl3.run(&k, &ek, s, w, sc, plan, 0x200000000, 520, 0x300000000, 9, rows, 9, 512, 256, 10, prompt, 0x400000000, 0);
@@ -84,13 +87,23 @@ test "exl3 prompt: dispatch rotates once per row only with verified shared scale
     }
 }
 
+test "exl3 prompt: 3-bit layers take the fused kernels built for 24-word tiles" {
+    try runBits(40, true, true, 6);
+    try std.testing.expect(Capture.by(14).len > 0 and Capture.by(15).len > 0);
+    try std.testing.expectEqual(@as(usize, 0), Capture.by(12).len + Capture.by(13).len + Capture.by(3).len);
+    try std.testing.expectEqual(@as(u32, 40), Capture.by(11)[0].grid[0]);
+    try runBits(4, false, true, 6); // decode keeps the grouped kernels
+    try std.testing.expectEqual(@as(usize, 0), Capture.by(14).len);
+    try std.testing.expect(Capture.by(3).len > 0);
+}
+
 test "exl3 prompt: scratch omits global split partials and shared rotation storage is independent of pick count" {
     const shared = glm.exl3.scratchBytes(1024, 512, 256, true, true, 8)[0];
     const separate = glm.exl3.scratchBytes(1024, 512, 256, true, false, 8)[0];
     const decode = glm.exl3.scratchBytes(1024, 512, 256, false, false, 8)[0];
     try std.testing.expect(shared < separate and separate < decode);
-    // 3-bit layers skip the fused prompt path, so a prompt sizes the common grouped scratch, as decode does
-    try std.testing.expectEqual(glm.exl3.scratchBytes(1024, 512, 256, false, false, 6)[0], glm.exl3.scratchBytes(1024, 512, 256, true, true, 6)[0]);
+    // 3-bit layers take the fused prompt path too, so a prompt sizes its smaller scratch
+    try std.testing.expectEqual(shared, glm.exl3.scratchBytes(1024, 512, 256, true, true, 6)[0]);
     if (comptime @hasDecl(ex, "prompt")) {
         const l: ex.Layer = .{ .gate = 0, .up = 0, .down = 0, .gate_k2 = 0, .up_k2 = 0, .down_k2 = 0, .suh_g = 0, .suh_u = 0, .svh_g = 0, .svh_u = 0, .suh_d = 0, .svh_d = 0, .dims = 512, .width = 256, .experts = 9, .codebook = .mcg, .uniform_k2 = 8, .shared_input = true };
         const bytes = try ex.prompt.bytes(l, 1024, 8);
@@ -130,6 +143,8 @@ test "exl3 prompt: the common dispatch requires verified mcg4 geometry and keeps
     l.uniform_k2 = 0;
     try std.testing.expect(!P.eligible(l));
     l.uniform_k2 = 6;
+    try std.testing.expect(P.eligible(l));
+    l.uniform_k2 = 10;
     try std.testing.expect(!P.eligible(l));
     l.uniform_k2 = 8;
     for ([_]ex.Codebook{ .inst3, .mul1 }) |cb| {
