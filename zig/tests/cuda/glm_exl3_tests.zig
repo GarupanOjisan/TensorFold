@@ -204,33 +204,35 @@ pub fn run_(gpu: Gpu) !void {
     defer k.unload();
     var ek = try glm.experts.Kernels.load(gpu.d, pm, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
     defer ek.unload();
-    for ([_]u32{ 8, 6 }) |half_bits| for ([_]bool{ true, false }) |one| { // 4-bit and 3-bit experts
-        const s = try weights(&r, one, half_bits);
-        for ([_]usize{ 1, 3, 8 }) |rows| { // decode windows
-            const x = try r.bfs(rows * D, 1.0);
-            const pk = try picks(&r, rows);
-            const got = try run(&r, &k, &ek, s, x, pk, rows, false);
-            try expect(&r, if (one) "glm-exl3 decode, one rotation" else "glm-exl3 decode, a rotation an expert", got, s, x, pk);
-            if (rows > 1) { // every row's bits as alone
-                const all = try r.back(got.ey, rows * slots * D * 4);
-                for (0..rows) |row| {
-                    const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, false);
-                    const mine = try r.back(alone.ey, slots * D * 4);
-                    try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 decode: row {d} of {d} equals the row alone", .{ row, rows });
+    for ([_]u32{ 8, 6 }) |half_bits| { // 4-bit and 3-bit experts
+        for ([_]bool{ true, false }) |one| {
+            const s = try weights(&r, one, half_bits);
+            for ([_]usize{ 1, 3, 8 }) |rows| { // decode windows
+                const x = try r.bfs(rows * D, 1.0);
+                const pk = try picks(&r, rows);
+                const got = try run(&r, &k, &ek, s, x, pk, rows, false);
+                try expect(&r, if (one) "glm-exl3 decode, one rotation" else "glm-exl3 decode, a rotation an expert", got, s, x, pk);
+                if (rows > 1) { // every row's bits as alone
+                    const all = try r.back(got.ey, rows * slots * D * 4);
+                    for (0..rows) |row| {
+                        const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, false);
+                        const mine = try r.back(alone.ey, slots * D * 4);
+                        try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 decode: row {d} of {d} equals the row alone", .{ row, rows });
+                    }
                 }
             }
-        }
-        for ([_]usize{ 1, 40, 200, glm.exl3.chunk_rows + 6 }) |rows| { // prompt chunks, the last in two calls
-            const x = try r.bfs(rows * D, 1.0);
-            const pk = try picks(&r, rows);
-            const got = try run(&r, &k, &ek, s, x, pk, rows, true);
-            try expect(&r, if (one) "glm-exl3 prompt, one rotation" else "glm-exl3 prompt, a rotation an expert", got, s, x, pk);
-            if (rows > glm.exl3.chunk_rows) { // the rows either side of the calls' boundary keep their bits as alone
-                const all = try r.back(got.ey, rows * slots * D * 4);
-                for ([_]usize{ 0, glm.exl3.chunk_rows - 1, glm.exl3.chunk_rows, rows - 1 }) |row| {
-                    const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, true);
-                    const mine = try r.back(alone.ey, slots * D * 4);
-                    try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 prompt: row {d} of {d} equals the row alone", .{ row, rows });
+            for ([_]usize{ 1, 40, 200, glm.exl3.chunk_rows + 6 }) |rows| { // prompt chunks, the last in two calls
+                const x = try r.bfs(rows * D, 1.0);
+                const pk = try picks(&r, rows);
+                const got = try run(&r, &k, &ek, s, x, pk, rows, true);
+                try expect(&r, if (one) "glm-exl3 prompt, one rotation" else "glm-exl3 prompt, a rotation an expert", got, s, x, pk);
+                if (rows > glm.exl3.chunk_rows) { // the rows either side of the calls' boundary keep their bits as alone
+                    const all = try r.back(got.ey, rows * slots * D * 4);
+                    for ([_]usize{ 0, glm.exl3.chunk_rows - 1, glm.exl3.chunk_rows, rows - 1 }) |row| {
+                        const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, true);
+                        const mine = try r.back(alone.ey, slots * D * 4);
+                        try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 prompt: row {d} of {d} equals the row alone", .{ row, rows });
+                    }
                 }
             }
         }
