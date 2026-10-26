@@ -154,7 +154,7 @@ fn picksBytes(rows: usize) usize {
     const cap: usize = @min(rows, chunk_rows);
     return std.mem.alignForward(usize, cap * top_k * 4, 256);
 }
-/// `half_bits`: the layers' trellis width (2 * bits); only 4-bit layers take the fused prompt path.
+/// `half_bits`: the layers' trellis width (2 * bits); 4-bit and 3-bit layers take the fused prompt path.
 pub fn scratchBytes(rows: usize, dims: usize, width: usize, prefill: bool, shx: bool, half_bits: u32) [4]usize {
     const n: usize = @min(rows, chunk_rows);
     var l = shape(dims, width, half_bits);

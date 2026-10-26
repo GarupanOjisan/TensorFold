@@ -29,13 +29,14 @@ const Set = struct {
     suh_d: u64,
     svh_d: u64,
     k2: u64,
+    half_bits: u32, // 8: 4 bits, 6: 3 bits
     shx: bool,
     wg: []f64, // [E][D][N]
     wu: []f64,
     wd: []f64, // [E][N][D]
 
     fn experts(s: Set) glm.exl3.Experts {
-        return .{ .k2 = s.k2, .gt = s.gt, .ut = s.ut, .dt = s.dt, .suh_g = s.suh_g, .suh_u = s.suh_u, .svh_g = s.svh_g, .svh_u = s.svh_u, .suh_d = s.suh_d, .svh_d = s.svh_d, .shx = s.shx };
+        return .{ .k2 = s.k2, .gt = s.gt, .ut = s.ut, .dt = s.dt, .suh_g = s.suh_g, .suh_u = s.suh_u, .svh_g = s.svh_g, .svh_u = s.svh_u, .suh_d = s.suh_d, .svh_d = s.svh_d, .half_bits = s.half_bits, .shx = s.shx };
     }
 };
 
@@ -46,8 +47,8 @@ fn signs(r: *Rig, n: usize, scale: f16) ![]f16 {
 }
 
 /// `E` random K x N matrices: trellis words, suh (shared by every expert when `one`), svh; device copies and float64.
-fn matrices(r: *Rig, k: usize, n: usize, shared_suh: ?[]const f16, out_suh: *u64, out_svh: *u64, w: []f64) !u64 {
-    const words = k / 16 * (n / 16) * 64;
+fn matrices(r: *Rig, half_bits: u32, k: usize, n: usize, shared_suh: ?[]const f16, out_suh: *u64, out_svh: *u64, w: []f64) !u64 {
+    const words = k / 16 * (n / 16) * 8 * half_bits; // i16 words: a tile is 256 values of half_bits / 2 bits
     const tr = try r.a.alloc(i16, E * words);
     for (tr) |*v| v.* = r.rng.int(i16);
     const suh = try r.a.alloc(f16, E * k);
@@ -56,7 +57,7 @@ fn matrices(r: *Rig, k: usize, n: usize, shared_suh: ?[]const f16, out_suh: *u64
     for (0..E) |e| {
         if (shared_suh) |s| @memcpy(suh[e * k ..][0..k], s) else @memcpy(suh[e * k ..][0..k], try signs(r, k, 1.0));
         @memcpy(svh[e * n ..][0..n], try signs(r, n, 0.02));
-        fmt.dequantize(.{ .halves = 8 }, .mcg, tr[e * words ..][0..words], k / 16, n / 16, suh[e * k ..][0..k], svh[e * n ..][0..n], w[e * k * n ..][0 .. k * n], scratch);
+        fmt.dequantize(.{ .halves = @intCast(half_bits) }, .mcg, tr[e * words ..][0..words], k / 16, n / 16, suh[e * k ..][0..k], svh[e * n ..][0..n], w[e * k * n ..][0 .. k * n], scratch);
     }
     out_suh.* = try r.dev(std.mem.sliceAsBytes(suh));
     out_svh.* = try r.dev(std.mem.sliceAsBytes(svh));
@@ -66,18 +67,19 @@ fn matrices(r: *Rig, k: usize, n: usize, shared_suh: ?[]const f16, out_suh: *u64
     return r.dev(std.mem.sliceAsBytes(ptrs));
 }
 
-fn weights(r: *Rig, one: bool) !Set {
+fn weights(r: *Rig, one: bool, half_bits: u32) !Set {
     var s: Set = undefined;
     s.shx = one;
-    const k2: [E]i32 = @splat(8);
+    s.half_bits = half_bits;
+    const k2: [E]i32 = @splat(@intCast(half_bits));
     s.k2 = try r.dev(std.mem.sliceAsBytes(&k2));
     s.wg = try r.a.alloc(f64, E * D * N);
     s.wu = try r.a.alloc(f64, E * D * N);
     s.wd = try r.a.alloc(f64, E * N * D);
     const rot = if (one) try signs(r, D, 1.0) else null; // one input rotation for every gate and up
-    s.gt = try matrices(r, D, N, rot, &s.suh_g, &s.svh_g, s.wg);
-    s.ut = try matrices(r, D, N, rot, &s.suh_u, &s.svh_u, s.wu);
-    s.dt = try matrices(r, N, D, null, &s.suh_d, &s.svh_d, s.wd);
+    s.gt = try matrices(r, half_bits, D, N, rot, &s.suh_g, &s.svh_g, s.wg);
+    s.ut = try matrices(r, half_bits, D, N, rot, &s.suh_u, &s.svh_u, s.wu);
+    s.dt = try matrices(r, half_bits, N, D, null, &s.suh_d, &s.svh_d, s.wd);
     return s;
 }
 
@@ -111,7 +113,7 @@ fn run(r: *Rig, k: *const glm.exl3.Kernels, ek: *const glm.experts.Kernels, s: S
         .rank = try r.zeros((if (wide) P else 1) * 4),
         .hist = try r.zeros((if (wide) (P + 1023) / 1024 * E else 1) * 4),
     };
-    const sz = glm.exl3.scratchBytes(rows, D, N, prompt, s.shx, 8);
+    const sz = glm.exl3.scratchBytes(rows, D, N, prompt, s.shx, s.half_bits);
     const sc: glm.exl3.Scratch = .{ .picks = try r.zeros(sz[0]), .xg = try r.zeros(sz[1]), .xu = try r.zeros(sz[2]), .z = try r.zeros(sz[3]) };
     const ey = try r.zeros(rows * slots * D * 4);
     const xd = try r.zeros(P * N * 2);
@@ -202,39 +204,41 @@ pub fn run_(gpu: Gpu) !void {
     defer k.unload();
     var ek = try glm.experts.Kernels.load(gpu.d, pm, @intCast(try gpu.ctx.attribute(.multiprocessor_count)));
     defer ek.unload();
-    for ([_]bool{ true, false }) |one| {
-        const s = try weights(&r, one);
-        for ([_]usize{ 1, 3, 8 }) |rows| { // decode windows
-            const x = try r.bfs(rows * D, 1.0);
-            const pk = try picks(&r, rows);
-            const got = try run(&r, &k, &ek, s, x, pk, rows, false);
-            try expect(&r, if (one) "glm-exl3 decode, one rotation" else "glm-exl3 decode, a rotation an expert", got, s, x, pk);
-            if (rows > 1) { // every row's bits as alone
-                const all = try r.back(got.ey, rows * slots * D * 4);
-                for (0..rows) |row| {
-                    const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, false);
-                    const mine = try r.back(alone.ey, slots * D * 4);
-                    try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 decode: row {d} of {d} equals the row alone", .{ row, rows });
+    for ([_]u32{ 8, 6 }) |half_bits| { // 4-bit and 3-bit experts
+        for ([_]bool{ true, false }) |one| {
+            const s = try weights(&r, one, half_bits);
+            for ([_]usize{ 1, 3, 8 }) |rows| { // decode windows
+                const x = try r.bfs(rows * D, 1.0);
+                const pk = try picks(&r, rows);
+                const got = try run(&r, &k, &ek, s, x, pk, rows, false);
+                try expect(&r, if (one) "glm-exl3 decode, one rotation" else "glm-exl3 decode, a rotation an expert", got, s, x, pk);
+                if (rows > 1) { // every row's bits as alone
+                    const all = try r.back(got.ey, rows * slots * D * 4);
+                    for (0..rows) |row| {
+                        const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, false);
+                        const mine = try r.back(alone.ey, slots * D * 4);
+                        try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 decode: row {d} of {d} equals the row alone", .{ row, rows });
+                    }
                 }
             }
-        }
-        for ([_]usize{ 1, 40, 200, glm.exl3.chunk_rows + 6 }) |rows| { // prompt chunks, the last in two calls
-            const x = try r.bfs(rows * D, 1.0);
-            const pk = try picks(&r, rows);
-            const got = try run(&r, &k, &ek, s, x, pk, rows, true);
-            try expect(&r, if (one) "glm-exl3 prompt, one rotation" else "glm-exl3 prompt, a rotation an expert", got, s, x, pk);
-            if (rows > glm.exl3.chunk_rows) { // the rows either side of the calls' boundary keep their bits as alone
-                const all = try r.back(got.ey, rows * slots * D * 4);
-                for ([_]usize{ 0, glm.exl3.chunk_rows - 1, glm.exl3.chunk_rows, rows - 1 }) |row| {
-                    const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, true);
-                    const mine = try r.back(alone.ey, slots * D * 4);
-                    try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 prompt: row {d} of {d} equals the row alone", .{ row, rows });
+            for ([_]usize{ 1, 40, 200, glm.exl3.chunk_rows + 6 }) |rows| { // prompt chunks, the last in two calls
+                const x = try r.bfs(rows * D, 1.0);
+                const pk = try picks(&r, rows);
+                const got = try run(&r, &k, &ek, s, x, pk, rows, true);
+                try expect(&r, if (one) "glm-exl3 prompt, one rotation" else "glm-exl3 prompt, a rotation an expert", got, s, x, pk);
+                if (rows > glm.exl3.chunk_rows) { // the rows either side of the calls' boundary keep their bits as alone
+                    const all = try r.back(got.ey, rows * slots * D * 4);
+                    for ([_]usize{ 0, glm.exl3.chunk_rows - 1, glm.exl3.chunk_rows, rows - 1 }) |row| {
+                        const alone = try run(&r, &k, &ek, s, x[row * D ..][0..D], pk[row * slots ..][0..slots], 1, true);
+                        const mine = try r.back(alone.ey, slots * D * 4);
+                        try check.expect(std.mem.eql(u8, mine[0 .. (slots - 1) * D * 4], all[row * slots * D * 4 ..][0 .. (slots - 1) * D * 4]), "glm-exl3 prompt: row {d} of {d} equals the row alone", .{ row, rows });
+                    }
                 }
             }
         }
     }
     { // a NaN in one row's input: that row's routed slots NaN, every other row finite
-        const s = try weights(&r, true);
+        const s = try weights(&r, true, 8);
         const rows = 4;
         const x = try r.bfs(rows * D, 1.0);
         x[2 * D + 17] = 0x7fc0;
