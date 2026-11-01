@@ -591,8 +591,7 @@ pub const Lanes = struct {
 };
 
 comptime {
-    std.debug.assert(max_rows == fw.copy_rows);
-    std.debug.assert(dflash.BLOCK <= fw.window_rows); // DFlash's block stays on the head window
+    std.debug.assert(max_rows == fw.copy_rows and dflash.BLOCK <= fw.window_rows); // DFlash keeps the head window
 }
 
 /// Eligibility for the maintained fresh-prompt batching path.
