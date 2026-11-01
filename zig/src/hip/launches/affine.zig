@@ -285,11 +285,12 @@ pub const Kernels = struct {
         return k.reg.select(k.env(), .mlx, op, path, shape);
     }
 
-    /// The costs of the GPU's generation: RDNA2's, or the gfx11 ones (RDNA4 takes them for its dot2 tiles).
-    fn tableFor(caps: Caps) *const tuning.Table {
+    /// The costs of the GPU's generation: RDNA2's, the gfx11 ones for RDNA3 and RDNA3.5, RDNA4's own.
+    pub fn tableFor(caps: Caps) *const tuning.Table {
         return switch (caps.generation) {
             .rdna2 => &tuning.gfx1030,
-            .rdna3, .rdna3_5, .rdna4 => &tuning.gfx1100,
+            .rdna3, .rdna3_5 => &tuning.gfx1100,
+            .rdna4 => &tuning.gfx1201,
         };
     }
 
@@ -464,9 +465,11 @@ pub const Kernels = struct {
     // ---- the entry points ----
 
     /// Prefill's tile, same bits however a prompt is cut: matrix on gfx11 unless off, else dot2 GEMM; few rows K-split.
-    pub fn prefillLaunch(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream, items: c_int) Error!void {
+    pub fn prefillLaunch(k: *const Kernels, r: *const runtime.Runtime, a: Arg, s: abi.Stream, items: c_int, pairs: c_int) Error!void {
         const op: registry.Op = if (a.route.items != 0) .routed else .project;
-        const e = k.choose(op, .prefill, shapeOf(a, items)) orelse return refuse("prefill shape");
+        var shape = shapeOf(a, items);
+        shape.plan_pairs = @intCast(@max(pairs, 0));
+        const e = k.choose(op, .prefill, shape) orelse return refuse("prefill shape");
         try e.launch(k, .{ .r = r, .s = s, .arg = a, .items = items });
     }
 

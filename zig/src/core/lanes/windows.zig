@@ -32,6 +32,7 @@ pub const Plan = struct {
     cost_probe_rows: ?u32 = null, // an unseen width selected for calibration, confirmed by a matching completed round
     context_copy: bool = false, // branch_from names a copied continuation appended to the head
     copy_trusted: bool = true, // the copy is priced from cfg.copy_rate's prior (trustedCopy), else from short_rate's
+    deferred_copy: []const u32 = &.{}, // a full priced head may free room for this continuation
     tried: bool = false, // the planner read the head's chain back to graft branches
     lanes: ?*const shape.Shape = null, // the held drafts' tree shape (each lane's depth and rank)
     masks: []const u32 = &.{}, // structured output: the rows' allowed-token bits (constrain)
@@ -99,7 +100,10 @@ pub fn plan(e: *Engine, s: *Stream, copied: ?Copy) !Plan {
                 }
             }
             if (p.count() > 0) p.kind = .head;
-            if (extend and copy.tokens.len > 0) try @import("context_copy.zig").extend(e, &p, copy.tokens);
+            if (extend and copy.tokens.len > 0) {
+                try @import("context_copy.zig").extend(e, &p, copy.tokens);
+                if (!p.context_copy and e.cfg.node_probabilities) p.deferred_copy = try a.dupe(u32, copy.tokens);
+            }
             if (p.context_copy) p.copy_trusted = trustedCopy(s);
         }
     }
@@ -248,7 +252,8 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
             pr.* = &.{};
         } else if (p.kind == .copy) {
             fx.* = 1;
-            pr.* = try alloc.chainProbabilities(a, &.{e.cfg.copy_rate}, n);
+            const rate = if (e.cfg.own_copy_rates) copiedRate(e, p.stream, p.recalled) else e.cfg.copy_rate;
+            pr.* = try alloc.chainProbabilities(a, &.{rate}, n);
         } else {
             fx.* = 1;
             const chances = try planChances(e, p, n);
@@ -256,6 +261,15 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
             pr.* = if (p.kind == .head and e.cfg.draft_confidence != null) chances[0..controls.prefix(chances)] else chances;
         }
     }
+    if (e.cfg.allocate_shared_drafts) for (plans, probs) |p, chances| {
+        if (p.kind == .copy or p.context_copy) {
+            p.stream.draft_chances.clearRetainingCapacity();
+            continue;
+        }
+        if (p.kind != .head or chances.len == 0) continue;
+        p.stream.draft_chances.clearRetainingCapacity();
+        try p.stream.draft_chances.appendSlice(e.gpa, chances);
+    };
     const untimed: @import("table.zig").Table = .{};
     const explicit = e.cfg.draft_confidence != null;
     const live = plans.len == 1 and lone_costs.enabled(e, plans[0]);
@@ -285,6 +299,17 @@ pub fn allocate(e: *Engine, plans: []Plan) !void {
         if (p.kind == .head) p.stream.granted = c;
         if (p.kind == .forced or p.count() == 0 or c == p.count()) continue;
         try cut.prefix(a, p, c);
+    }
+    if (plans.len == 1 and plans[0].deferred_copy.len > 0) {
+        const p = &plans[0];
+        const copy = p.deferred_copy;
+        p.deferred_copy = &.{};
+        const before = p.count();
+        if (before > 0) try @import("context_copy.zig").extend(e, p, copy);
+        if (p.context_copy) {
+            p.copy_trusted = trustedCopy(p.stream);
+            return allocate(e, plans);
+        }
     }
     const rows = try a.alloc(Value, plans.len);
     for (rows, plans) |*r, p| {
@@ -360,6 +385,31 @@ pub fn observeCopy(e: *const Engine, s: *Stream, trusted: bool, kept: u64, offer
         s.copy_landed[i] = copy_decay * s.copy_landed[i] + @as(f64, @floatFromInt(kept));
         s.copy_broke[i] = copy_decay * s.copy_broke[i] + @as(f64, @floatFromInt(@intFromBool(kept < offered)));
     }
+}
+
+/// A copy window's history weighs this many rows of cfg.copy_rate's prior before the stream's own copies teach it.
+const copied_prior = 4;
+
+/// A copy window's row landing rate for this stream and source: landed rows over those plus breaks, decayed a copy.
+pub fn copiedRate(e: *const Engine, s: *Stream, recalled: bool) f64 {
+    const i = @intFromBool(recalled);
+    if (s.copied_landed[i] < 0) {
+        s.copied_landed[i] = copied_prior * e.cfg.copy_rate;
+        s.copied_broke[i] = copied_prior * (1 - e.cfg.copy_rate);
+    }
+    return s.copied_landed[i] / (s.copied_landed[i] + s.copied_broke[i]);
+}
+
+/// A verified copy window of `offered` rows, `kept` landing: its source's counters, then its own rate's history.
+pub fn observeCopied(e: *const Engine, s: *Stream, recalled: bool, kept: usize, offered: usize) void {
+    if (recalled) {
+        if (s.recall) |r| r.observe(@intCast(offered), @intCast(kept), s.rounds);
+    } else if (s.proposer) |pr| pr.observe(@intCast(offered), @intCast(kept));
+    if (!e.cfg.own_copy_rates) return;
+    _ = copiedRate(e, s, recalled);
+    const i = @intFromBool(recalled);
+    s.copied_landed[i] = copy_decay * s.copied_landed[i] + @as(f64, @floatFromInt(kept));
+    s.copied_broke[i] = copy_decay * s.copied_broke[i] + @as(f64, @floatFromInt(@intFromBool(kept < offered)));
 }
 
 /// A context copy's appended rows: each its parent's chance times the stream's copy rate; the drafts keep their own.

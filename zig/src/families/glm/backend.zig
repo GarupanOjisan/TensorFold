@@ -93,10 +93,10 @@ pub const Backend = struct {
     }
 
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
-        while (!try prefillStep(ptr, s)) {}
+        while (!try prefillStep(ptr, s, 0)) {}
     }
-    fn prefillStep(ptr: *anyopaque, s: *Stream) anyerror!bool {
-        return prompt_fill.step(self(ptr), s);
+    fn prefillStep(ptr: *anyopaque, s: *Stream, _: u32) anyerror!bool {
+        return prompt_fill.step(self(ptr), s, 0);
     }
 
     pub fn beginPrompt(b: *Backend, s: *Stream) !prompt_fill.State {
@@ -110,17 +110,18 @@ pub const Backend = struct {
         const i = b.sl.pick(reuse) orelse return error.NoFreeSlot;
         try b.by.put(b.gpa, s, i);
         errdefer release(b, s);
-        try pool.reserve(b.sl, i, need(prompt.len, s.max_new), reuse); // pooled: its share (admission checked it fits)
+        // Admission can precede other fills' reservations; temporary exhaustion waits for a lane to finish.
+        pool.reserve(b.sl, i, need(prompt.len, s.max_new), reuse) catch |err| return switch (err) {
+            error.PoolFull => error.LaneMemory,
+            else => err,
+        };
         b.words.clearRetainingCapacity();
         try b.words.appendSlice(b.gpa, &.{ i, @intFromBool(s.drafts) });
         try b.words.appendSlice(b.gpa, prompt);
         try mirror.send(e, .begin, b.words.items);
         try b.sl.begin(i, prompt, s.drafts);
         s.cached = 0;
-        if (s.images.len > 0) { // the images through the tower first: the chunks inject their rows
-            if (e.ep != null) return error.VisionOnPair;
-            try @import("prompt_images.zig").prepare(b, s, i);
-        }
+        if (s.images.len > 0 and e.ep != null) return error.VisionOnPair;
         var at: u32 = 0;
         if (s.reuse.saved) |saved| { // a kept state of this prompt's prefix: the pass starts there
             const snap: *snapshot.Snap = @ptrCast(@alignCast(saved));
@@ -137,6 +138,8 @@ pub const Backend = struct {
                 s.reuse_error = if (snap.at >= prompt.len) error.SnapshotNotPrefix else if (snap.stale) error.SnapshotStale else error.SnapshotMissing;
             }
         }
+        // the images the restored state does not hold through the tower: the chunks inject their rows
+        if (s.images.len > 0) try @import("prompt_images.zig").prepare(b, s, i);
         s.fill_at.store(at, .monotonic);
         return .{ .stream = s, .slot = i, .at = at };
     }
