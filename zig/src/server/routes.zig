@@ -21,6 +21,7 @@ const imprint = @import("imprint_routes.zig");
 const slide_forget = @import("slide_forget.zig");
 const Server = @import("server.zig").Server;
 const idle_unload = @import("idle_unload.zig");
+const admission = @import("request_admission.zig");
 const log = @import("log.zig");
 const Conn = http_conn.Conn;
 const Allocator = std.mem.Allocator;
@@ -83,6 +84,7 @@ fn get(srv: *Server, conn: *Conn, a: Allocator) void {
         return memory.get(srv, conn, a) catch {};
     if (responses.route(route)) |rid| if (rid.len > 0) return responses.get(srv, conn, a, rid);
     if (std.mem.eql(u8, route, "/metrics") or std.mem.eql(u8, route, "/v1/metrics")) return status.metrics(srv, conn, a);
+    if (std.mem.eql(u8, route, "/v1/load")) return @import("load_metrics.zig").get(srv, conn, a);
     if (std.mem.eql(u8, route, "/dashboard")) return status.dashboard(srv, conn, a);
     if (std.mem.eql(u8, route, "/stats")) return status.stats(srv, conn, a);
     if (std.mem.eql(u8, route, "/slide")) return slide.view(srv, conn, a);
@@ -119,6 +121,9 @@ fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     // counted before the drain flag is read: a stop that sees no request in progress sees every later one refused
     _ = srv.generating.fetchAdd(1, .seq_cst);
     defer _ = srv.generating.fetchSub(1, .seq_cst);
+    const group: api.load_ledger.RouteGroup = if (is_chat) .chat_completions else if (is_responses) .responses else if (is_anthropic) .messages else if (is_embedding) .embeddings else if (is_speech) .speech else if (std.mem.endsWith(u8, route, "/completions")) .completions else .other;
+    srv.load.enter(group);
+    defer srv.load.leave(group);
     if (srv.idle_manager) |m| m.begin(); // engine work starts: the idle window restarts at this route's end
     defer if (srv.idle_manager) |m| m.end();
     if (@import("builtin").is_test) if (counted_hook) |h| h();
@@ -126,6 +131,13 @@ fn post(srv: *Server, conn: *Conn, a: Allocator) void {
         discardBody(conn, a);
         return draining(conn, is_anthropic);
     }
+    // --max-inflight and the rest, when set: a reservation for the whole reply, taken before the body is read
+    var lease: ?admission.Lease = null;
+    if (srv.config.admission.enabled()) switch (srv.admission.acquire(srv.io, srv.config.admission, conn.key_digest)) {
+        .accepted => |held| lease = held,
+        .rejected => |refusal| return overloaded(conn, is_anthropic, refusal),
+    };
+    defer if (lease) |*held| held.release();
     if (srv.info.embeddings != null and (is_speech or is_anthropic or is_responses or is_decisions or is_systemone or is_chat or std.mem.endsWith(u8, route, "/completions"))) {
         discardBody(conn, a);
         conn.sendJson(400, "{\"error\":{\"message\":\"this model produces embeddings; use POST /v1/embeddings\",\"type\":\"invalid_request_error\"}}");
@@ -154,6 +166,24 @@ fn post(srv: *Server, conn: *Conn, a: Allocator) void {
     if (is_anthropic) return anthropic.post(srv, conn, a);
     if (is_responses) return responses.post(srv, conn, a);
     openai.post(srv, conn, a, is_chat);
+}
+
+/// 429 with Retry-After in the API's own error shape; the unread body is left behind with the connection.
+fn overloaded(conn: *Conn, anthropic_shape: bool, refusal: admission.Refusal) void {
+    var buf: [320]u8 = undefined;
+    const body = (if (anthropic_shape)
+        std.fmt.bufPrint(&buf, "{{\"type\": \"error\", \"error\": {{\"type\": \"rate_limit_error\", \"message\": \"{s}\"}}}}", .{admission.message(refusal.reason)})
+    else
+        std.fmt.bufPrint(&buf, "{{\"error\": {{\"message\": \"{s}\", \"type\": \"rate_limit_error\", \"param\": null, \"code\": \"{s}\"}}}}", .{ admission.message(refusal.reason), admission.code(refusal.reason) })) catch unreachable;
+    conn.close = true;
+    conn.startResponse(429, null) catch return;
+    conn.addHeader("Content-Type", "application/json") catch return;
+    var retry: [16]u8 = undefined;
+    conn.addHeader("Retry-After", std.fmt.bufPrint(&retry, "{d}", .{refusal.retry_after_s}) catch unreachable) catch return;
+    var len: [24]u8 = undefined;
+    conn.addHeader("Content-Length", std.fmt.bufPrint(&len, "{d}", .{body.len}) catch unreachable) catch return;
+    conn.addHeader("Connection", "close") catch return;
+    conn.finish(body) catch {};
 }
 
 /// Tests only: the gap between a request's count and its drain check, where a stop must still see it counted.

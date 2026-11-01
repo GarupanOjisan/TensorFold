@@ -14,6 +14,11 @@ pub const SpeechRequest = struct {
     top_k: u32 = 30,
     /// Publishes decoded prefixes; whole replies also decode incrementally when a speech guard is enabled.
     stream: bool = false,
+    /// End of the invariant reference prompt, excluding request text; 0 disables reuse; backend saves no lookahead row.
+    reference_rows: u32 = 0,
+    /// Plain text frame rows for reference-conditioned semantic CFG; empty means no guidance.
+    unconditioned: []const [11]i32 = &.{},
+    cfg_gamma: f32 = 1,
 };
 
 pub const SpeechInfo = struct {

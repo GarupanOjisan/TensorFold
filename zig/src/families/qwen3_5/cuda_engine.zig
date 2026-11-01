@@ -10,6 +10,8 @@ const routed = @import("cuda_routed.zig");
 const hooks = @import("cuda_learn_hooks.zig");
 const pocket = @import("cuda_pocket.zig");
 const profile = @import("cuda_startup_profile.zig");
+const modelopt = @import("cuda_modelopt.zig");
+const x3w = @import("cuda_exl3_weights.zig");
 pub const recurrent = @import("cuda_recurrent.zig");
 
 pub const Geometry = geometry.Geometry;
@@ -79,6 +81,8 @@ pub const Engine = struct {
     stream: cuda.Stream,
     mods: [19]cuda.Module,
     kv8: bool, // attention caches as e4m3 rows with a scale each
+    rope_table: u64 = 0, // YaRN's attention factor and 32 frequencies on the device (cuda_rope.zig); 0: plain rope
+    rope_buf: ?cuda.DeviceBuffer = null, // the table's buffer (cuda_rope_table.zig)
     fp8: Kv8,
     prompt_attn: @import("cuda_prompt.zig").Fns, // a prompt chunk's attention tiles and delta-rule chain
     int8: @import("cuda_prompt_int8.zig").State = .{}, // prompt projections with int8 activations, when on
@@ -87,6 +91,7 @@ pub const Engine = struct {
     wide: cuda.qlinear.AffineNKernels, // the tiles of every width but 4, and their packs
     experts: cuda.experts.Affine4Experts,
     experts3: cuda.experts3.Affine3Experts,
+    mo: ?modelopt.Kernels = null, // a ModelOpt checkpoint's lane, prompt GEMM, packers and bf16 rows
     plan: cuda.grouped.Router,
     moe: cuda.moe.Fns,
     fns: Fns,
@@ -101,7 +106,8 @@ pub const Engine = struct {
     embed_w: u64,
     embed_s: u64,
     embed_b: u64,
-    embed_bits: u8, // the embedding's rows' width: 4 or 8
+    embed_bits: u8, // the embedding's rows' width: 4 or 8 (16: bf16 rows, an EXL3 checkpoint's)
+    kit: ?*x3w.Kit = null, // an EXL3 checkpoint's kernels (g.exl3)
     head: Proj,
     final_norm: u64,
     layers: []Layer,
@@ -142,6 +148,8 @@ pub const Engine = struct {
     host_logits: cuda.HostBuffer,
     /// The kept rows' device draws, when forward was given them.
     tokens: [most_verify]u32 = undefined,
+    /// presence and frequency penalties the next forward takes from its kept rows' logits (staged by the caller).
+    penalties: @import("cuda_penalties.zig").Rows = .{},
     /// The captured forwards by shape (`Shape.key`): the launches from the embedding to the head.
     graphs: std.AutoHashMapUnmanaged(u32, cuda.graph.Exec) = .empty,
     /// A drafter's tapped layers (`setTaps`): each row's residual after them lands in its stream's tap ring.
@@ -179,20 +187,30 @@ pub const Engine = struct {
         e.learning = null;
         e.mlp = null;
         e.taught = 0;
+        e.kit = null;
         e.d = d;
         e.g = g;
         e.geo = .{ .hid = @intCast(g.hidden), .nk = @intCast(g.k_heads), .nv = @intCast(g.v_heads), .qh = @intCast(g.q_heads), .kvh = @intCast(g.kv_heads), .nl = @intCast(g.deltas()) };
         e.verify_rows = most_verify;
         e.kv8 = kv8;
+        e.rope_table = 0; // plain rope until cuda_rope.zig uploads a YaRN table (the engine starts undefined)
+        e.rope_buf = null;
         e.window_rows = most_window;
         e.arena_at = 0;
         e.graphs = .empty;
+        try @import("cuda_rope_table.zig").set(e, g.rope); // a YaRN config's table, before any weight or forward
+        errdefer @import("cuda_rope_table.zig").free(e);
+        e.penalties = .{};
         e.rec_scratch = recurrent.Pool.init(gpa, @intFromPtr(e));
         e.n_taps = 0;
         e.features = 0;
         e.stream = try cuda.Stream.init(d, true);
         errdefer e.stream.deinit();
-        e.arena = try DeviceBuffer.alloc(d, weights.total(g) + try e.scratch(.measure));
+        var ck = try core.Checkpoint.openModel(gpa, io, dir);
+        defer ck.close();
+        // an EXL3 checkpoint's weights are sized by a dry run of its loader (trellis widths come from the tensors)
+        const wbytes = if (g.exl3) try x3w.measure(e, &ck) else weights.total(g);
+        e.arena = try DeviceBuffer.alloc(d, wbytes + try e.scratch(.measure));
         errdefer e.arena.free();
         try e.arena.fill8(0, null); // touched once now: the driver commits memory on first touch, slowly
         const kk = cuda.kernels;
@@ -222,33 +240,36 @@ pub const Engine = struct {
         inline for (@typeInfo(Fns).@"struct".field_names) |name| @field(e.fns, name) = try e.mods[4].function("tf_q35_" ++ name);
         try e.fns.attn_partial.allowDynamicShared(@import("cuda_forward.zig").attn_tiles); // bf16 tiles' two buffers
         try e.fns.attn_rows.allowDynamicShared(@import("cuda_forward.zig").attn_tiles);
+        try e.fns.attn_partial_whole.allowDynamicShared(@import("cuda_forward.zig").attn_tiles);
+        try e.fns.attn_rows_whole.allowDynamicShared(@import("cuda_forward.zig").attn_tiles);
         inline for (@typeInfo(Keeps).@"struct".field_names) |name| @field(e.keeps, name) = try e.mods[6].function("tf_q35k_" ++ name);
         e.prompt_attn = try @import("cuda_prompt.zig").resolve(e.mods[16], e.mods[17]);
         try e.int8.resolve(e.mods[18]);
-        e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .attn_rows = try e.mods[9].function("tf_q35_attn_rows8"), .compact = try e.mods[9].function("tf_q35k_compact8") };
+        e.fp8 = .{ .rope = try e.mods[9].function("tf_q35_rope8"), .attn_partial = try e.mods[9].function("tf_q35_attn_partial8"), .attn_rows = try e.mods[9].function("tf_q35_attn_rows8"), .attn_partial8_whole = try e.mods[9].function("tf_q35_attn_partial8_whole"), .attn_rows8_whole = try e.mods[9].function("tf_q35_attn_rows8_whole"), .compact = try e.mods[9].function("tf_q35k_compact8") };
+        e.mo = if (g.kinds.modelopt) try modelopt.Kernels.load(d, @intCast(10 * major + minor), sms, g.moe()) else null;
+        errdefer if (e.mo) |*m| m.unload();
         e.layers = try gpa.alloc(Layer, g.layers);
         errdefer gpa.free(e.layers);
-        var ck = try core.Checkpoint.openModel(gpa, io, dir);
-        defer ck.close();
-        {
+        if (g.exl3) {
+            e.kit = try x3w.Kit.init(gpa, d, g);
+            errdefer e.kit.?.deinit(gpa);
+            try x3w.load(e, &ck);
+        } else {
             // each projection as stored, packed from here; freed before the server counts what streams can use
             var stage = try DeviceBuffer.alloc(d, weights.stageBytes(g));
             defer stage.free();
             try weights.load(e, &ck, &stage);
         }
-        _ = try e.scratch(.allocate);
-        e.tables = try DeviceBuffer.alloc(d, tables_len);
-        errdefer e.tables.free();
-        e.staged = try cuda.HostBuffer.alloc(d, tables_len);
-        errdefer e.staged.free();
-        e.host_logits = try cuda.HostBuffer.alloc(d, most_verify * g.vocab * 2);
-        errdefer e.host_logits.free();
-        try e.stream.synchronize();
+        if (e.mo) |*m| try m.reserveParts(e);
+        try @import("cuda_engine_tail.zig").finish(e, io, started);
+        return e;
+    }
+
+    pub fn finishWarm(e: *Engine, io: std.Io, started: i96) !void {
         const warm_start = profile.now(io);
         e.startup = .{ .load = warm_start - started };
         errdefer recurrent.shutdown(e);
-        e.startup.add(try profile.withCache(gpa, io, e, Cache));
-        return e;
+        e.startup.add(try profile.withCache(e.gpa, io, e, Cache));
     }
 
     /// Every path a request takes, run once now: WDDM stalls a process's first forwards for seconds (a 20 s launch).
@@ -267,10 +288,13 @@ pub const Engine = struct {
 
     pub fn deinit(e: *Engine) void {
         recurrent.shutdown(e);
+        @import("cuda_rope_table.zig").free(e);
+        if (e.kit) |k| k.deinit(e.gpa);
         e.pockets.deinit();
         var it = e.graphs.valueIterator();
         while (it.next()) |x| x.deinit();
         e.graphs.deinit(e.gpa);
+        e.penalties.deinit(e.gpa);
         e.host_logits.free();
         e.staged.free();
         e.tables.free();
@@ -280,6 +304,7 @@ pub const Engine = struct {
         e.affine.deinit();
         e.wide.deinit();
         e.int8.deinit();
+        if (e.mo) |*m| m.unload();
         for (&e.mods) |*m| m.unload();
         e.stream.deinit();
         e.gpa.destroy(e);
@@ -312,7 +337,7 @@ pub const Engine = struct {
     }
 
     /// The scratch rows' bytes (`measure`: summed, nothing taken), or the rows themselves from the arena.
-    fn scratch(e: *Engine, mode: enum { measure, allocate }) !usize {
+    pub fn scratch(e: *Engine, mode: enum { measure, allocate }) !usize {
         var total: usize = 0;
         const Take = struct {
             e: *Engine,
@@ -361,12 +386,15 @@ pub const Engine = struct {
     pub const projSums = @import("cuda_projection.zig").projSums;
     pub const projAgain = @import("cuda_projection.zig").projAgain;
     pub const projMany = @import("cuda_projection.zig").projMany;
+    pub const projManyPrompt = @import("cuda_projection.zig").projManyPrompt;
     pub const projManySums = @import("cuda_projection.zig").projManySums;
     pub const projectMany = @import("cuda_projection.zig").projectMany;
     pub const project = @import("cuda_projection.zig").project;
 
     /// Token rows of the embedding into `out` (rows, hidden) bf16, at the width its words are served.
     pub fn embed(e: *Engine, ids: u64, out: u64, rows: usize, params: u64) !void {
+        if (e.kit) |kit| return kit.b16.embedRows(e.stream, ids, e.embed_w, out, rows, e.g.hidden, params);
+        if (e.embed_bits == 16) return modelopt.embed(e, ids, out, rows); // bf16 rows; padding rows' ids are zeroed
         const f = if (e.embed_bits == 8) e.fns.embed8 else e.fns.embed;
         try e.run(f, .{ rows, 1, 1 }, .{ 256, 1, 1 }, .{ ids, e.embed_w, e.embed_s, e.embed_b, out, @as(c_int, @intCast(e.g.hidden)), params });
     }
@@ -421,6 +449,7 @@ pub const Engine = struct {
         // the tables
         const st = e.staged.bytes;
         @memcpy(std.mem.bytesAsSlice(u32, st[ids_at..][0 .. total * 4]), ids);
+        @memset(st[ids_at + total * 4 .. ids_at + max_rows * 4], 0); // a bucket's padding rows read token 0
         const segs = std.mem.bytesAsSlice(Seg, st[segs_at..][0 .. parts.len * @sizeOf(Seg)]);
         const slot_peak = try Round.build(st, parts, record);
         for (parts) |p| {
@@ -464,6 +493,7 @@ pub const Engine = struct {
             if (p.rows == 1) try recurrent.mark(p.cache, true);
         };
         shape.hidden = keep == .hidden;
+        shape.paged = @import("cuda_attention.zig").hasPages(segs);
         if (e.learning != null or e.pockets.any()) {
             var exact = shape;
             exact.total = @intCast(total);
@@ -494,6 +524,7 @@ pub const Engine = struct {
             try gop.value_ptr.launchOn(e.stream);
         }
         for (parts) |p| p.cache.advanced(p.rows, record);
+        if (keep == .draws or keep == .logits) try e.penalties.apply(e.d, &e.draws, e.stream, e.logits, g.vocab) else e.penalties.clear();
         switch (keep) {
             .hidden => try e.stream.synchronize(), // mapped layer inputs are ready before the learner reads them
             .draws => |pk| {

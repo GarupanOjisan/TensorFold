@@ -21,12 +21,14 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .{ "gemm128", "zig/kernels/xpu/qwen27/gemm.cl", " -DGSZ=128" },
         .{ "gdn", "zig/kernels/xpu/qwen27/gdn_chunk.cl", "" },
         .{ "drafter", "zig/kernels/xpu/qwen27/drafter.cl", "" },
+        .{ "glue_g4s", "zig/kernels/xpu/gemma4/glue_g4.cl", "" },
+        .{ "glue_g4g", "zig/kernels/xpu/gemma4/glue_g4.cl", " -DHD=512" },
     }) |k| {
         const c = b.addSystemCommand(&.{ ocloc, "compile", "-q", "-file" });
         c.addFileArg(b.path(k[1]));
         c.addArgs(&.{ "-device", device, "-options", b.fmt("{s}{s} -I zig/kernels/xpu/qwen27", .{ opts, k[2] }), "-output_no_suffix", "-output", k[0], "-out_dir" });
         c.setCwd(b.path("."));
-        for ([_][]const u8{ "glue_attn.cl", "glue_quant.cl" }) |part| c.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
+        for ([_][]const u8{ "glue.cl", "glue_attn.cl", "glue_quant.cl" }) |part| c.addFileInput(b.path(b.fmt("zig/kernels/xpu/qwen27/{s}", .{part})));
         const dir = c.addOutputDirectoryArg(b.fmt("ocloc-{s}", .{k[0]}));
         _ = files.addCopyFile(dir.path(b, b.fmt("{s}.bin", .{k[0]})), b.fmt("{s}.bin", .{k[0]}));
     }
@@ -71,7 +73,26 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         \\pub const ngen_a4 align(8) = @embedFile("ngen_a4.zebin").*;
         \\
     ) });
+    // Gemma 4 E4B: its glue, and the Qwen GEMMs (same files, same bits)
+    const embedded_g4 = b.createModule(.{ .root_source_file = files.add("xpu_gemma4_kernels.zig",
+        \\pub const glue align(8) = @embedFile("glue_g4s.bin").*; // head 256: the sliding layers
+        \\pub const glue_g align(8) = @embedFile("glue_g4g.bin").*; // head 512: the global layers
+        \\pub const gemm align(8) = @embedFile("gemm.bin").*;
+        \\pub const ngen_wide align(8) = @embedFile("ngen_wide.zebin").*;
+        \\pub const ngen_narrow align(8) = @embedFile("ngen_narrow.zebin").*;
+        \\
+    ) });
     const ze_mod = zeModule(b, target, optimize);
+    // the Gemma 4 family config reads MLX widths and bf16 rounding from `core` by name (cuda_config.zig and its twins)
+    const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
+    {
+        const g4 = b.createModule(.{ .root_source_file = b.path("zig/src/families/gemma4/xpu_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
+        g4.addImport("xpu_gemma4_kernels", embedded_g4);
+        g4.addImport("core", core);
+        g4.addImport("ze", ze_mod);
+        const g4_exe = b.addExecutable(.{ .name = "xpu-gemma4", .root_module = g4 });
+        b.step("xpu-gemma4", "Build the Gemma 4 E4B XPU runner (needs ocloc, a C++17 compiler and nGEN headers)").dependOn(&b.addInstallArtifact(g4_exe, .{}).step);
+    }
     const module = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27_main.zig"), .target = target, .optimize = optimize, .link_libc = true });
     module.addImport("xpu_qwen27_kernels", embedded);
     // the FP64 references of the weight formats (core/quant), for XPU_FP64_REF and XPU_FIDELITY
@@ -108,10 +129,13 @@ pub fn steps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const nem = nemotronModules(b, target, optimize, ocloc, device, ze_mod, lanes);
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
-    const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "xpu_qwen27", .module = qwen27 }, .{ .name = "lanes", .module = lanes }, .{ .name = "xpu", .module = nem.xpu }, .{ .name = "nemotron_xpu", .module = nem.nemotron } } });
+    const gemma4 = b.createModule(.{ .root_source_file = b.path("zig/src/families/gemma4/xpu_engine.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    gemma4.addImport("xpu_gemma4_kernels", embedded_g4);
+    gemma4.addImport("core", core);
+    gemma4.addImport("ze", ze_mod);
+    const engines = b.createModule(.{ .root_source_file = b.path("zig/src/native/xpu.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "engine_api", .module = api }, .{ .name = "xpu_qwen27", .module = qwen27 }, .{ .name = "lanes", .module = lanes }, .{ .name = "xpu", .module = nem.xpu }, .{ .name = "nemotron_xpu", .module = nem.nemotron }, .{ .name = "gemma4_xpu", .module = gemma4 } } });
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const template = b.createModule(.{ .root_source_file = b.path("zig/src/core/template/template.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
-    const core = b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true });
     const checkpoint_cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cli.zig"), .target = target, .optimize = .ReleaseSafe, .link_libc = true, .imports = &.{ .{ .name = "native_engines", .module = engines }, exlr8_build.cliImport(b, target, .ReleaseSafe, core), .{ .name = "core", .module = core } } });
     const server = b.addExecutable(.{ .name = "tensorfold-native", .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/server/main.zig"),
@@ -237,5 +261,17 @@ pub fn hostTests(b: *std.Build, step: *std.Build.Step) void {
     const xpu = runtime(b, host, .debug, &.{}, zeModule(b, host, .debug));
     const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = host, .optimize = .debug, .link_libc = true });
     const mods = family(b, host, .debug, xpu, lanes);
+    const ze = xpu.import_table.get("ze").?;
+    const empty = b.createModule(.{ .root_source_file = b.addWriteFiles().add("draft_xpu_images.zig", "") });
+    const qwen = b.createModule(.{ .root_source_file = b.path("zig/src/xpu/qwen27.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "ze", .module = ze }, .{ .name = "xpu_qwen27_kernels", .module = empty } } });
+    const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const sources = b.createModule(.{ .root_source_file = b.path("zig/src/native/draft_sources_xpu_test.zig"), .target = host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "engine_api", .module = api }, .{ .name = "xpu", .module = xpu }, .{ .name = "xpu_qwen27", .module = qwen }, .{ .name = "nemotron_xpu", .module = mods.nemotron } } });
+    const source_tests = b.addRunArtifact(b.addTest(.{ .root_module = sources, .filters = &.{"draft sources:"} }));
+    b.step("test-draft-xpu-host", "XPU draft source metadata without devices or kernel compilation").dependOn(&source_tests.step);
+    step.dependOn(&source_tests.step);
     for ([_]*std.Build.Module{ xpu, mods.nemotron, cliModule(b, host, .debug, xpu, mods), zeModule(b, host, .debug) }) |m| step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = m })).step);
+    // the Gemma 4 E4B runner's admission, over the family config (which takes `core` by name)
+    const gemma4 = b.createModule(.{ .root_source_file = b.path("zig/src/families/gemma4/xpu_config.zig"), .target = host, .optimize = .debug });
+    gemma4.addImport("core", b.createModule(.{ .root_source_file = b.path("zig/src/core/root.zig"), .target = host, .optimize = .debug, .link_libc = true }));
+    step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = gemma4 })).step);
 }

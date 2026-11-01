@@ -146,25 +146,44 @@ fn narrow(contexts: []const *draft.Ctx) bool {
     return true;
 }
 
+/// An EXL3 head's tail view: the last wide_blocks blocks (from row 240,128), so it plans as the whole head does.
+pub const x3_tail_at = spans[1][1] - cuda.exl3.wide_blocks * 128;
+
+/// An EXL3 head's first span and the blocks holding its tail span, as views that keep the whole head's bits.
+pub fn x3Views(q: cuda.exl3.Weight) !struct { first: cuda.exl3.Weight, tail: cuda.exl3.Weight } {
+    return .{ .first = try q.columns(0, spans[0][1]), .tail = try q.columns(x3_tail_at, spans[1][1] - x3_tail_at) };
+}
+
 /// The rows' draft logits over the spans' columns, packed in d.logits after the two projections (null: not this head).
 fn head(d: anytype, rows: usize) !?u64 {
     const e = d.e;
-    const q = switch (e.head) {
-        .a4 => |q| q,
-        .an => return full(d, rows),
+    // the head's first span and the whole tiles holding its tail span, as views of the stored matrix
+    const first: layers.Proj, const tail: layers.Proj, const tail_at: usize = switch (e.head) {
+        .a4 => |q| blk: {
+            if (q.n != spans[1][1] or q.k % 64 != 0) return full(d, rows);
+            break :blk .{
+                .{ .a4 = .{ .w = q.w, .s = q.s, .b = q.b, .n = spans[0][1], .k = q.k, .npad = q.npad } },
+                .{ .a4 = .{ .w = q.w + tail_tile * q.k / 2, .s = q.s + tail_tile * 2, .b = q.b + tail_tile * 2, .n = q.n - tail_tile, .k = q.k, .npad = q.npad } },
+                tail_tile,
+            };
+        },
+        .x3 => |q| blk: {
+            if (q.n != spans[1][1] or q.k % 128 != 0) return full(d, rows);
+            const v = try x3Views(q);
+            break :blk .{ .{ .x3 = v.first }, .{ .x3 = v.tail }, x3_tail_at };
+        },
+        .an, .ql, .bf => return full(d, rows),
     };
-    if (q.n != spans[1][1] or q.k % 64 != 0) return full(d, rows);
-    const first: cuda.qlinear.Affine4 = .{ .w = q.w, .s = q.s, .b = q.b, .n = spans[0][1], .k = q.k, .npad = q.npad };
-    const tail: cuda.qlinear.Affine4 = .{ .w = q.w + tail_tile * q.k / 2, .s = q.s + tail_tile * 2, .b = q.b + tail_tile * 2, .n = q.n - tail_tile, .k = q.k, .npad = q.npad };
-    const a = d.logits; // rows x 98,304, then rows x 320, then the packed rows x 98,592
-    const b = a + rows * first.n * 2;
-    const out = b + rows * tail.n * 2;
-    try draft.precision.project(e, layers.Proj{ .a4 = first }, d.x, d.xs, a, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
-    try draft.precision.project(e, layers.Proj{ .a4 = tail }, d.x, d.xs, b, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
-    const skip = spans[1][0] - tail_tile;
+    const tail_n = spans[1][1] - tail_at;
+    const a = d.logits; // rows x 98,304, then rows x the tail's columns, then the packed rows x 98,592
+    const b = a + rows * spans[0][1] * 2;
+    const out = b + rows * tail_n * 2;
+    try draft.precision.project(e, first, d.x, d.xs, a, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
+    try draft.precision.project(e, tail, d.x, d.xs, b, rows, .proposal, draft.precision.dflash_projection_prompt_cutoff);
+    const skip = spans[1][0] - tail_at;
     const copies = [2]cuda.abi.Memcpy2D{
-        .{ .src = a, .src_pitch = first.n * 2, .dst = out, .dst_pitch = span_width * 2, .width = first.n * 2, .height = rows },
-        .{ .src = b + skip * 2, .src_pitch = tail.n * 2, .dst = out + first.n * 2, .dst_pitch = span_width * 2, .width = (tail.n - skip) * 2, .height = rows },
+        .{ .src = a, .src_pitch = spans[0][1] * 2, .dst = out, .dst_pitch = span_width * 2, .width = spans[0][1] * 2, .height = rows },
+        .{ .src = b + skip * 2, .src_pitch = tail_n * 2, .dst = out + spans[0][1] * 2, .dst_pitch = span_width * 2, .width = (tail_n - skip) * 2, .height = rows },
     };
     for (&copies) |*m| try e.d.check(e.d.api.cuMemcpy2DAsync_v2(m, e.stream.handle), "cuMemcpy2DAsync");
     return out;

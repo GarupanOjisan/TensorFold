@@ -1,10 +1,11 @@
 # GLM-5.3-Flash on CUDA
 
 The native CUDA build serves GLM-5.3-Flash at tensor parallel over hosts: from NVIDIA's ModelOpt NVFP4 checkpoint
-([1.0.12](../../CHANGELOG.md#1012)), and on two ranks from Mia-AiLab's EXL3/TR3 checkpoint
-([1.1.0](../../CHANGELOG.md#110), [the checkpoint](glm-5.3-flash.md#exl3)). Rank 0 serves HTTP and the other ranks
-follow its steps, with MTP drafts, concurrent streams and kept prompt states. The
-[Python 0.6.6 recipe](glm-5.3-flash.md) and its `--tp`, `--rank` and `--master` flags belong to the frozen engine.
+([1.0.12](../../CHANGELOG.md#1012)), on two ranks from Mia-AiLab's EXL3/TR3 checkpoint
+([1.1.0](../../CHANGELOG.md#110), [the checkpoint](glm-5.3-flash.md#exl3)), and in [1.1.5](../../CHANGELOG.md#115) (#1050) from
+NVIDIA's FP4-Local checkpoint as stored and from XSFP4, which keeps FP4-Local's tensors outside the routed experts.
+Rank 0 serves HTTP and the other ranks follow its steps, with MTP drafts, concurrent streams and kept prompt states.
+The [Python 0.6.6 recipe](glm-5.3-flash.md) and its `--tp`, `--rank` and `--master` flags belong to the frozen engine.
 
 ## Run
 
@@ -37,11 +38,17 @@ left after a 12.2 GiB reserve` and a 5.8 GiB prompt cache
 
 - `--vision` on every rank reads images and video: rank 0's tower encodes them and sends their rows and spans to the
   other ranks ([1.1.0](../../CHANGELOG.md#110)). Video needs `libtfvideo`
-  ([video](../vision.md#video-on-the-native-server)).
+  ([video](../vision.md#video-on-the-native-server)). `TF_GLM_VISION_HOST=1` keeps the tower's bf16 weights in pinned
+  host memory and copies each part of a pass into one device slot as it runs (240 MiB for GLM-5.3-Flash's tower instead
+  of its 1.05 GiB), leaving rank 0 that much more room for KV pages. Checked on two RTX PRO 6000 Blackwell cards.
 - Nonstreaming `/v1/completions` requests return `prompt_logprobs`, structured output follows its schema with drafts
   on, and required and named tool calls use the model's tool markup ([1.1.1](../../CHANGELOG.md#111): #1016 to #1018).
 - `--kv-cache fp8` is an opt-in FP8 latent cache. BF16 remains the default, and its native quality and device
   qualification are pending ([1.1.2](../../CHANGELOG.md#112)).
+- `TF_GLM_HOST_CACHE=1` on every rank keeps kept prompt states in pinned host memory instead of on the card, so a
+  long conversation's next turn resumes when the card has no room left for its state (#1510). `--prompt-cache-gib`
+  sizes the host cache on each rank (8 GiB unasked, at most half of the available memory), and the KV pool sets no
+  device cache aside. Checked on two RTX PRO 6000 Blackwell cards at TP=2 with the EXL3 4bpw checkpoint.
 
 ## More ranks
 

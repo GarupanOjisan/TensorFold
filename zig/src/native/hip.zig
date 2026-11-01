@@ -85,6 +85,7 @@ const kv8_refusal = "--kv-cache fp8 keeps fp8 caches on CUDA; the HIP engines ke
 
 /// The cache flags this backend cannot honour, refused on every rank before a family loads.
 fn cacheRefused(o: api.Open) ?[]const u8 {
+    if (o.loops != null) return "--loops sets Dory's recurrent passes, served on CUDA: the HIP engines run no looped model";
     return if (o.kv8) kv8_refusal else null;
 }
 
@@ -187,6 +188,7 @@ fn join(
 
 /// The family's refusal of --slide or --mtp-confidence, when it names one.
 fn flagRefused(comptime F: type, o: api.Open) ?[]const u8 {
+    if (o.rope_yarn != null) return "--rope-yarn: the native HIP engine has no YaRN rope; serve without --rope-yarn, or on CUDA";
     if (o.slide and @hasDecl(F, "slide_refusal")) return F.slide_refusal;
     if (o.mtp_confidence != null and @hasDecl(F, "confidence_refusal")) return F.confidence_refusal;
     return null;
@@ -226,6 +228,10 @@ fn readMemory(_: ?*anyopaque, reset_peak: bool) ?api.Memory {
 pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
     const report = @import("sys").optional_libraries.atBoundary();
     defer report.deinit();
+    if (o.fsrRefusal("hip")) |why| {
+        problem.* = why;
+        return null;
+    }
     inline for (registry) |F| {
         if (std.mem.eql(u8, o.model_type, F.model_type)) return openWith(F, a, gpa, io, o, problem);
     }
@@ -261,7 +267,7 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     h.clock = .{ .io = io };
     h.core = lanes.Engine.init(gpa, &h.cfg, loaded.backend, h.clock.clock());
     errdefer h.core.deinit();
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = @intCast(loaded.streams), .context_window = @intCast(r.options.window), .prefill_step = F.prefill_step, .policy = h.policy_line, .startup = loaded.startup, .structures = true });
+    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .lanes = @intCast(loaded.streams), .context_window = @intCast(r.options.window), .prefill_step = F.prefill_step, .decode_share = o.decode_share, .policy = h.policy_line, .startup = loaded.startup, .structures = true });
     h.host.memory = .{ .read = readMemory };
     try h.host.start();
     served = true;
@@ -388,4 +394,8 @@ test "matrix=on runs only where the matrix-core tiles exist; auto runs everywher
     try std.testing.expect(matrixRefused(on, hip.Caps.of("gfx1030").?) != null);
     const auto: hip.Policy = .{};
     for ([_][]const u8{ "gfx1030", "gfx1100", "gfx1151", "gfx1200", "gfx1201" }) |name| try std.testing.expect(matrixRefused(auto, hip.Caps.of(name).?) == null);
+}
+
+test {
+    _ = @import("draft_sources_hip_test.zig");
 }

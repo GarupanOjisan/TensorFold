@@ -34,27 +34,32 @@ pub const Draft = struct {
             return err;
         };
         d.* = .{ .gpa = gpa, .runner = runner, .model = model, .owns_model = owns_model, .generation = generation, .previous_capture = previous_capture, .previous_taps = previous_taps };
+        model.backend.profile(runner.trace); // the target's TF_Q27_PROFILE trace times the drafter's passes too
         return d;
     }
     pub fn reset(d: *Draft) !void {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
+        try d.generation.settle();
         try d.runner.reset(0);
         try d.model.reset();
     }
     pub fn promptChunk(d: *Draft, ids: []const u32, last: bool) !void {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
+        try d.generation.settle();
         try d.generation.promptChunk(ids, last);
     }
     pub fn decodeChunk(d: *Draft, ids: []const u32, last: bool) !void {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
+        try d.generation.settle();
         try d.generation.decodeChunk(ids, last);
     }
     pub fn advance(d: *Draft, token: u32) !void {
         const pool = mtl.objc.Pool.push();
         defer pool.pop();
+        try d.generation.settle();
         try d.generation.advance(token);
     }
     pub fn deinit(d: *Draft) void {
@@ -63,6 +68,7 @@ pub const Draft = struct {
         d.generation.deinit();
         d.runner.capture_taps = d.previous_capture;
         d.runner.taps.ids = d.previous_taps;
+        d.model.backend.profile(null); // a borrowed drafter outlives the host and its trace
         if (d.owns_model) d.model.deinit();
         d.gpa.destroy(d);
     }
