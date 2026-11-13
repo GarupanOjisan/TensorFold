@@ -1,11 +1,24 @@
 //! TF_EXTRA_EOS: comma-separated token texts (GLM-5.3: `<|assistant|>`) that end a reply like the checkpoint's EOS ids.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const log = @import("log.zig");
 
 /// The list TF_EXTRA_EOS asks for, or null when unset.
 pub fn fromEnv() ?[]const u8 {
     const v = std.c.getenv("TF_EXTRA_EOS") orelse return null;
     return std.mem.span(v);
+}
+
+/// `base` with TF_EXTRA_EOS's tokens merged in and logged; unset returns `base`, an unknown name is logged and refused.
+pub fn withEnv(a: Allocator, base: []const u32, ctx: anytype, comptime tokenId: fn (@TypeOf(ctx), []const u8) ?u32) error{ OutOfMemory, UnknownExtraEos }![]const u32 {
+    const raw = fromEnv() orelse return base;
+    var unknown: []const u8 = "";
+    const eos = merge(a, base, raw, ctx, tokenId, &unknown) catch |e| {
+        if (e == error.UnknownExtraEos) log.line("TF_EXTRA_EOS: the tokenizer has no token {s}", .{unknown});
+        return e;
+    };
+    log.line("TF_EXTRA_EOS: a reply also ends at {s} ({d} stop ids)", .{ raw, eos.len });
+    return eos;
 }
 
 /// `base` followed by each token `raw` names that it does not already hold; `unknown` gets the first name not found.

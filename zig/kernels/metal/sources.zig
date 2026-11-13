@@ -1,9 +1,14 @@
 //! Metal kernel sources the engine compiles at run time, embedded in the executable.
 
+/// DeepSeek-V4.1's sources live beside their kernels: users say sources.dsv41.NAME.
+pub const dsv41 = @import("deepseek_v41/sources.zig");
+
 /// Nemotron's generated kernels (tools/zig/gen_nemotron_kernels.py).
 pub const nemotron = @import("nemotron/kernels.zig");
 /// Nemotron's KV in pages of the core pool: twins of its seven K/V kernels, each library beside its original.
 pub const nemotron_paged = @import("nemotron/paged.zig");
+/// The 27B's KV in pages of the core pool: its attention sources with the K/V address through a stream's table.
+pub const qwen27_paged = @import("qwen27/paged.zig");
 
 pub const qwen35 = @import("qwen3_5/kernels.zig");
 pub const qwen35_layout = @embedFile("qwen3_5/layout.metal");
@@ -24,10 +29,18 @@ pub const gemma4_vision = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("ge
 pub const lfm2 = @embedFile("lfm2/lfm2.metal") ++ @embedFile("lfm2/lfm2_segments.metal");
 /// LFM2's prompt attention on the tensor units (nax.h inlined at load, after lfm2.metal's text).
 pub const lfm2_attn_nax = @embedFile("lfm2/lfm2_attn_nax.metal");
+pub const nemotron_prompt_masked = @import("nemotron/prompt_masked.zig");
+
+pub const lfm3 = @embedFile("lfm3/ops.metal");
+pub const lfm3_attention = @embedFile("lfm3/attention.metal");
+pub const lfm3_image_rows = @embedFile("lfm3/image_rows.metal");
+pub const lfm3_projection_dual = @embedFile("lfm3/projectiondual.metal");
+pub const lfm3_projection = @embedFile("lfm3/projection.metal");
 
 /// Our glue kernels around them: embedding, MLX's RMS arithmetic, argmax, layout moves.
 pub const nemotron_glue = @embedFile("nemotron_glue.metal");
 pub const core_row_projection = @embedFile("core/row_projection.metal");
+pub const core_binned_projection = @embedFile("core/binned_projection.metal");
 pub const core_tile_qmm = @embedFile("core/tile_qmm.metal") ++ @embedFile("core/tile_qmv.metal") ++
     @embedFile("core/tile_qmv_rows.metal");
 pub const core_exl3_projection = @embedFile("core/exl3_projection.metal");
@@ -133,6 +146,8 @@ pub const core_qwen_vision = @embedFile("prefill/gemm_nax.metal") ++ @embedFile(
 pub const qwen_image = @embedFile("prefill/attention_nax.metal") ++ @embedFile("qwen_image.metal");
 /// MOSS-Image: the prefill attention template, then its transformer's and encoder's steps (gemms: core_qwen_vision).
 pub const moss_image = @embedFile("prefill/attention_nax.metal") ++ @embedFile("moss_image.metal") ++ @embedFile("moss_image_encoder.metal");
+/// MOSS-Image's image decoder: its own float32 steps, without a template.
+pub const moss_image_decoder = @embedFile("moss_image_decoder.metal");
 /// A prompt chunk's KDA layer in three passes, appended to the generated kda_rows source (its helpers).
 pub const glm_kda_prompt = @embedFile("glm_kda_prompt.metal");
 /// GLM-5.3-Flash speed-up mode's exchange kernels (families/glm/ep.zig).
@@ -192,6 +207,12 @@ pub const spark25_glue = @embedFile("spark25/glue.metal");
 pub const spark25_attention_nax = @embedFile("spark25/attention_nax.metal");
 /// Spark2.5's bf16 prompt projections on gemm_nax's tensor-unit GEMM (nax.h inlined at load).
 pub const spark25_gemm = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("spark25/gemm.metal");
+/// Llama's glue at HF's rounding points: embed, a bf16 residual and its norm, rope with bf16 cos and sin, SiLU.
+pub const llama_glue = @embedFile("llama/glue.metal");
+/// Llama's prompt attention on the tensor units (gemma4's prompt kernel, every key; nax.h inlined at load).
+pub const llama_attention_nax = @embedFile("llama/attention_nax.metal");
+/// Llama's bf16 prompt projections on gemm_nax's tensor-unit GEMM (nax.h inlined at load).
+pub const llama_gemm = @embedFile("prefill/gemm_nax.metal") ++ @embedFile("llama/gemm.metal");
 /// The kernel contract's planted controls: one kernel breaking each gate (zig/tests/contract/).
 pub const core_contract_controls = @embedFile("core/contract_controls.metal");
 
@@ -217,3 +238,5 @@ pub const core_weight_only = @embedFile("core/weight_only.metal");
 pub const core_hc_activation_body = @embedFile("core/hc_activation.h");
 pub const core_hc_activation = @embedFile("core/hc_activation.metal");
 pub const core_hc_pointwise = @embedFile("core/hc_pointwise.metal");
+
+pub const lfm2_prompt_masked = @import("lfm2/prompt_masked.zig");
