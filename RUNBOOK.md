@@ -19,7 +19,7 @@ For an archive installation, download the arm64 asset and its companion checksum
 [latest release](https://github.com/ashhart/TensorFold/releases/latest), with `V` set to its version:
 
 ```sh
-V=1.2.0
+V=1.2.7
 curl -fLO https://github.com/ashhart/TensorFold/releases/download/v$V/tensorfold-$V-macos-arm64.tar.gz
 curl -fLO https://github.com/ashhart/TensorFold/releases/download/v$V/tensorfold-$V-macos-arm64.tar.gz.sha256
 shasum -a 256 -c tensorfold-$V-macos-arm64.tar.gz.sha256
@@ -134,24 +134,25 @@ and `live.waiting`, the queued requests. Subtract waiting from connections to ge
 For example, 8 connections with 4 waiting means 4 active and 4 queued.
 When API authentication is enabled, `/health` returns only status.
 
-## Prompt prefill share and budget
+## Prompt prefill share, budget and admission policy
 
-The native server reads two environment variables when it opens its lane host.
-Both are optional. Set them before starting the server.
+The native server reads four environment variables when it opens its lane host, and `serve` checks them before it loads the model.
+All are optional. Set them before starting the server.
 `TENSORFOLD_PREFILL_SHARE` takes a number from 0.01 to 1.
-The default is 1. Any other text gives the default.
+The default is 1, and empty text gives the default. `serve` refuses any other value at start, naming the variable.
 It is the share of wall time long prompt steps get while other streams are decoding.
 A step of length t at share p owes the decoders t (1 - p) / p of decode time.
 The debt grows after each step and falls after each decode round.
 A long prompt's next step runs only when no debt is owed or no stream can decode.
 At the default 1 no debt is recorded, so the only waiting is the ordinary turn-taking: the host runs at most one step of a long prompt each time it turns to it, and chunked prompts still interleave with the decoding streams' rounds.
 Lower values add that debt, finish the long prompt later and leave more time for decoding streams.
+Flash Next's shared sessions on a Mac without tensor units start from a reply share of 0.8 when neither this nor `--decode-share` is set: see [the API](docs/api.md).
 A prompt whose whole uncached pass is at most 512 rows runs outside the share as one call.
 The check compares the prompt's length with the cached state, not how far the fill has reached, so a long prompt whose last rows remain does not become exempt when its unfilled tail is small.
 
 `TENSORFOLD_PREFILL_BUDGET` takes a whole number of prompt rows from 1 to 4,294,967,295.
 The default is 0, which means none.
-Empty text, 0, a negative number, a fractional form, a value above the range or any other text gives 0, which removes the cap.
+Empty text or 0 gives 0, which removes the cap. `serve` refuses a negative number, a fractional form, a value above the range or any other text at start.
 It caps the prompt rows filled in one pass while a stream is ready to decode.
 The cap counts only rows filled while such a stream waits.
 A call that reports no progress spends the allowance anyway and yields, so unknown or stale progress never holds the cap open.
@@ -165,22 +166,51 @@ Lowering it gives those streams their next round sooner.
 That costs more passes to finish the prompts.
 With the default 0 no cap applies: short prompts run as one burst beside decoders, bounded at a lane's worth of newly begun prompts while other work waits.
 
+`TENSORFOLD_PREFILL_POLICY` takes `fcfs`.
+Unset or empty keeps the default order described above. `serve` refuses any other text at start.
+Under `fcfs` the host fills only the oldest long prompt (more than 512 uncached rows) on each visit, in chunks of `TENSORFOLD_PREFILL_TOKENS` rows, and the decoding streams take one round after each chunk.
+A long prompt with no stream decoding beside it takes the engine's own cut, so a lone request runs exactly as without the policy.
+Short prompts run as they do without the policy. `TENSORFOLD_PREFILL_BUDGET` does not apply under a policy; `TENSORFOLD_PREFILL_SHARE` is checked once per visit.
+
+`TENSORFOLD_PREFILL_TOKENS` takes a whole number of prompt rows from 64 to 16384. Values outside the range are clamped.
+The default is 2048, and empty text or 0 gives the default. `serve` refuses text that is not a whole number at start.
+It only matters when `TENSORFOLD_PREFILL_POLICY` is set.
+Smaller chunks shorten each pause the decoding streams see while a prompt fills; larger chunks let later prompts start sooner.
+On flashnext Metal with eight 14336-row prompts arriving together, `fcfs` at 2048 paused decoders about 1.7 s per chunk with the last first token at about 94 s;
+4096 gave about 3.1 s and 87 s; 8192 gave about 5.9 s and 83 s. 16384 matches 8192 at that prompt length.
+
 ## Linux and CUDA
 
 For source builds with `zig build native` (including `--prefix` installs): Structured output and required tool calls need the release archive's `lib/` or `zig build grammar -Dxgrammar=DIR`; prepare DIR with `git clone --branch v0.2.8 --recurse-submodules https://github.com/mlc-ai/xgrammar` (use the native build's same `--prefix` for grammar).
 
 Choose `linux-aarch64` for an arm64 host or `linux-x86_64` for an x86_64 host.
-The archives require glibc 2.28 or newer and an NVIDIA driver providing `libcuda.so.1`.
-CUDA serves Nemotron 3.5 Lightning, qualified on GB10 (`linux-aarch64`, greedy and sampled) and on Ampere cards with
-compute capability 8.6 (`linux-x86_64`, greedy: the RTX 30 series, RTX A6000, A10 and A40), and checked on an RTX PRO 6000 Blackwell (compute
-capability 12.0, `linux-x86_64`).
-Flash Next also serves on CUDA from its MLX 4-bit checkpoint, on the built-in kernels, run on a GB10: see
-[Flash Next on CUDA](docs/recipes/flash-next-cuda.md).
+The archives require glibc 2.28 or newer and NVIDIA driver R580 or newer (CUDA 13.0), providing `libcuda.so.1`.
+Their kernels are built with CUDA 13, so TensorFold refuses an older driver at startup; `nvidia-smi` shows the installed one.
+See [qualified models](README.md#qualified-models) for native CUDA serving by family and format.
+Nemotron 3.5 Lightning MLX 4-bit has been checked on GB10 (sm_121, greedy and sampled), RTX 3090 (sm_86, greedy)
+and RTX PRO 6000 Blackwell (sm_120). A receipt on one sm_86 card does not measure every card of that class.
+Flash Next MLX 4-bit has served on a GB10 ([native recipe](docs/recipes/flash-next-cuda.md)).
+[GLM-5.3-Flash](docs/recipes/glm-5.3-flash-cuda.md) has recorded native TP=2 and TP=3 runs, including FP4-Local and
+XSFP4 on two and three GB10s. GLM uses `TF_GLM_RANK`, `TF_GLM_WORLD` and `NCCL_COMM_ID`; other ranked families use
+their supported `--tp` options. [Gemma 4](CHANGELOG.md#114) 12B and 31B MLX checkpoints have served on a GB10 too.
+The largest recorded CUDA server is GLM on three GB10s; GLM refuses more than 16 ranks and `--tp` offers only
+1, 2, 4 or 8, so no native family serves 32 GPUs as one server and no run beyond three is recorded.
+
+Release fatbins contain sm_80, sm_86, sm_120 and sm_121 images. The A100 (sm_80) has kernel checks recorded in
+[#846](https://github.com/ashhart/TensorFold/pull/846), but no served checkpoint on record, so it is not model-qualified.
+Nemotron and dense Qwen's NVFP4/FP8 paths have non-cluster fallbacks for sm_80 to sm_89 (#901, #1470).
+No NVFP4/FP8 model run on sm_80 to sm_89 is recorded; implementation and kernel checks are not whole-model qualification.
+MiniMax-M3.1-Flash refuses an A100: its CUDA path admits only sm_121 at exactly two ranks.
+DeepSeek requires sm_90 or newer and remains refused by the release server pending whole-model gate #827.
+Nemotron's `--precision checkpoint` is refused on an A100 because it needs Blackwell (compute capability 12.x).
+GLM also refuses an FP8 or MXFP8 projection on sm_80 to sm_89 when its shape needs split-K partial storage that
+this family does not hold. CUDA `--slide` learning is admitted only on sm_121.
+Qwen4 has synthetic gates only.
 
 On a GB10 arm64 host (an x86_64 host uses `linux-x86_64` in the same commands):
 
 ```sh
-V=1.2.0
+V=1.2.7
 curl -fLO https://github.com/ashhart/TensorFold/releases/download/v$V/tensorfold-$V-linux-aarch64.tar.gz
 curl -fLO https://github.com/ashhart/TensorFold/releases/download/v$V/tensorfold-$V-linux-aarch64.tar.gz.sha256
 sha256sum -c tensorfold-$V-linux-aarch64.tar.gz.sha256
@@ -203,8 +233,11 @@ pinned host memory.
 A request that names no `top_k`, on a checkpoint whose generation config names none, samples with no top-k filter on
 CUDA and Metal alike, so a seeded request draws the same on both. `--top-k 20` gives 0.6.6's CUDA default.
 A conversation's next turn resumes from a prompt state kept where its last turn's history ended, so a reply equals the same
-request with the cache off. `--prompt-cache-gib` sizes the kept states (16 GiB by default, inside the memory budget) and 0 turns
-them off. A state kept inside a prompt chunk costs no extra prompt call. A Nemotron 3.5 Lightning state takes 48 MiB plus
+request with the cache off. `--prompt-cache-gib` sizes kept states. The default takes half the room after streams,
+with a 16 GiB floor on Metal and CUDA device memory, or 8 GiB for unified CUDA host snapshots, clipped to the room.
+Discrete CUDA host snapshots default to 8 GiB. Flash Next's batch host keeps a 16 GiB ceiling before sizing sessions.
+An explicit value overrides it, and 0 turns them off. A state kept inside a prompt chunk costs no extra prompt call.
+A Nemotron 3.5 Lightning state takes 48 MiB plus
 7 KiB a prompt token, in whole 2 MiB pages (62 MiB at 2,048 tokens), and the cache keeps four 48 MiB buffers of its
 budget free for the next states.
 Prompts fill a chunk at a time between decode rounds, so requests that arrive together on a new system prompt would each
@@ -218,6 +251,29 @@ On three GB10s serving GLM-5.3-Flash NVFP4 at TP=3, a 1,035,295-token prompt wit
 zone at 94 C or more for most of the prompt (97.7 C at the top); `TF_HEAT_HIGH=92` and `TF_HEAT_LOW=88` held all three
 at 93.0 C or under, and the first token came 10% later.
 Archives whose names contain `host-only` are CPU verification artifacts and cannot serve CUDA inference.
+
+### Build a server for one GPU
+
+`zig build -Dgpu=<gpu>` builds only `tensorfold-native`, with kernel code for that one GPU architecture and every model family, stripped by default:
+
+```sh
+zig build -Dgpu=spark -Dnvcc=/usr/local/cuda/bin/nvcc            # zig-out/native/bin/tensorfold-native
+zig build -Dgpu=gfx1201 -Dhipcc=/opt/rocm/core/bin/hipcc          # zig-out/native-hip/bin/tensorfold-native
+```
+
+- `-Dgpu`: `sm_80`, `sm_86`, `sm_89`, `sm_120`, `sm_121`, `spark` (GB10, sm_121), or an exact HIP architecture from `zig/src/hip/caps.zig`. It replaces `-Dsm`, `-Dhip` and `-Dhip-arch`.
+- `sm_89` builds, but the release set (sm_80, 86, 120, 121) holds no image qualified on it.
+- The server refuses a GPU of another architecture at startup and names the `-Dgpu` that fits it (HIP already refuses one at device open).
+- CUDA needs `-Dnvcc`, or `-Dfatbins` with prebuilt images; each prebuilt image must hold exactly the one SASS profile its kernel needs on that GPU. `-Dstrip=false` keeps debug info.
+- The build offers no other step: tests, tools and `grammar` need the development build (no `-Dgpu`). Structured output needs `libtfgrammar` in the server's `../lib` (release archive `lib/`, or `zig build grammar -Dxgrammar=DIR`, which installs `native/lib`; copy it to `native-hip/lib` for HIP).
+
+Measured on 2026-11-02 (aarch64 for CUDA, x86_64 for HIP), every model family in every server:
+
+| Hardware GPU | Generic server | `-Dgpu` server | Saved |
+| --- | --- | --- | --- |
+| RTX PRO 6000 (`sm_120`, nvcc 13.3) | 145.5 MB (sm_80, 86, 120, 121) | 44.9 MB | 100.6 MB (69.2%) |
+| GB10 DGX Spark (`spark`, nvcc 13.4) | 146.1 MB (sm_80, 86, 120, 121) | 44.8 MB | 101.3 MB (69.3%) |
+| Radeon AI PRO R9700 (`gfx1201`, ROCm 7.16) | 48.9 MB (`native-hip`, unstripped) | 20.6 MB | 28.3 MB (58.0%) |
 
 ### Two GB10 ranks for GLM-5.3-Flash
 
@@ -249,30 +305,29 @@ First launch. The first start can stay silent for several minutes while it reads
 
 ### GLM CUDA copy windows
 
-Rank 0 reads these. Give both ranks the same values. The decode buffers, sampler and KDA save always hold 16 rows.
-DFlash stays on its 8-row block (7 drafts). The MTP head still absorbs in 8-row chunks. Native verify launches
-kernels directly: there is no captured CUDA graph to widen, and `WIDE_GRAPHS` is not read. The KDA wide step already
-walks rows in tiles of 16.
+Rank 0 reads these. Give both ranks the same values. From upstream v1.2.7 the decode buffers, sampler and KDA save
+hold a 32-row window (#2257), so these knobs no longer size any buffer: they only narrow or tighten the copies the
+lane core proposes. They sit under upstream's `TF_GLM_COPIES` (cost-priced root and context copies, off by default).
 
-`TF_GLM_COPY_MAX` is the most tokens a copy may draft. The default is 15 (a 16-row window). `7` is the previous cap
-(an 8-row window). Values outside 1..15 clamp into that range; text that is not an integer keeps 15. The first copy
-is still 3 tokens and doubles plus one after a fully accepted copy, including in a shared or multi-stream round.
-That growth fits: each stream's KDA save holds 16 rows, a shared segment may be 16 rows, and one shared forward
-still holds at most 32 rows, so the allocator trims a round that would overflow.
+`TF_GLM_COPY_MAX` is the most tokens a copy may draft. Unset, a copy may fill the decode window (31 tokens). `15` is
+this fork's earlier default (a 16-row window) and `7` the cap before that. Values outside 1..31 clamp into that
+range; text that is not an integer sets no cap. A cap never cuts the head's own drafts: the window stays at least 16
+rows for the MTP chain and 8 for a DFlash2 block. The first copy is still 3 tokens and doubles plus one after a
+fully accepted copy, including in a shared or multi-stream round. One shared forward still holds at most 32 rows,
+so the allocator trims a round that would overflow.
 
 `TF_GLM_COPY_REPLY_MATCH` is the match a copy needs when its continuation starts in the reply. The default is 16.
 A copy taken from the prompt still needs 8. The recipe's 16-token reply bar moved code from 55.4 to 56.2 tok/s and
 edit from 120 to 125, with no prose regression called out for that bar. `TF_GLM_COPY_MAX=15` is what moved edit
-from 84 to 119 tok/s with prose and code unchanged. Those figures are the recipe's, not a measurement on this tree.
+from 84 to 119 tok/s with prose and code unchanged. Those figures are the recipe's on the 8-row base, not a
+measurement on this tree.
 
 `TF_GLM_COPY_EXTEND=1` is off by default. It turns on context copies and root copies, and a match of at least 16
-tokens may take the whole `TF_GLM_COPY_MAX` in that round instead of waiting for the ramp. Root copies then skip
+tokens may take the whole copy cap in that round instead of waiting for the ramp. Root copies then skip
 the head for an admitted copy. Use it for an A/B against the default. Unset or any value other than `1` leaves it off.
 
-A 16-row save is twice the KDA window of an 8-row save, and the shared scratch sizes its per-stream chain for 16
-rows. Watch free memory on both GPUs, especially at 4 streams. Drafted token ids must match `"draft": false`
-(`token_sha256`). Prose and prefill should not regress. The on-hardware plan is in the pull request that added
-these knobs.
+Drafted token ids must match `"draft": false` (`token_sha256`). Prose and prefill should not regress. None of these
+knobs has been measured on hardware since the v1.2.7 sync.
 
 ### GB10 CPU pinning for long CUDA runs
 
@@ -438,7 +493,11 @@ After a memory refusal, reduce the context or reply limit, or choose a smaller q
 `--learn` writes a shared prompt state to disk only while the disk keeps `--learn-min-free-gib` free, 4 GiB by default.
 Below that, learning pauses with a log line and serving goes on; a refused write is tried again after 1 to 60 seconds, sooner when space comes back.
 Each learned file carries a checksum over its header and contents, so a damaged, truncated or older file is refused and learned again.
-`--learn-conversations` writes every kept prompt state behind, while the engine idles, and a SIGTERM stop writes what waits within 20 seconds.
+`--prompt-cache-disk DIR` writes every kept prompt state behind to that directory, while the engine idles,
+and a SIGTERM stop writes what waits within 20 seconds. It is equivalent to `--learn-conversations --learn-dir DIR`;
+the old flags remain supported, and `--learn-conversations` alone keeps its existing default directory.
+Use either spelling: combining `--prompt-cache-disk` with `--learn-dir` or `--learn-conversations` is refused.
+The startup line names the disk directory and the device budget when the engine reports one.
 Stop a server with SIGTERM, not SIGKILL, so its last turn is kept.
 `--learn-daily-gib` caps those writes a day (32 GiB by default); `DELETE /v1/imprint` forgets one model's conversation states.
 
@@ -458,3 +517,4 @@ Python 0.6.6 remains a separate release line.
 | Packed Metal runtime compilation fails | 1.0.0 probes and selects its prebuilt fallback; include chip, macOS version and startup error in a report. |
 
 For a bug report, include the version, checkpoint revision, public reproducing request, exact command and relevant startup/request logs.
+`TENSORFOLD_LOG_TIME=1` starts each server log line, the `[tensorfold]` lines and every engine's warnings, with its UTC time (`2026-10-30T18:54:04.123Z [tensorfold] ...`), to match the log against other records.

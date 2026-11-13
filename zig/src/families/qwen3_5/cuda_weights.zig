@@ -235,11 +235,8 @@ fn bf16f(h: u16) f32 {
     return @bitCast(@as(u32, h) << 16);
 }
 
-/// f32 to bf16, round to nearest even (finite values).
-fn f32bf16(x: f32) u16 {
-    const u: u32 = @bitCast(x);
-    return @intCast((u +% 0x7fff +% ((u >> 16) & 1)) >> 16);
-}
+/// f32 to bf16, round to nearest even; NaN stays NaN.
+const f32bf16 = core.bf16_round.bits;
 
 /// 8-bit affine rows (four codes a word, a scale and bias a group of 64) dequantized to bf16: the router rows.
 fn dequant8(dst: []u16, words: []align(1) const u32, scales: []align(1) const u16, biases: []align(1) const u16, k: usize) void {
@@ -345,7 +342,8 @@ pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer) !void {
         e.embed_w = try tensor(e, ck, "{s}embed_tokens.weight", .{m}, .bf16, &.{ g.vocab, g.hidden });
         e.embed_s = 0;
         e.embed_b = 0;
-        e.head = try modelopt.linear(e, ck, stage, "", "lm_head", g.vocab, g.hidden, g.kinds.head);
+        // a tied plain BF16 head is the embedding's rows, packed again into the lane's layout
+        e.head = if (g.bf16 and g.tied) try modelopt.linear(e, ck, stage, m, "embed_tokens", g.vocab, g.hidden, g.kinds.head) else try modelopt.linear(e, ck, stage, "", "lm_head", g.vocab, g.hidden, g.kinds.head);
     } else {
         e.embed_bits = rowBits(g.bits.embed);
         e.embed_w = try embedWords(e, ck, stage, m);
@@ -353,12 +351,25 @@ pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer) !void {
         e.embed_b = try tensor(e, ck, "{s}embed_tokens.biases", .{m}, .bf16, &.{ g.vocab, g.hidden / 64 });
         e.head = if (g.tied) try linear(e, e, ck, stage, m, "embed_tokens", g.vocab, g.hidden, g.bits.head) else try linear(e, e, ck, stage, "language_model.", "lm_head", g.vocab, g.hidden, g.bits.head);
     }
-    e.final_norm = try normVec(e, ck, mo, "{s}norm.weight", .{m}, .bf16, &.{g.hidden});
+    // a plain BF16 checkpoint keeps HF's raw w: its norm kernels (the _shift ones) scale by 1 + w in FP32
+    const shift = mo and !g.bf16;
+    e.final_norm = try normVec(e, ck, shift, "{s}norm.weight", .{m}, .bf16, &.{g.hidden});
     const conv = g.convWidth();
     const taps_shape: []const usize = if (mo) &.{ conv, 1, geometry.taps } else &.{ conv, geometry.taps, 1 }; // the same bytes
+    const readers = try core.checkpoint.loadReaders();
+    // each layer read past the page cache, the next one while it packs (TF_LOAD_DIRECT=0: #1928's read-ahead)
+    var direct = core.checkpoint.direct.Layers.init(e.gpa, ck, readers);
+    defer direct.deinit();
     for (e.layers, 0..) |*l, i| {
-        var pbuf: [96]u8 = undefined;
-        const p = try std.fmt.bufPrint(&pbuf, "{s}layers.{d}.", .{ m, i });
+        var pbuf: [2][96]u8 = undefined;
+        const p = try std.fmt.bufPrint(&pbuf[0], "{s}layers.{d}.", .{ m, i });
+        const last = i + 1 == e.layers.len;
+        try direct.enter(p, if (last) null else try std.fmt.bufPrint(&pbuf[1], "{s}layers.{d}.", .{ m, i + 1 }));
+        // a read-ahead layer is on the device: its pages leave the cache (none: main's one release at close)
+        defer if (readers > 0 and !direct.on()) ck.release();
+        // read ahead by threads of their own while the layer packs
+        var reading: core.checkpoint.Ahead = if (direct.on()) .{} else ck.prefetch(p, readers);
+        defer _ = reading.join();
         var ps: std.enums.EnumArray(Slot, Proj) = .initUndefined();
         for (slots(g, i)) |slot| {
             const nk = shape(g, slot);
@@ -366,8 +377,8 @@ pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer) !void {
             ps.set(slot, if (mo) try modelopt.linear(e, ck, stage, p, name, nk[0], nk[1], g.kinds.of(i, slot)) else try linear(e, e, ck, stage, p, name, nk[0], nk[1], g.bits.of(i, slot)));
         }
         l.* = .{
-            .input_norm = try normVec(e, ck, mo, "{s}input_layernorm.weight", .{p}, .bf16, &.{g.hidden}),
-            .post_norm = try normVec(e, ck, mo, "{s}post_attention_layernorm.weight", .{p}, .bf16, &.{g.hidden}),
+            .input_norm = try normVec(e, ck, shift, "{s}input_layernorm.weight", .{p}, .bf16, &.{g.hidden}),
+            .post_norm = try normVec(e, ck, shift, "{s}post_attention_layernorm.weight", .{p}, .bf16, &.{g.hidden}),
             .mlp = if (g.moe() and mo) try modelopt_experts.routed(e, ck, stage, p) else if (g.moe()) try routed(e, e, ck, stage, p, g.expert_bits) else .{ .dense = .{ .gate = ps.get(.gate), .up = ps.get(.up), .down = ps.get(.down) } },
             .mixer = undefined,
         };
@@ -390,8 +401,8 @@ pub fn load(e: *Engine, ck: *core.Checkpoint, stage: *DeviceBuffer) !void {
                 .k = ps.get(.k),
                 .v = ps.get(.v),
                 .o = ps.get(.o),
-                .q_norm = try normVec(e, ck, mo, "{s}self_attn.q_norm.weight", .{p}, .bf16, &.{head_dim}),
-                .k_norm = try normVec(e, ck, mo, "{s}self_attn.k_norm.weight", .{p}, .bf16, &.{head_dim}),
+                .q_norm = try normVec(e, ck, shift, "{s}self_attn.q_norm.weight", .{p}, .bf16, &.{head_dim}),
+                .k_norm = try normVec(e, ck, shift, "{s}self_attn.k_norm.weight", .{p}, .bf16, &.{head_dim}),
             } };
         }
     }
@@ -418,6 +429,34 @@ test "a uniform 4-bit checkpoint keeps its sizes; other modules take their own w
 
 test {
     _ = @import("cuda_expert_pack.zig");
+}
+
+test "Qwen norm and dequant bf16: today's bits on every zero, subnormal, infinity and tie; a NaN weight stays NaN" {
+    const old = struct {
+        /// f32bf16 as it was spelled before it was core's bits(): the oracle for every non-NaN input.
+        fn wrapped(x: f32) u16 {
+            const u: u32 = @bitCast(x);
+            return @intCast((u +% 0x7fff +% ((u >> 16) & 1)) >> 16);
+        }
+
+        fn kept(u: u32) !void {
+            const v: f32 = @bitCast(u);
+            const h = f32bf16(v);
+            if (!std.math.isNan(v)) return std.testing.expectEqual(wrapped(v), h);
+            try std.testing.expect(std.math.isNan(bf16f(h)));
+            try std.testing.expectEqual(u >> 31, h >> 15);
+        }
+    };
+    for (0..1 << 25) |i| { // sign, exponent 0 or 255, every mantissa
+        const top: u32 = if (i & 1 << 23 != 0) 0x7f80_0000 else 0;
+        try old.kept(@as(u32, @intCast(i >> 24)) << 31 | top | @as(u32, @intCast(i & 0x7f_ffff)));
+    }
+    for (0..1 << 16) |hi| for ([_]u32{ 0, 1, 0x7fff, 0x8000, 0x8001, 0xffff }) |lo| try old.kept(@as(u32, @intCast(hi)) << 16 | lo);
+    var prng = std.Random.DefaultPrng.init(1863);
+    for (0..1 << 22) |_| try old.kept(prng.random().int(u32));
+    try std.testing.expectEqual(@as(u16, 0x8000), old.wrapped(@bitCast(@as(u32, 0x7fff8001)))); // the old copy's -0
+    try std.testing.expectEqual(@as(u16, 0x0000), old.wrapped(@bitCast(@as(u32, 0xffff8001)))); // and its +0
+    for ([_]u32{ 0x7fff8001, 0xffff8001, 0x7fc00000, 0xffffffff, 0x7f800001, 0xff800001, 0x7fbfffff, 0xffa00000 }) |u| try old.kept(u);
 }
 
 fn linearWide(e: *Engine, into: anytype, ck: *core.Checkpoint, stage: *DeviceBuffer, prefix: []const u8, name: []const u8, n: usize, k: usize) !Affine4 {
