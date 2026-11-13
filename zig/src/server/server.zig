@@ -20,6 +20,7 @@ const clock = @import("clock.zig");
 const tool_grammar = @import("tool_grammar.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
+const extra_eos = @import("extra_eos.zig");
 const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
@@ -195,6 +196,17 @@ pub const Server = struct {
         };
         const a = srv.arena.allocator();
         srv.eos = try a.dupe(u32, text.eosIds());
+        if (extra_eos.fromEnv()) |raw| {
+            var unknown: []const u8 = "";
+            srv.eos = extra_eos.merge(a, srv.eos, raw, text, model_text.Text.tokenId, &unknown) catch |e| switch (e) {
+                error.UnknownExtraEos => {
+                    log.line("TF_EXTRA_EOS: the tokenizer has no token {s}", .{unknown});
+                    return error.UnknownExtraEos;
+                },
+                else => |other| return other,
+            };
+            log.line("TF_EXTRA_EOS: a reply also ends at {s} ({d} stop ids)", .{ raw, srv.eos.len });
+        }
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         const minimax = text.tokenId(reply_text.mm_markers.close) != null;
         if (minimax) srv.markers = reply_text.mm_markers;
