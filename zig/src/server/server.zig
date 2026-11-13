@@ -20,6 +20,7 @@ const clock = @import("clock.zig");
 const tool_grammar = @import("tool_grammar.zig");
 const chunk_plan = @import("chunk_plan.zig");
 const log = @import("log.zig");
+const extra_eos = @import("extra_eos.zig");
 const live = @import("live.zig");
 const slide_graph = @import("slide_graph.zig");
 const slide_lesson = @import("slide_lesson.zig");
@@ -220,7 +221,7 @@ pub const Server = struct {
             };
         };
         const a = srv.arena.allocator();
-        srv.eos = try a.dupe(u32, text.eosIds());
+        srv.eos = try extra_eos.withEnv(a, try a.dupe(u32, text.eosIds()), text, model_text.Text.tokenId);
         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
         const minimax = text.tokenId(reply_text.mm_markers.close) != null;
         if (minimax) srv.markers = reply_text.mm_markers;
