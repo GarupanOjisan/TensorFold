@@ -1,7 +1,4 @@
-//! TF_EXTRA_EOS: a comma-separated list of the tokenizer's tokens (by their text, e.g. `<|assistant|>`) that end a reply
-//! like the checkpoint's own EOS ids, added after them. A checkpoint whose generation_config leaves out a turn opener
-//! the model can write (GLM-5.3: `<|assistant|>`) otherwise streams it as text and starts a turn of its own until the
-//! length cap. Unset or empty: the EOS list is the checkpoint's. A name the tokenizer does not hold refuses the start.
+//! TF_EXTRA_EOS: comma-separated token texts (GLM-5.3: `<|assistant|>`) that end a reply like the checkpoint's EOS ids.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 
