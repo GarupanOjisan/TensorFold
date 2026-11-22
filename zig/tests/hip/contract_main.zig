@@ -40,6 +40,7 @@ const vl_k = @import("contract_vl.zig");
 const pos_k = @import("contract_vl_position.zig");
 const sparse_k = @import("contract_sparse_lanes.zig");
 const skew_k = @import("contract_wmma_skew.zig");
+const idx_k = @import("contract_idx_scores.zig");
 
 const g = core.contract.gates;
 
@@ -191,6 +192,11 @@ fn run(a: std.mem.Allocator, io: std.Io) !usize {
     }
     defer for (&attends) |*w| w.deinit();
     for (&attends) |*w| try kernels.append(a, w.kernel());
+    // d = 256 (the Qwen checkpoints): each head group, short and long spans, q fp32 and in the kind; two controls
+    var qwen_walks: [walk_k.qwen_count]walk_k.Walk = undefined;
+    for (&qwen_walks, 0..) |*w, i| w.* = .qwenAt(a, &r, s, &l, i);
+    defer for (&qwen_walks) |*w| w.deinit();
+    for (&qwen_walks) |*w| try kernels.append(a, w.kernel());
     var prefills: [2]prefill_k.Prefill = undefined;
     for (&prefills, [_]bool{ true, false }) |*p, paged| p.* = .init(a, &r, s, &l, paged);
     defer for (&prefills) |*p| p.deinit();
@@ -233,9 +239,14 @@ fn run(a: std.mem.Allocator, io: std.Io) !usize {
     for (&streams, 0..) |*x, i| x.* = .init(a, &r, s, &l, i);
     defer for (&streams) |*x| x.deinit();
     for (&streams) |*x| try kernels.append(a, x.kernel());
-    var relu2 = relu2_k.Relu2.init(a, &r, s, &l);
-    defer relu2.deinit();
-    try kernels.append(a, relu2.kernel());
+    // each width's relu^2 stream tile, then each wider width's planted control (its codes read as 4-bit)
+    var relu2s: [2 * relu2_k.widths.len - 1]relu2_k.Relu2 = undefined;
+    for (&relu2s, 0..) |*x, i| {
+        const plant = i >= relu2_k.widths.len;
+        x.* = .init(a, &r, s, &l, relu2_k.widths[if (plant) i + 1 - relu2_k.widths.len else i], plant);
+    }
+    defer for (&relu2s) |*x| x.deinit();
+    for (&relu2s) |*x| try kernels.append(a, x.kernel());
     var kv_write = kv_k.KvWrite.init(a, &r, s, &l);
     defer kv_write.deinit();
     try kernels.append(a, kv_write.kernel());
@@ -298,10 +309,14 @@ fn run(a: std.mem.Allocator, io: std.Io) !usize {
     for (&routers) |*x| try kernels.append(a, x.kernel());
     // the few-row matrix-core tiles run on gfx11's matrix cores only
     const matrix = if (hip.Caps.of(arch)) |v| v.matrix == .wmma11 else false;
-    var items: [item_k.cases.len]item_k.Item = undefined;
-    for (&items, 0..) |*x, i| x.* = .init(a, &r, s, &l, i);
+    // the last one is the few-row passes' control, on its case's geometry
+    var items: [item_k.cases.len + 1]item_k.Item = undefined;
+    for (&items, 0..) |*x, i| x.* = .init(a, &r, s, &l, @min(i, item_k.control.index));
     defer for (&items) |*x| x.deinit();
-    if (matrix) for (&items) |*x| try kernels.append(a, x.kernel());
+    if (matrix) {
+        items[item_k.cases.len].planted = try ctl.function(item_k.control.symbol);
+        for (&items) |*x| try kernels.append(a, x.kernel());
+    }
     var embeds: [4]embed_k.Embed = undefined;
     var nembeds: usize = 0;
     defer for (embeds[0..nembeds]) |*x| x.deinit();
@@ -341,6 +356,10 @@ fn run(a: std.mem.Allocator, io: std.Io) !usize {
     var sparse = sparse_k.SparseLanes.init(a, &r, s, &l);
     defer sparse.deinit();
     try kernels.append(a, sparse.kernel());
+    var idx_scores: [2]idx_k.IdxScores = undefined;
+    for (&idx_scores, std.enums.values(idx_k.Fault)) |*x, fault| x.* = .init(a, &r, s, &l, fault);
+    defer for (&idx_scores) |*x| x.deinit();
+    for (&idx_scores) |*x| try kernels.append(a, x.kernel());
     var skews: [skew_k.cases.len]skew_k.Skew = undefined;
     for (&skews, 0..) |*x, i| x.* = .init(a, &r, s, &l, i);
     defer for (&skews) |*x| x.deinit();

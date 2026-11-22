@@ -2,6 +2,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 const graph_cache = @import("cuda").graph_cache;
+const nccl = @import("cuda").nccl;
 
 pub const Backend = enum {
     /// NCCL for everything (the default).
@@ -50,6 +51,8 @@ pub const Config = struct {
     nccl_lib: []const u8 = "libnccl.so.2",
     /// `name[:gid],...` RDMA devices for `roce` (null: active RoCE v2 ports on an IPv4 /24 the peer has, roce_pick).
     roce_hca: ?[]const u8 = null,
+    /// TF_TP_LINK: the link a host-transport result names (`tcp-host`); a label only, not in `digest`.
+    link: ?[]const u8 = null,
     /// Stripe over at most this many HCAs (auto detection only).
     roce_hcas: u8 = 2,
     roce_tc: u8 = 0,
@@ -114,8 +117,9 @@ pub const Config = struct {
         if (get("TF_TP_FAILFAST")) |v| c.failfast = !(std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "off"));
         c.grace_ns = try seconds(get, "TF_TP_FAILFAST_GRACE_S", 1.0, 0, 60);
         c.report_ns = try seconds(get, "TF_TP_PEER_MEM_S", 0.5, 0.01, 60);
-        if (get("TF_NCCL_LIB")) |p| c.nccl_lib = p;
+        c.nccl_lib = nccl.Library.pathFrom(get("TF_NCCL_LIB")) catch return error.BadSetting;
         c.roce_hca = get("TF_TP_ROCE_HCA");
+        c.link = get("TF_TP_LINK");
         c.roce_hcas = try int(u8, get, "TF_TP_ROCE_HCAS", 2, 1, 2);
         c.roce_tc = try int(u8, get, "TF_TP_ROCE_TC", try int(u8, get, "NCCL_IB_TC", 0, 0, 255), 0, 255);
         if (try int(u8, get, "TF_TP_ROCE_FAST", 0, 0, 1) == 1) {
@@ -198,6 +202,15 @@ pub const Config = struct {
         h.final(&out);
         return out;
     }
+
+    /// TF_TP_LINK with quotes, backslashes and control bytes replaced, so a RESULT line stays JSON.
+    pub fn linkLabel(c: Config, buf: []u8) []const u8 {
+        const s = c.link orelse "unnamed link (set TF_TP_LINK)";
+        var n = @min(s.len, buf.len);
+        if (n < s.len) while (n > 0 and s[n] & 0xc0 == 0x80) : (n -= 1) {}; // a cut name ends on a whole character
+        for (s[0..n], buf[0..n]) |ch, *o| o.* = if (ch == '"' or ch == '\\' or ch < 0x20) '?' else ch;
+        return buf[0..n];
+    }
 };
 
 fn envGet(name: []const u8) ?[]const u8 {
@@ -251,6 +264,15 @@ test "defaults: the plan link 7 ports past the rendezvous, NCCL, fail-fast on" {
     try std.testing.expectEqual(Backend.nccl, c.backend);
     try std.testing.expectEqual(std.time.ns_per_s, c.grace_ns);
     try std.testing.expectEqual(std.time.ns_per_s / 2, c.report_ns);
+}
+
+test "TF_NCCL_LIB follows the loader's rule: a path is kept, blank keeps libnccl.so.2, a control byte is refused" {
+    Fake.pairs = &.{.{ "TF_NCCL_LIB", "/fixture/nccl/libnccl.so.2" }};
+    try std.testing.expectEqualStrings("/fixture/nccl/libnccl.so.2", (try Config.parse(&Fake.get)).nccl_lib);
+    Fake.pairs = &.{.{ "TF_NCCL_LIB", " \t" }};
+    try std.testing.expectEqualStrings("libnccl.so.2", (try Config.parse(&Fake.get)).nccl_lib);
+    Fake.pairs = &.{.{ "TF_NCCL_LIB", "libnccl.so.2\n" }};
+    try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
 }
 
 test "bad settings are refused and the digest ignores the rank" {
@@ -372,4 +394,22 @@ test "relay ceiling: default, named validation, slot independence and rank agree
         try std.testing.expectError(error.BadSetting, Config.parse(&Fake.get));
     }
     Fake.pairs = &.{};
+}
+
+test "the link label: quotes, backslashes and control bytes become ?, and a cut name ends on a whole character" {
+    var buf: [8]u8 = undefined;
+    // an 8-byte buffer: é and € across the cut, and € ending exactly at it
+    const cases = [_][2][]const u8{
+        .{ "a\"b\\c\td", "a?b?c?d" },
+        .{ "abcdefgh!", "abcdefgh" },
+        .{ "abcdefg\u{e9}", "abcdefg" },
+        .{ "abcdef\u{20ac}", "abcdef" },
+        .{ "abcde\u{20ac}", "abcde\u{20ac}" },
+    };
+    for (cases) |p| try std.testing.expectEqualStrings(p[1], (Config{ .link = p[0] }).linkLabel(&buf));
+    var wide: [64]u8 = undefined;
+    Fake.pairs = &.{.{ "TF_TP_LINK", "cable \"2\"" }};
+    try std.testing.expectEqualStrings("cable ?2?", (try Config.parse(&Fake.get)).linkLabel(&wide));
+    Fake.pairs = &.{};
+    try std.testing.expectEqualStrings("unnamed link (set TF_TP_LINK)", (try Config.parse(&Fake.get)).linkLabel(&wide));
 }

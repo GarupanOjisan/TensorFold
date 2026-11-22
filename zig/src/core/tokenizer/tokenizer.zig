@@ -8,7 +8,7 @@ const models = @import("model.zig");
 const qwen2_slow = @import("qwen2_slow.zig");
 const Allocator = std.mem.Allocator;
 pub const Memo = @import("memo.zig").Memo;
-pub const eos = @import("eos.zig");
+pub const eos = @import("checkpoint_eos"); // a shared module: std-only families read it too
 /// A digest of what ids mean as loaded (identity.zig): what Recall keys its record by.
 pub const identity = @import("identity.zig").identity;
 
@@ -34,6 +34,7 @@ pub const IdTable = struct {
     tokens: std.ArrayList(?[]const u8) = .empty,
 
     pub fn put(t: *IdTable, id: u32, token: []const u8) Allocator.Error!void {
+        if (id > models.max_id) return error.OutOfMemory; // loaders refuse such a file first; `id + 1` must never wrap
         if (id >= t.tokens.items.len) try t.tokens.appendNTimes(t.allocator, null, id + 1 - t.tokens.items.len);
         t.tokens.items[id] = token;
     }
@@ -510,6 +511,7 @@ fn addTokens(t: *Tokenizer, keep: Allocator, scratch: Allocator, list: std.json.
         if (steps.flag(item, "special", false)) try t.specials.put(keep, try keep.dupe(u8, content), {});
         if (ids.contains(content)) continue;
         const id = t.model.id(&t.vocab, content) orelse if (max) |m| (if (m >= t.model.size or t.model.size == 0) (if (m < std.math.maxInt(u32) - 1) m + 1 else return error.InvalidTokenizer) else t.model.size) else t.model.size;
+        if (id > models.max_id) return error.InvalidTokenizer;
         max = @max(max orelse id, id);
         try ids.put(content, id);
     }

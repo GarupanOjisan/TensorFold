@@ -36,6 +36,8 @@ pub const Options = struct {
     mtp: bool = true,
     /// The KV pool is made at `open` from `streams` and `extra_pages`; false leaves it to `sizePool` (after agreeing).
     pool: bool = true,
+    /// Admitted config when `admit` already checked the checkpoint; null reads `config.json` with HIP allowances.
+    cfg: ?config.Config = null,
 };
 
 pub const Engine = struct {
@@ -125,14 +127,15 @@ pub const Engine = struct {
         if (o.world > 1) e.comm = try (o.group orelse return error.NoGroup).open();
         errdefer if (e.comm) |c| c.close();
         _ = try steps.done(.{ 0, 0 }, .first);
-        e.cfg = try config.Config.read(gpa, io, dir);
+        e.cfg = o.cfg orelse try config.Config.readWith(gpa, io, dir, .{ .bf16_embed = true });
         const mtp = o.mtp and o.rank == 0 and hasFile(gpa, dir, tensors.mtp_file);
-        e.weights = try loader.load(
+        e.weights = try loader.loadInto(
             gpa,
             io,
             &e.driver,
             dir,
             &e.cfg,
+            o.cfg != null,
             .{ .world = o.world, .rank = o.rank, .mtp = mtp, .act = e.act },
         );
         errdefer e.weights.deinit();
@@ -172,7 +175,7 @@ pub const Engine = struct {
             head_kv,
         );
         errdefer e.pool.deinit();
-        e.plan = try rounds.Plan.init(&e.driver, &e.pool, streams * rounds.max_window, streams);
+        e.plan = try rounds.Plan.init(&e.driver, &e.pool, streams * rounds.max_window, streams, d.vocab);
         errdefer e.plan.deinit();
         e.wins = try e.gpa.alloc(rounds.Window, streams);
         e.sized = true;
@@ -230,6 +233,7 @@ pub const Engine = struct {
 
     /// `tokens` as int32 ids in fresh arena memory, the copy queued on the stream.
     pub fn ids(e: *Engine, o: hip.ops.Ops, tokens: []const u32) !u64 {
+        for (tokens) |t| if (t >= e.weights.model.dims.vocab) return error.TokenOutsideVocabulary; // no kernel bounds an id
         const dst = try o.arena.of(i32, tokens.len);
         try hip.runtime.check(e.driver.api.hipMemcpyHtoDAsync(
             @ptrFromInt(dst),

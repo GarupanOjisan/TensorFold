@@ -4,6 +4,7 @@ const cuda = @import("cuda");
 const sig = @import("cuda_signatures.zig");
 const hooks = @import("cuda_learn_hooks.zig");
 const geometry = @import("cuda_geometry.zig");
+const modelopt = @import("cuda_modelopt.zig");
 const head_dim = geometry.head_dim;
 const max_chunks = 64;
 /// Prompt experts keep the shipped arithmetic boundary, independently of verification capacity.
@@ -38,9 +39,10 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     const t_params = e.tables.ptr + params_at;
     const geo = e.geo;
     const group = g.q_heads / g.kv_heads;
+    if (shape.part == .head) return finish(e, total, heads, shape.hidden, shape.rows); // a stage's head over the ring's rows
 
     if (prompt and e.int8.on) @import("cuda_prompt_int8.zig").chunkStart(e);
-    try e.embed(t_ids, e.h, total, t_params);
+    if (g.embeds) try e.embed(t_ids, e.h, total, t_params); // a later stage's h and r came over the ring
     // the producers of the out, o and down inputs write their group sums; a prompt GEMM past 16 rows needs none
     const sums: u64 = if (prompt and total > 16) 0 else e.xs;
     // an image chunk's rows take the tower's features, and rotate at their staged t, h, w positions
@@ -49,12 +51,13 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
     var di: usize = 0;
     var ai: c_int = 0;
     // a prompt chunk keeps its last row: past the last layer's keys and values, the kept row's tile runs alone
-    const tail_at: ?usize = if (prompt) @import("cuda_prompt_tail.zig").first(e, total, nseg, shape.hidden or shape.rows) else null;
+    const ends = g.whole == 0 or g.first + g.layers == g.whole; // an earlier stage sends every row on: no tail
+    const tail_at: ?usize = if (prompt and ends) @import("cuda_prompt_tail.zig").first(e, total, nseg, shape.hidden or shape.rows) else null;
     for (e.layers, 0..) |l, i| {
         const tail = tail_at != null and i + 1 == e.layers.len;
         const t0: usize = if (tail) tail_at.? else 0;
         const rows: usize = total - t0;
-        try e.norm(i != 0, l.input_norm, total);
+        try e.norm(g.first + i != 0, l.input_norm, total);
         if (e.learning) |k| try k.input(i, e.h, total);
         switch (l.mixer) {
             .delta => |m| {
@@ -90,11 +93,11 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                     const rows_args = .{ geo, e.qn, t_segs, t_rows, t_anc, @as(c_int, ai), t_params, @as(f32, 1.0 / 16.0), @as(c_int, @intCast(total)), e.pm, e.pl, e.po };
                     if (e.kv8) {
                         try launch(e, if (shape.paged) e.fp8.attn_partial else e.fp8.attn_partial8_whole, sig.attn_partial8, .{ total, max_chunks, g.kv_heads }, .{ 128, 1, 1 }, args);
-                        const rows_fn = if (shape.mt2) (if (shape.paged) e.mt2.paged else e.mt2.whole) else (if (shape.paged) e.fp8.attn_rows else e.fp8.attn_rows8_whole);
+                        const rows_fn = if (shape.mt2) (if (shape.paged) e.mt2.paged else e.mt2.whole) else (if (shape.join) e.fp8.attn_rows_join else if (shape.paged) e.fp8.attn_rows else e.fp8.attn_rows8_whole);
                         try launch(e, rows_fn, sig.attn_rows8, .{ groups, max_chunks, g.kv_heads }, .{ if (shape.mt2) @as(usize, 128) else 256, 1, 1 }, rows_args);
                     } else {
                         try shared(e, if (shape.paged) e.fns.attn_partial else e.fns.attn_partial_whole, sig.attn_partial, .{ total, max_chunks, g.kv_heads }, 128, args);
-                        try shared(e, if (shape.paged) e.fns.attn_rows else e.fns.attn_rows_whole, sig.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
+                        try shared(e, if (shape.join) e.fns.attn_rows_join else if (shape.paged) e.fns.attn_rows else e.fns.attn_rows_whole, sig.attn_rows, .{ groups, max_chunks, g.kv_heads }, 256, rows_args);
                     }
                     try launch(e, e.fns.attn_merge, sig.attn_merge, .{ g.q_heads, total, 1 }, .{ 32, 1, 1 }, .{ geo, e.pm, e.pl, e.po, t_segs, t_rows, t_anc, t_params, e.y });
                 }
@@ -118,7 +121,9 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         const rp: u64 = if (tail) 0 else t_params;
         switch (l.mlp) {
             .dense => |m| {
-                if (m.gate == .x3) {
+                // NVFP4 prompt rows: gate, up and the act in one lean pair launch, the same act bytes
+                const paired = e.learning == null and sums == 0 and try modelopt.swiglu(e, m.gate, m.up, x0, e.act, rows, prompt, rp);
+                if (paired) {} else if (m.gate == .x3) {
                     try e.projMany(&.{ m.gate, m.up }, x0, &.{ e.gate, e.up }, rows, prompt); // one EXL3 group launch
                 } else if (e.affine.pdl and !prompt and e.learning == null and m.gate == .a4 and m.up == .a4) {
                     try e.projMany(&.{ m.gate, m.up }, e.x, &.{ e.gate, e.up }, total, false);
@@ -129,7 +134,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
                 if (e.learning) |k| try k.mlp(i, e.gate, e.up, total);
                 const n: c_longlong = @intCast(rows * g.intermediate);
                 const act_args = .{ e.gate, e.up, e.act, n, rp, @as(c_int, @intCast(g.intermediate)), sums };
-                try e.run(e.fns.mlp_act, .{ (rows * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, act_args);
+                if (!paired) try e.run(e.fns.mlp_act, .{ (rows * g.intermediate + 1023) / 1024, 1, 1 }, .{ 256, 1, 1 }, act_args);
                 try e.projAgain(m.down, e.act, r0, rows, prompt);
                 if (e.mlp) |k| try k.f(k.ctx, i, e.x, e.r, total, e.taught) else try e.pockets.add(e.stream, i, e.x, e.r, total, e.taught);
             },
@@ -140,7 +145,7 @@ pub fn body(e: *E.Engine, shape: anytype) !void {
         };
     }
     if (prompt and e.int8.on) @import("cuda_prompt_int8.zig").chunkEnd(e, total);
-    try finish(e, total, heads, shape.hidden, shape.rows);
+    if (shape.part == .whole) try finish(e, total, heads, shape.hidden, shape.rows);
 }
 
 /// A launch whose arguments are checked against the kernel's .cu signature: a wrong count or kind does not build.
