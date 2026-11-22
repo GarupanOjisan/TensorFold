@@ -29,7 +29,26 @@ fn pickCtx(ctx: *anyopaque, row: []const f32, position: u64, s: api.Sampling) !u
     return pickRow(gpa.*, row, position, s);
 }
 
-fn pickRow(gpa: Allocator, row: []const f32, position: u64, s: api.Sampling) !u32 {
+/// The same draw from the card's top_k candidates (1 <= top_k <= 64), widened to f64 as pickRow's scan holds them.
+fn pickCandCtx(ctx: *anyopaque, vals: []const f32, ids: []const u32, bad: bool, position: u64, s: api.Sampling) !u32 {
+    const gpa: *const Allocator = @ptrCast(@alignCast(ctx));
+    return pickCand(gpa.*, vals, ids, bad, position, s);
+}
+
+pub fn pickCand(gpa: Allocator, vals: []const f32, ids: []const u32, bad: bool, position: u64, s: api.Sampling) !u32 {
+    if (bad) return error.NonfiniteLogits; // a value anywhere in the row, as pickRow's scan finds it
+    const k: usize = s.top_k;
+    if (s.temperature <= 0 or k == 0 or k > 64 or vals.len != k or ids.len != k) return error.BadCandidates;
+    var v64: [64]f64 = undefined;
+    var id64: [64]u64 = undefined;
+    for (vals, ids, v64[0..k], id64[0..k]) |v, id, *o, *oi| {
+        o.* = v;
+        oi.* = id;
+    }
+    return @intCast(try sampling.choose(gpa, v64[0..k], id64[0..k], position, s));
+}
+
+pub fn pickRow(gpa: Allocator, row: []const f32, position: u64, s: api.Sampling) !u32 {
     if (s.temperature <= 0 or s.top_k == 0 or s.top_k > 256) return pickAll(gpa, row, position, s);
     const k: usize = s.top_k;
     var vals: [256]f64 = undefined;
@@ -62,6 +81,23 @@ fn pickAll(gpa: Allocator, row: []const f32, position: u64, s: api.Sampling) !u3
         id.* = i;
     }
     return @intCast(try sampling.choose(gpa, values, ids, position, s));
+}
+
+/// What the lane host serves: structured output and logprobs (the backend's rows), not prompt logprobs.
+pub fn laneInfo(slots: u32, context: u32, drafter: ?api.DraftSources.Named) api.Info {
+    return .{ .name = "qwen27-xpu", .draft_sources = .{ .drafter = drafter }, .lanes = slots, .context_window = context, .prefill_step = 0, .structures = true, .logprobs = true };
+}
+
+/// Drafted in front of the lane backend, with the backend's logprob rows reaching the lane core through it.
+pub fn wrapDrafter(gpa: Allocator, back: lanes.backend.Backend, drafter: lanes.drafter.Drafter) !lanes.drafted.Drafted {
+    var w = try lanes.drafted.Drafted.init(gpa, back, drafter);
+    w.first_rows = true;
+    return w;
+}
+
+/// The lone drafted stream's driver: sampled, resumed between rounds, and with the logprob rows of its path.
+pub fn loneDriver(back: *XpuLanes) api.Lone {
+    return .{ .ctx = back, .run = XpuLanes.lone, .resumes = true, .sampled = true, .logprobs = true };
 }
 
 /// The lane host over N runner slots (`--parallel N`, at least one).
@@ -139,7 +175,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     gpa_box.* = gpa;
     h.gpa = gpa;
     h.cache = null; // gpa.create leaves the defaults unset
-    h.back = .{ .gpa = gpa, .runner = runner, .drafter = drafter, .pick = pickCtx, .pick_ctx = gpa_box, .slots = slots };
+    h.back = .{ .gpa = gpa, .runner = runner, .drafter = drafter, .pick = pickCtx, .pick_cand = pickCandCtx, .pick_ctx = gpa_box, .slots = slots };
     if (std.c.getenv("XPU_BLOCK")) |v| h.back.block = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 8;
     if (std.c.getenv("XPU_TREE")) |v| h.back.nodes = std.fmt.parseInt(u32, std.mem.span(v), 10) catch 15;
     if (drafter != null) {
@@ -149,7 +185,7 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     h.wrap = null;
     if (drafter) |d| {
         h.dflash = .{ .d = d, .host = &h.back };
-        h.wrap = try lanes.drafted.Drafted.init(gpa, h.back.backend(), h.dflash.drafter());
+        h.wrap = try wrapDrafter(gpa, h.back.backend(), h.dflash.drafter());
         h.back.wrap = &h.wrap.?;
     }
     errdefer if (h.wrap) |*w| w.deinit();
@@ -159,10 +195,10 @@ fn openLanes(gpa: Allocator, io: std.Io, runner: *xq.Runner, drafter: ?*Drafter,
     h.core = lanes.Engine.init(gpa, &h.cfg, if (h.wrap) |*w| w.backend() else h.back.backend(), h.wall.clock());
     errdefer h.core.deinit();
     // the engine cuts its prompts on its own grid from position 0 (prefill_step 0): the same ids give the same bits
-    h.host = api.LaneHost.init(gpa, io, &h.core, .{ .name = "qwen27-xpu", .draft_sources = .{ .drafter = if (drafter != null) .{ .kind = "DFlash2", .name = o.drafter_name orelse o.drafter orelse "" } else null }, .lanes = slots, .context_window = context, .prefill_step = 0, .structures = true });
+    h.host = api.LaneHost.init(gpa, io, &h.core, laneInfo(slots, context, if (drafter != null) .{ .kind = "DFlash2", .name = o.drafter_name orelse o.drafter orelse "" } else null));
     if (drafter != null) {
         h.back.initDrafts();
-        h.host.lone = .{ .ctx = &h.back, .run = XpuLanes.lone, .resumes = true, .sampled = true };
+        h.host.lone = loneDriver(&h.back);
     }
     if (budget > 0) {
         // the prompt kernels compute in blocks of 64 rows from a call's start: kept and resumed at planned marks only

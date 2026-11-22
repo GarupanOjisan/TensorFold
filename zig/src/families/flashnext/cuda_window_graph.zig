@@ -1,4 +1,4 @@
-//! Drafted windows' passes, the draft head's pieces and rollback replays as CUDA graphs on one GPU, one key a graph.
+//! Drafted windows' passes (one GPU), the draft head's pieces and rollback replays (any rank) as CUDA graphs.
 const std = @import("std");
 const cuda = @import("cuda");
 const parts = @import("cuda_batch_state.zig");
@@ -18,8 +18,8 @@ pub fn nextGen() u64 {
 
 /// On by default (the same kernels, launched from a graph); TF_FLASHNEXT_WINDOW_GRAPH=0: every pass eagerly.
 pub fn enabled() bool {
-    const v = std.c.getenv("TF_FLASHNEXT_WINDOW_GRAPH") orelse return true;
-    return !std.mem.eql(u8, std.mem.span(v), "0");
+    // the startup check refused every malformed value already, so a plain default stands here
+    return @import("sys").environment.read(bool, "TF_FLASHNEXT_WINDOW_GRAPH", true) catch true;
 }
 
 /// attnRows' host values for rows ending at `ends` in a `cap`-token cache: dense chunks, the score grid (0: none).

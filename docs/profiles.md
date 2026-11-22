@@ -6,8 +6,8 @@ the same profile. It enables no additional optimization and supplies no new envi
 This is the foundation of [#1660](https://github.com/ashhart/TensorFold/issues/1660), beginning with the CUDA KV
 switches in its first table, their `_ALL` companions, the shared prompt store, GLM's and Nemotron's paging policies,
 the Dory, Gemma 4 and Spark2.5 pool-page switches, and Nemotron's paging on Metal. The registry also covers grouped learning modes.
-It does not migrate every `TF_*` or `TENSORFOLD_*` variable yet. Other settings keep their existing readers. `fast-exact` and `fast` are refused by name; they are not aliases for `stable` and cannot enable
-unqualified optimizations.
+It does not migrate every `TF_*` or `TENSORFOLD_*` variable yet. Other settings keep their existing readers. `fast-exact` is
+refused by name pending its token gates; `fast` is not planned: a speed mode that changes output tokens is not shipped.
 
 ## Explicit environment values win
 
@@ -51,14 +51,19 @@ Coverage includes:
   with `TENSORFOLD_DORY_KV_PAGES=0` it refuses to load, by both names. With the switch unset, the startup line
   shows `TENSORFOLD_DORY_KV_PAGES=1 (arithmetic, TF_KV_SHARE)` and kept states carry the same identity as `=1`.
 - Every CUDA family whose host prompt cache the CUDA host builds (Nemotron, Nemotron Omni, GLM, MiniMax M3, Qwen3.5
-  dense/MoE, Flash Next, Kolibri-1, Gemma 4, Spark2.5, Dory): `TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS`, exact `1` only.
+  dense/MoE, Flash Next, Kolibri-1, Gemma 4, Spark2.5, Dory, LFM2.5-24B-A2B): `TENSORFOLD_PROMPT_CACHE_KEEP_OTHERS`,
+  exact `1` only.
 - Flash Next on CUDA: `TF_FLASHNEXT_KV_PAGES`, `TF_FLASHNEXT_KV_PAGES_ALL`.
 - Dory on CUDA: `TENSORFOLD_DORY_KV_PAGES`, full-attention caches in pool pages unless it is exactly `0`; unset,
   every stream's caches are contiguous and made at open.
 - Gemma 4 on CUDA: `TENSORFOLD_GEMMA4_KV_PAGES`, global caches in pool pages by default, where `0` keeps them linear.
 - Spark2.5 on CUDA: `TENSORFOLD_SPARK25_KV_PAGES`, full caches in pool pages by default, where `0` keeps them linear.
+- LFM2.5-24B-A2B on CUDA: `TENSORFOLD_LFM2_KV_PAGES`, attention caches in pool pages by default, where `0` gives
+  each stream fixed pages made at open.
 - Nemotron-H on Metal: `TF_NEMOTRON_METAL_KV_PAGES`, where exactly `1` puts keys
   and values in the core pool's pages.
+- Qwen on Metal: `TF_QWEN27_METAL_KV_PAGES` (the 27B) and `TF_QWEN35_METAL_KV_PAGES`, where exactly `1` puts keys and
+  values in the core pool's pages; `arithmetic` until a main-against-branch token-hash run says otherwise.
 - DeepSeek V4.1 on CUDA: the settings below, with no stable fallback.
 
 `identical` records the existing switch's token-preserving design and linked evidence; it is not a claim that the
@@ -166,6 +171,9 @@ that each setting changed a reply. Each stable fallback is null. The release bac
 | `debug` | `TF_DSV41_LAYERS`, `TF_DSV41_NEEDS_POOL` |
 | `experimental` | `TF_DSV41_EXPERT_TOPP`, `TF_DSV41_OWN_PREFILL`, `TF_DSV41_PREFILL_PIECES`, `TF_DSV41_SLOTS`, `TF_DSV41_MHC_DEFER`, `TF_DSV41_DRAFTS`, `TF_DSV41_SAMPLING`, `TF_DSV41_IMAGES`, `TF_DSV41_BIAS_VL`, `TF_DSV41_ENGRAM_DIR`, `TF_DSV41_SCHEMA_PROMPT`, `TF_DSV41_TOOL_GRAMMAR` |
 
+The DeepSeek-V4.1 Metal server also reads `TF_DSV41_PREFILL_PIECES`: there `1` runs a prompt in steps between the
+other streams' rounds ([environment](environment.md)); `stable` leaves it absent, so prompts run whole.
+
 The pool settings have separate rows because each can be set independently. `NEEDS_POOL` forces pool geometry
 in the AOT asset planner; it does not select the served engine's pool. Its class is therefore `debug`.
 The other pool classes conservatively retain the audit's `arithmetic` classification, without claiming exactness.
@@ -241,8 +249,9 @@ the existing BF16 paging evidence is [#1322](https://github.com/ashhart/TensorFo
 ## Further profile work
 
 Migrate additional switch groups with their existing parsers and tests intact. A future `fast-exact` profile needs
-the issue's same-checkpoint token gates: solo, concurrent 1/2/4/8, and resumed runs for every affected family. An
-arithmetic-changing `fast` profile additionally needs each switch's measured quality gate and maintainer agreement.
+the issue's same-checkpoint token gates: solo, concurrent 1/2/4/8, and resumed runs for every affected family, plus a
+measurement where no served cell for that family gets slower. `fast` is not planned: a speed mode that changes output
+tokens is not shipped, so the arithmetic class has no profile to join.
 The host tests for this foundation establish lookup/CLI/reporting behavior, not those GPU or checkpoint gates.
 
 ## Four-rank RoCE relay ceiling
